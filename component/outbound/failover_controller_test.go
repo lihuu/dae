@@ -6,6 +6,8 @@
 package outbound
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -717,5 +719,143 @@ func TestValidateFailoverGroup_UnsupportedPriority(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unsupported priority 2")
+	}
+}
+
+func runFailoverProbeNow(t *testing.T, fc *FailoverController) {
+	t.Helper()
+
+	fc.mu.Lock()
+	if fc.recoveryTimer != nil {
+		fc.recoveryTimer.Stop()
+		fc.recoveryTimer = nil
+	}
+	gen := fc.generation
+	fc.mu.Unlock()
+	fc.runProbe(gen)
+}
+
+func TestFailoverControllerThreeExplicitProbeSuccessesCompleteFailback(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     time.Hour,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+	fc := NewFailoverController(log, "test", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: time.Hour,
+		ProbeMax:     time.Hour,
+		Successes:    3,
+		StableTime:   time.Nanosecond,
+	})
+	defer fc.Close()
+
+	fc.probeTCP = func(context.Context) (bool, error) {
+		return true, nil
+	}
+	fc.onPrimaryHealthChange(&dialer.NetworkType{
+		L4Proto:   consts.L4ProtoStr_TCP,
+		IpVersion: consts.IpVersionStr_4,
+	}, false)
+
+	for range 3 {
+		runFailoverProbeNow(t, fc)
+	}
+
+	if got := fc.State(); got != statePrimaryActive {
+		t.Fatalf("state = %v, want statePrimaryActive", got)
+	}
+	if got := fc.ActiveDialerIndex(); got != 0 {
+		t.Fatalf("active role = %d, want primary", got)
+	}
+}
+
+func TestFailoverControllerExplicitProbeFailureResetsSuccesses(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     time.Hour,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+	fc := NewFailoverController(log, "test", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: time.Hour,
+		ProbeMax:     time.Hour,
+		Successes:    3,
+		StableTime:   time.Nanosecond,
+	})
+	defer fc.Close()
+
+	results := []bool{true, true, false, true}
+	fc.probeTCP = func(context.Context) (bool, error) {
+		result := results[0]
+		results = results[1:]
+		if !result {
+			return false, errors.New("probe failed")
+		}
+		return true, nil
+	}
+	fc.onPrimaryHealthChange(&dialer.NetworkType{
+		L4Proto:   consts.L4ProtoStr_TCP,
+		IpVersion: consts.IpVersionStr_4,
+	}, false)
+
+	for range 4 {
+		runFailoverProbeNow(t, fc)
+	}
+
+	fc.mu.Lock()
+	successes := fc.recoverySuccesses
+	state := fc.state
+	fc.mu.Unlock()
+	if successes != 1 {
+		t.Fatalf("recovery successes = %d, want 1", successes)
+	}
+	if state != stateRecovering {
+		t.Fatalf("state = %v, want stateRecovering", state)
+	}
+}
+
+func TestFailoverGroupDoesNotKeepOrdinaryPeriodicCheckerActive(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     time.Hour,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+	dialers := []*dialer.Dialer{primary, fallback}
+	annotations := []*dialer.Annotation{{Priority: 0}, {Priority: 1}}
+	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial: time.Hour,
+		ProbeMax:     time.Hour,
+		Successes:    3,
+		StableTime:   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("ValidateFailoverGroup() error = %v", err)
+	}
+	group := NewDialerGroup(
+		option,
+		"test",
+		dialers,
+		annotations,
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover},
+		func(bool, *dialer.NetworkType, bool) {},
+		cfg,
+	)
+	defer group.Close()
+
+	primary.ActivateCheck()
+	deadline := time.Now().Add(time.Second)
+	for primary.ConnectivityCheckActive() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if primary.ConnectivityCheckActive() {
+		t.Fatal("failover group kept ordinary periodic checker active")
 	}
 }

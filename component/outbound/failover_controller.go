@@ -53,6 +53,7 @@ type FailoverController struct {
 	primary  *dialer.Dialer
 	fallback *dialer.Dialer
 	config   FailoverRecoveryConfig
+	probeTCP func(context.Context) (bool, error)
 
 	// mu protects mutable state below. It must NOT be held during network ops.
 	mu sync.Mutex
@@ -62,14 +63,9 @@ type FailoverController struct {
 	stableSince       time.Time // when the first recovery success occurred
 	currentDelay      time.Duration
 	recoveryTimer     *time.Timer
-	nextProbeAt       time.Time // when the current recovery timer is scheduled to fire
+	nextProbeAt       time.Time          // when the current recovery timer is scheduled to fire
 	probeCancel       context.CancelFunc // cancels the in-flight probe
 	generation        uint64             // incremented on close/reload to invalidate stale callbacks
-
-	// probeResultCh is a one-shot channel used by probePrimaryTCP to receive
-	// the result from onPrimaryHealthChange. Non-nil only while a probe is
-	// in-flight. Buffered by 1 so the callback never blocks.
-	probeResultCh chan bool
 
 	// closed is set by Close(). After closed, onPrimaryHealthChange returns
 	// early without modifying state or scheduling timers.
@@ -106,6 +102,7 @@ func NewFailoverController(
 		primary:      primary,
 		fallback:     fallback,
 		config:       config,
+		probeTCP:     primary.ProbeTCPOnce,
 		state:        statePrimaryActive,
 		currentDelay: config.ProbeInitial,
 	}
@@ -137,26 +134,6 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 		return
 	}
 
-	// If a recovery probe is in-flight, signal its result channel instead of
-	// triggering failover logic. The probe waits for this signal to avoid
-	// polling stale cached alive state.
-	fc.mu.Lock()
-	if fc.closed {
-		fc.mu.Unlock()
-		return
-	}
-	if fc.probeResultCh != nil {
-		ch := fc.probeResultCh
-		fc.probeResultCh = nil // one-shot
-		fc.mu.Unlock()
-		select {
-		case ch <- alive:
-		default:
-		}
-		return
-	}
-	fc.mu.Unlock()
-
 	if alive {
 		// Primary recovered — handled by recovery probe, not here.
 		// Real traffic success during fallback_active/ recovering would be
@@ -168,7 +145,7 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
-	if fc.state != statePrimaryActive {
+	if fc.closed || fc.state != statePrimaryActive {
 		// Already in fallback or recovering; ignore duplicate.
 		return
 	}
@@ -251,38 +228,17 @@ func (fc *FailoverController) runProbe(gen uint64) {
 }
 
 // probePrimaryTCP performs a one-shot TCP connectivity check on the primary.
-// It triggers a fresh TCP check via the dialer's existing health-check
-// infrastructure and waits for the transition callback to report the result,
-// avoiding false positives from stale cached alive state.
+// Each invocation returns its own result and does not depend on a canonical
+// health-state transition.
 func (fc *FailoverController) probePrimaryTCP(ctx context.Context) bool {
-	// Register a one-shot result channel before triggering the check.
-	// onPrimaryHealthChange will signal this channel when the TCP health
-	// transition fires (alive=true on success, alive=false on failure).
-	resultCh := make(chan bool, 1)
-	fc.mu.Lock()
-	fc.probeResultCh = resultCh
-	fc.mu.Unlock()
-
-	defer func() {
-		fc.mu.Lock()
-		fc.probeResultCh = nil
-		fc.mu.Unlock()
-	}()
-
-	// Trigger a fresh TCP check (both IPv4 and IPv6) via the existing
-	// aliveBackground loop.
-	fc.primary.NotifyCheckTcp()
-
-	// Wait for the transition callback. If the check succeeds, markAvailable
-	// fires a transition (not-alive → alive) and the callback signals true.
-	// If the check fails and the primary was already not-alive, no transition
-	// fires — we fall through on context timeout and return false.
-	select {
-	case result := <-resultCh:
-		return result
-	case <-ctx.Done():
-		return false
+	ok, err := fc.probeTCP(ctx)
+	if err != nil && fc.log.IsLevelEnabled(logrus.DebugLevel) {
+		fc.log.WithError(err).WithFields(logrus.Fields{
+			"group":   fc.groupName,
+			"primary": dialerName(fc.primary),
+		}).Debug("recovery TCP probe failed")
 	}
+	return ok && err == nil
 }
 
 // onProbeSuccessLocked handles a successful recovery probe. Must hold mu.
@@ -312,10 +268,10 @@ func (fc *FailoverController) onProbeSuccessLocked() {
 		time.Since(fc.stableSince) >= fc.config.StableTime {
 		// Failback!
 		fc.log.WithFields(logrus.Fields{
-			"group":     fc.groupName,
-			"from":      "fallback",
-			"to":        "primary",
-			"successes": fc.recoverySuccesses,
+			"group":      fc.groupName,
+			"from":       "fallback",
+			"to":         "primary",
+			"successes":  fc.recoverySuccesses,
 			"stable_for": time.Since(fc.stableSince).Round(time.Second),
 		}).Info("failback_complete")
 

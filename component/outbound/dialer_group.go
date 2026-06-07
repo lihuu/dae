@@ -189,10 +189,6 @@ func NewDialerGroup(
 			dialers[failoverCfg.FallbackIdx],
 			failoverCfg.Recovery,
 		)
-		// Register both dialers so their aliveBackground goroutines stay
-		// alive to serve targeted TCP checks for recovery probing.
-		dialers[failoverCfg.PrimaryIdx].RegisterFailoverGroup()
-		dialers[failoverCfg.FallbackIdx].RegisterFailoverGroup()
 		// Failover doesn't use AliveDialerSet, so we store a minimal state.
 		group.selectionState.Store(&dialerGroupSelectionState{policy: p})
 	} else {
@@ -213,8 +209,6 @@ func NewDialerGroup(
 
 func (g *DialerGroup) Close() error {
 	if g.failoverController != nil {
-		g.failoverController.primary.UnregisterFailoverGroup()
-		g.failoverController.fallback.UnregisterFailoverGroup()
 		g.failoverController.Close()
 	}
 	g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
