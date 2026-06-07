@@ -62,8 +62,18 @@ type FailoverController struct {
 	stableSince       time.Time // when the first recovery success occurred
 	currentDelay      time.Duration
 	recoveryTimer     *time.Timer
+	nextProbeAt       time.Time // when the current recovery timer is scheduled to fire
 	probeCancel       context.CancelFunc // cancels the in-flight probe
 	generation        uint64             // incremented on close/reload to invalidate stale callbacks
+
+	// probeResultCh is a one-shot channel used by probePrimaryTCP to receive
+	// the result from onPrimaryHealthChange. Non-nil only while a probe is
+	// in-flight. Buffered by 1 so the callback never blocks.
+	probeResultCh chan bool
+
+	// closed is set by Close(). After closed, onPrimaryHealthChange returns
+	// early without modifying state or scheduling timers.
+	closed bool
 
 	// snapshot is read lock-free on the selection path.
 	snapshot atomic.Pointer[failoverSnapshot]
@@ -126,6 +136,27 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 	if networkType.L4Proto != "tcp" {
 		return
 	}
+
+	// If a recovery probe is in-flight, signal its result channel instead of
+	// triggering failover logic. The probe waits for this signal to avoid
+	// polling stale cached alive state.
+	fc.mu.Lock()
+	if fc.closed {
+		fc.mu.Unlock()
+		return
+	}
+	if fc.probeResultCh != nil {
+		ch := fc.probeResultCh
+		fc.probeResultCh = nil // one-shot
+		fc.mu.Unlock()
+		select {
+		case ch <- alive:
+		default:
+		}
+		return
+	}
+	fc.mu.Unlock()
+
 	if alive {
 		// Primary recovered — handled by recovery probe, not here.
 		// Real traffic success during fallback_active/ recovering would be
@@ -171,6 +202,7 @@ func (fc *FailoverController) scheduleProbeLocked() {
 	delay := fc.currentDelay
 	gen := fc.generation
 
+	fc.nextProbeAt = time.Now().Add(delay)
 	fc.recoveryTimer = time.AfterFunc(delay, func() {
 		fc.runProbe(gen)
 	})
@@ -219,45 +251,37 @@ func (fc *FailoverController) runProbe(gen uint64) {
 }
 
 // probePrimaryTCP performs a one-shot TCP connectivity check on the primary.
+// It triggers a fresh TCP check via the dialer's existing health-check
+// infrastructure and waits for the transition callback to report the result,
+// avoiding false positives from stale cached alive state.
 func (fc *FailoverController) probePrimaryTCP(ctx context.Context) bool {
-	// Reuse the primary dialer's existing TCP health check.
-	// We call NotifyCheckTcp which signals the aliveBackground loop to do a
-	// check. But we need to observe the result. Instead, we directly check
-	// if the primary reports alive for TCP after the check.
-	//
-	// Actually, the simplest approach: just check if the primary's TCP
-	// health is currently alive. If it is, the probe succeeds. If not,
-	// trigger a check and wait.
-	//
-	// But the spec says to reuse the existing TCP health-check implementation.
-	// The most reliable way is to observe the Alive state after triggering a
-	// check.
-	//
-	// For now, we use a simpler approach: check TCP4 and TCP6 alive state.
-	// If either is alive, the probe succeeds.
-	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
-	tcp6 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "6"}
+	// Register a one-shot result channel before triggering the check.
+	// onPrimaryHealthChange will signal this channel when the TCP health
+	// transition fires (alive=true on success, alive=false on failure).
+	resultCh := make(chan bool, 1)
+	fc.mu.Lock()
+	fc.probeResultCh = resultCh
+	fc.mu.Unlock()
 
-	// Trigger a check and wait briefly for the result.
+	defer func() {
+		fc.mu.Lock()
+		fc.probeResultCh = nil
+		fc.mu.Unlock()
+	}()
+
+	// Trigger a fresh TCP check (both IPv4 and IPv6) via the existing
+	// aliveBackground loop.
 	fc.primary.NotifyCheckTcp()
 
-	// Wait a short time for the check to complete, polling the alive state.
-	deadline := time.After(3 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-deadline:
-			// Timeout — check one last time.
-			return fc.primary.MustGetAlive(tcp4) || fc.primary.MustGetAlive(tcp6)
-		case <-ticker.C:
-			if fc.primary.MustGetAlive(tcp4) || fc.primary.MustGetAlive(tcp6) {
-				return true
-			}
-		}
+	// Wait for the transition callback. If the check succeeds, markAvailable
+	// fires a transition (not-alive → alive) and the callback signals true.
+	// If the check fails and the primary was already not-alive, no transition
+	// fires — we fall through on context timeout and return false.
+	select {
+	case result := <-resultCh:
+		return result
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -352,6 +376,7 @@ func (fc *FailoverController) Close() {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
+	fc.closed = true
 	fc.generation++
 	if fc.recoveryTimer != nil {
 		fc.recoveryTimer.Stop()
@@ -370,6 +395,7 @@ type FailoverControllerSnapshot struct {
 	RecoverySuccesses int
 	StableSince       time.Time
 	CurrentDelay      time.Duration
+	NextProbeAt       time.Time // when the next probe was scheduled to fire
 }
 
 // CaptureSnapshot returns a snapshot of the controller state for reload.
@@ -381,6 +407,7 @@ func (fc *FailoverController) CaptureSnapshot() FailoverControllerSnapshot {
 		RecoverySuccesses: fc.recoverySuccesses,
 		StableSince:       fc.stableSince,
 		CurrentDelay:      fc.currentDelay,
+		NextProbeAt:       fc.nextProbeAt,
 	}
 }
 
@@ -395,9 +422,19 @@ func (fc *FailoverController) RestoreSnapshot(snap FailoverControllerSnapshot) {
 	fc.currentDelay = snap.CurrentDelay
 	fc.publishSnapshot()
 
-	// If we were in fallback/recovering, re-arm the recovery probe.
+	// If we were in fallback/recovering, re-arm the recovery probe with the
+	// remaining delay from the old generation.
 	if fc.state == stateFallbackActive || fc.state == stateRecovering {
+		remaining := time.Until(snap.NextProbeAt)
+		if remaining <= 0 || snap.NextProbeAt.IsZero() {
+			// nextProbeAt is in the past or unset — fire immediately.
+			remaining = time.Millisecond
+		}
+		originalDelay := fc.currentDelay
+		fc.currentDelay = remaining
 		fc.scheduleProbeLocked()
+		// Restore the original delay for subsequent probes.
+		fc.currentDelay = originalDelay
 	}
 }
 

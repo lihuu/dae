@@ -616,6 +616,7 @@ func newControlPlaneWithContextOptions(
 		dialerGroup := outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy,
 			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback),
 			failoverCfg)
+		deferFuncs = append(deferFuncs, dialerGroup.Close)
 		outbounds = append(outbounds, dialerGroup)
 	}
 

@@ -567,6 +567,12 @@ func (d *Dialer) aliveBackground() {
 
 	var unusedOnce bool
 	checkUnused := func() bool {
+		// A failover group references this dialer for recovery probing.
+		// Keep the goroutine alive so NotifyCheckTcp signals are consumed.
+		if d.activeFailoverGroups.Load() > 0 {
+			unusedOnce = false
+			return false
+		}
 		var unused int
 		for _, opt := range CheckOpts {
 			if !d.hasAliveDialerSets(opt.networkType) {
@@ -867,6 +873,18 @@ func (d *Dialer) UnregisterAliveDialerSet(a *AliveDialerSet) {
 	if setSet[a] <= 0 {
 		delete(setSet, a)
 	}
+}
+
+// RegisterFailoverGroup increments the failover group reference count.
+// This keeps the aliveBackground goroutine alive to serve targeted TCP checks
+// for recovery probing, even without AliveDialerSet registrations.
+func (d *Dialer) RegisterFailoverGroup() {
+	d.activeFailoverGroups.Add(1)
+}
+
+// UnregisterFailoverGroup decrements the failover group reference count.
+func (d *Dialer) UnregisterFailoverGroup() {
+	d.activeFailoverGroups.Add(-1)
 }
 
 func (d *Dialer) logUnavailable(

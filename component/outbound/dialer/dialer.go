@@ -123,6 +123,12 @@ type Dialer struct {
 	stickyIpDialer *stickyip.StickyIpDialer
 	proxyIpCache   *ProxyIpCache
 
+	// activeFailoverGroups counts how many failover DialerGroups reference
+	// this dialer. When > 0, the aliveBackground goroutine stays alive to
+	// serve targeted TCP checks (for recovery probing) even without
+	// AliveDialerSet registrations.
+	activeFailoverGroups atomic.Int32
+
 	// recoveryState manages exponential backoff for recovery detection.
 	// It is intentionally scoped to a single dialer instance so cloned or
 	// recreated dialers start clean under their own health-check semantics.

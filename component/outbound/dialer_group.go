@@ -146,6 +146,9 @@ type DialerGroup struct {
 
 	// failoverController is non-nil only for failover policy groups.
 	failoverController *FailoverController
+	// failoverCfg maps role indices (0=primary, 1=fallback) to actual dialer
+	// indices. Non-nil only for failover policy groups.
+	failoverCfg *FailoverConfig
 }
 
 type dialerGroupSelectionState struct {
@@ -179,12 +182,17 @@ func NewDialerGroup(
 
 	if p.Policy == consts.DialerSelectionPolicy_Failover && failoverCfg != nil {
 		// Failover policy: use the failover controller instead of AliveDialerSet.
+		group.failoverCfg = failoverCfg
 		group.failoverController = NewFailoverController(
 			log, name,
 			dialers[failoverCfg.PrimaryIdx],
 			dialers[failoverCfg.FallbackIdx],
 			failoverCfg.Recovery,
 		)
+		// Register both dialers so their aliveBackground goroutines stay
+		// alive to serve targeted TCP checks for recovery probing.
+		dialers[failoverCfg.PrimaryIdx].RegisterFailoverGroup()
+		dialers[failoverCfg.FallbackIdx].RegisterFailoverGroup()
 		// Failover doesn't use AliveDialerSet, so we store a minimal state.
 		group.selectionState.Store(&dialerGroupSelectionState{policy: p})
 	} else {
@@ -205,6 +213,8 @@ func NewDialerGroup(
 
 func (g *DialerGroup) Close() error {
 	if g.failoverController != nil {
+		g.failoverController.primary.UnregisterFailoverGroup()
+		g.failoverController.fallback.UnregisterFailoverGroup()
 		g.failoverController.Close()
 	}
 	g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
@@ -530,22 +540,37 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 
 	case consts.DialerSelectionPolicy_Failover:
 		// Failover policy: select based on the controller's current state.
-		if g.failoverController == nil {
+		if g.failoverController == nil || g.failoverCfg == nil {
 			return nil, 0, nil, fmt.Errorf("failover controller not initialized")
 		}
-		activeIdx := g.failoverController.ActiveDialerIndex()
-		if activeIdx < 0 || activeIdx >= len(g.Dialers) {
-			return nil, 0, nil, fmt.Errorf("failover active index out of range")
+		// ActiveDialerIndex returns a role: 0=primary, 1=fallback.
+		// Map it to the actual dialer index via failoverCfg.
+		role := g.failoverController.ActiveDialerIndex()
+		var dialerIdx int
+		switch role {
+		case 0:
+			dialerIdx = g.failoverCfg.PrimaryIdx
+		case 1:
+			dialerIdx = g.failoverCfg.FallbackIdx
+		default:
+			return nil, 0, nil, fmt.Errorf("failover active role out of range: %d", role)
 		}
-		d := g.Dialers[activeIdx]
+		d := g.Dialers[dialerIdx]
 		// Respect excluded: if the active dialer is excluded, try the other.
 		if excluded != nil && d == excluded {
-			otherIdx := 1 - activeIdx
-			if otherIdx >= 0 && otherIdx < len(g.Dialers) {
-				other := g.Dialers[otherIdx]
-				if other != excluded {
-					selected := preferAlternateSelectionNetworkType(other, networkType)
-					return other, 0, selected, nil
+			// Only fall back to the other dialer when the primary is excluded.
+			// When the fallback is excluded, the primary is unconfirmed —
+			// returning it would violate the spec requirement that "fallback
+			// exclusion returns an error rather than primary while primary
+			// is unconfirmed."
+			if role == 0 {
+				otherIdx := g.failoverCfg.FallbackIdx
+				if otherIdx >= 0 && otherIdx < len(g.Dialers) {
+					other := g.Dialers[otherIdx]
+					if other != excluded {
+						selected := preferAlternateSelectionNetworkType(other, networkType)
+						return other, 0, selected, nil
+					}
 				}
 			}
 			return nil, 0, nil, ErrNoAliveDialer

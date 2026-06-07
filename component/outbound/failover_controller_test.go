@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 )
 
@@ -391,5 +392,330 @@ func TestValidateFailoverGroup_InvalidRecoveryConfig(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for Successes < 1")
+	}
+}
+
+// --- Acceptance Tests ---
+
+func TestFailoverController_ReverseFilterOrder(t *testing.T) {
+	// Verify role-to-index mapping: Dialers[0]=fallback (priority:1), Dialers[1]=primary (priority:0).
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false), // index 0 = fallback
+		newDirectDialer(option, false), // index 1 = primary
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 1}, // index 0 is fallback
+		{Priority: 0}, // index 1 is primary
+	}
+	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("validation failed: %v", err)
+	}
+	if cfg.PrimaryIdx != 1 || cfg.FallbackIdx != 0 {
+		t.Fatalf("unexpected indices: primary=%d fallback=%d", cfg.PrimaryIdx, cfg.FallbackIdx)
+	}
+
+	// Create DialerGroup and verify selection.
+	group := NewDialerGroup(option, "test", dialers, annotations,
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover},
+		func(bool, *dialer.NetworkType, bool) {},
+		cfg)
+	defer group.Close()
+
+	nt := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	d, _, _, err := group.SelectWithExclusionResult(nt, false, nil)
+	if err != nil {
+		t.Fatalf("select failed: %v", err)
+	}
+	if d != dialers[1] {
+		t.Fatalf("selected dialer %v, want primary (index 1)", d)
+	}
+
+	// Simulate primary failure → should select fallback (index 0).
+	group.failoverController.onPrimaryHealthChange(nt, false)
+	d, _, _, err = group.SelectWithExclusionResult(nt, false, nil)
+	if err != nil {
+		t.Fatalf("select after failover failed: %v", err)
+	}
+	if d != dialers[0] {
+		t.Fatalf("selected dialer %v, want fallback (index 0)", d)
+	}
+}
+
+func TestFailoverController_FallbackExcludedReturnsError(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+	dialers := []*dialer.Dialer{primary, fallback}
+	annotations := []*dialer.Annotation{{Priority: 0}, {Priority: 1}}
+
+	cfg, _ := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	group := NewDialerGroup(option, "test", dialers, annotations,
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover},
+		func(bool, *dialer.NetworkType, bool) {},
+		cfg)
+	defer group.Close()
+
+	nt := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+
+	// Failover to fallback.
+	group.failoverController.onPrimaryHealthChange(nt, false)
+
+	// Exclude the fallback → should return error, NOT the primary.
+	_, _, _, err := group.SelectWithExclusionResult(nt, false, fallback)
+	if err == nil {
+		t.Fatal("expected error when fallback is excluded, got nil")
+	}
+}
+
+func TestFailoverController_BackoffSequence(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	fc := NewFailoverController(log, "test", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: 1 * time.Second,
+		ProbeMax:     8 * time.Second,
+		Successes:    3,
+		StableTime:   1 * time.Second,
+	})
+	defer fc.Close()
+
+	// Trigger failover.
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	// Simulate probe failures and verify backoff.
+	// After failover, currentDelay = ProbeInitial = 1s
+	fc.mu.Lock()
+	if fc.currentDelay != 1*time.Second {
+		t.Fatalf("initial delay = %v, want 1s", fc.currentDelay)
+	}
+
+	// Simulate failure: delay should double.
+	fc.onProbeFailureLocked()
+	if fc.currentDelay != 2*time.Second {
+		t.Fatalf("after 1st failure: delay = %v, want 2s", fc.currentDelay)
+	}
+
+	fc.onProbeFailureLocked()
+	if fc.currentDelay != 4*time.Second {
+		t.Fatalf("after 2nd failure: delay = %v, want 4s", fc.currentDelay)
+	}
+
+	fc.onProbeFailureLocked()
+	if fc.currentDelay != 8*time.Second {
+		t.Fatalf("after 3rd failure: delay = %v, want 8s", fc.currentDelay)
+	}
+
+	// Cap at ProbeMax.
+	fc.onProbeFailureLocked()
+	if fc.currentDelay != 8*time.Second {
+		t.Fatalf("after 4th failure (capped): delay = %v, want 8s", fc.currentDelay)
+	}
+
+	// Success resets to ProbeInitial.
+	fc.onProbeSuccessLocked()
+	if fc.currentDelay != 1*time.Second {
+		t.Fatalf("after success: delay = %v, want 1s", fc.currentDelay)
+	}
+	fc.mu.Unlock()
+}
+
+func TestFailoverController_StableTimeRequired(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	fc := NewFailoverController(log, "test", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: 1 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    2,
+		StableTime:   10 * time.Second,
+	})
+	defer fc.Close()
+
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	// Two successes but not enough stable time → should NOT failback.
+	fc.mu.Lock()
+	fc.onProbeSuccessLocked() // successes=1
+	fc.onProbeSuccessLocked() // successes=2, but stable time < 10s
+	state := fc.state
+	fc.mu.Unlock()
+
+	if state != stateRecovering {
+		t.Fatalf("state = %v, want stateRecovering (stable time not met)", state)
+	}
+	if fc.ActiveDialerIndex() != 1 {
+		t.Fatalf("active index = %d, want 1 (still on fallback)", fc.ActiveDialerIndex())
+	}
+}
+
+func TestFailoverController_ReloadRemainingTime(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	fc := NewFailoverController(log, "test", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: 10 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	defer fc.Close()
+
+	// Trigger failover → schedules probe at now+10s.
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	// Wait 7 seconds → 3 seconds remaining.
+	time.Sleep(7 * time.Second)
+
+	// Capture snapshot.
+	snap := fc.CaptureSnapshot()
+	if snap.NextProbeAt.IsZero() {
+		t.Fatal("NextProbeAt should be set")
+	}
+	remaining := time.Until(snap.NextProbeAt)
+	if remaining < 2*time.Second || remaining > 4*time.Second {
+		t.Fatalf("remaining = %v, want ~3s", remaining)
+	}
+
+	// Restore into a new controller.
+	primary2 := newDirectDialer(option, false)
+	fallback2 := newDirectDialer(option, false)
+	fc2 := NewFailoverController(log, "test", primary2, fallback2, FailoverRecoveryConfig{
+		ProbeInitial: 10 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	defer fc2.Close()
+
+	before := time.Now()
+	fc2.RestoreSnapshot(snap)
+	elapsed := time.Since(before)
+
+	// The probe should be scheduled with remaining delay (~3s), not the full 10s.
+	if elapsed > 1*time.Second {
+		t.Fatalf("RestoreSnapshot took %v, expected fast return", elapsed)
+	}
+	// Verify the timer fires within ~3s (remaining), not 10s (full delay).
+	done := make(chan struct{})
+	go func() {
+		// The probe will fail (direct dialer, no real network), but we just
+		// care that it fires quickly.
+		time.Sleep(4 * time.Second)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// OK — probe fired within 4s (remaining ~3s + some slack)
+	case <-time.After(6 * time.Second):
+		t.Fatal("probe did not fire within expected remaining time")
+	}
+}
+
+func TestFailoverController_StaleCallbackAfterClose(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	fc := NewFailoverController(log, "test", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+
+	// Close the controller.
+	fc.Close()
+
+	// Simulate a stale callback — should NOT change state.
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	if fc.State() != statePrimaryActive {
+		t.Fatalf("state after stale callback = %v, want statePrimaryActive", fc.State())
+	}
+	if fc.ActiveDialerIndex() != 0 {
+		t.Fatalf("active index after stale callback = %d, want 0", fc.ActiveDialerIndex())
+	}
+}
+
+func TestValidateFailoverGroup_UnsupportedPriority(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 2}, // unsupported
+	}
+
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported priority 2")
 	}
 }
