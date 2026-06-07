@@ -32,6 +32,9 @@ const (
 	DialerSelectionPolicy_MinMovingAverageLatencies DialerSelectionPolicy = "min_moving_avg"
 	// DialerSelectionPolicy_MinLastLatency selects the dialer with minimum last latency.
 	DialerSelectionPolicy_MinLastLatency DialerSelectionPolicy = "min"
+	// DialerSelectionPolicy_Failover selects the primary dialer and fails over
+	// to the fallback when the primary's TCP path becomes unavailable.
+	DialerSelectionPolicy_Failover DialerSelectionPolicy = "failover"
 )
 
 const (

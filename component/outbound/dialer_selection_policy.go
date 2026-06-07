@@ -31,7 +31,8 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 	case consts.DialerSelectionPolicy_Random,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinLastLatency,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_Failover:
 		return &DialerSelectionPolicy{
 			Policy: fName,
 		}, nil

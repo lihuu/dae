@@ -548,13 +548,13 @@ func newControlPlaneWithContextOptions(
 			outbound.DialerSelectionPolicy{
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
-			}, core.outboundAliveChangeCallback(0, disableKernelAliveCallback)),
+			}, core.outboundAliveChangeCallback(0, disableKernelAliveCallback), nil),
 		outbound.NewDialerGroup(option, consts.OutboundBlock.String(),
 			[]*dialer.Dialer{block}, []*dialer.Annotation{{}},
 			outbound.DialerSelectionPolicy{
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
-			}, core.outboundAliveChangeCallback(1, disableKernelAliveCallback)),
+			}, core.outboundAliveChangeCallback(1, disableKernelAliveCallback), nil),
 	}
 
 	// Filter out groups.
@@ -600,8 +600,22 @@ func newControlPlaneWithContextOptions(
 			finalOption = groupOption
 		}
 		// Create dialer group and append it to outbounds.
+		var failoverCfg *outbound.FailoverConfig
+		if policy.Policy == consts.DialerSelectionPolicy_Failover {
+			recovery := outbound.FailoverRecoveryConfig{
+				ProbeInitial: group.RecoveryProbeInitial,
+				ProbeMax:     group.RecoveryProbeMax,
+				Successes:    group.RecoverySuccesses,
+				StableTime:   group.RecoveryStableTime,
+			}
+			failoverCfg, err = outbound.ValidateFailoverGroup(dialers, annos, recovery)
+			if err != nil {
+				return nil, fmt.Errorf(`failed to create group "%v": %w`, group.Name, err)
+			}
+		}
 		dialerGroup := outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy,
-			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback))
+			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback),
+			failoverCfg)
 		outbounds = append(outbounds, dialerGroup)
 	}
 
@@ -1144,6 +1158,18 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 			}
 		}
 		group.EnsureReloadSelectionFloor(fallback)
+
+		// Inherit failover controller state if identities match.
+		if group.HasFailoverController() && oldGroup.HasFailoverController() {
+			newPrimary, newFallback := group.FailoverIdentity()
+			oldPrimary, oldFallback := oldGroup.FailoverIdentity()
+			if newPrimary == oldPrimary && newFallback == oldFallback {
+				if snap := oldGroup.CaptureFailoverSnapshot(); snap != nil {
+					group.RestoreFailoverSnapshot(snap)
+				}
+			}
+			// If identities differ, the new group stays in primary_active (default).
+		}
 	}
 	return hasOverlap
 }

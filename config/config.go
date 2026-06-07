@@ -130,6 +130,12 @@ type Group struct {
 	UdpCheckDns        []string      `mapstructure:"udp_check_dns"`
 	CheckInterval      time.Duration `mapstructure:"check_interval"`
 	CheckTolerance     time.Duration `mapstructure:"check_tolerance"`
+
+	// Failover recovery settings (only used when policy: failover).
+	RecoveryProbeInitial time.Duration `mapstructure:"recovery_probe_initial" default:"15s"`
+	RecoveryProbeMax     time.Duration `mapstructure:"recovery_probe_max" default:"5m"`
+	RecoverySuccesses    int           `mapstructure:"recovery_successes" default:"3"`
+	RecoveryStableTime   time.Duration `mapstructure:"recovery_stable_time" default:"30s"`
 }
 
 type DnsRequestRouting struct {
