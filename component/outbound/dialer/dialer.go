@@ -123,6 +123,10 @@ type Dialer struct {
 	stickyIpDialer *stickyip.StickyIpDialer
 	proxyIpCache   *ProxyIpCache
 
+	// keepConnectivityCheck is set for failover dialers to ensure
+	// aliveBackground stays alive even without AliveDialerSet registration.
+	keepConnectivityCheck atomic.Bool
+
 	// recoveryState manages exponential backoff for recovery detection.
 	// It is intentionally scoped to a single dialer instance so cloned or
 	// recreated dialers start clean under their own health-check semantics.
@@ -375,6 +379,14 @@ func (d *Dialer) RegisterAliveTransitionCallback(callback func(networkType *Netw
 	d.aliveTransitionMu.Lock()
 	d.aliveTransitionCallbacks = append(d.aliveTransitionCallbacks, callback)
 	d.aliveTransitionMu.Unlock()
+}
+
+// MarkKeepConnectivityCheck signals that this dialer requires the
+// aliveBackground goroutine to remain active, even without AliveDialerSet
+// registrations. Used by the failover controller to observe TCP health
+// transitions from real traffic failures.
+func (d *Dialer) MarkKeepConnectivityCheck() {
+	d.keepConnectivityCheck.Store(true)
 }
 
 func (d *Dialer) notifyAliveTransition(networkType *NetworkType, alive bool) {

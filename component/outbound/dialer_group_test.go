@@ -108,6 +108,56 @@ func newTestGroupForSelection(policy DialerSelectionPolicy) (*DialerGroup, []*di
 	return group, dialers
 }
 
+func TestFailoverGroupInitializesAllBPFConnectivitySlots(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	dialers := []*dialer.Dialer{
+		newNoopDialer(option),
+		newNoopDialer(option),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 1},
+	}
+	failoverCfg := &FailoverConfig{
+		PrimaryIdx:  0,
+		FallbackIdx: 1,
+		Recovery: FailoverRecoveryConfig{
+			ProbeInitial: time.Second,
+			ProbeMax:     time.Minute,
+			Successes:    3,
+			StableTime:   time.Second,
+		},
+	}
+
+	var initialized [8]bool
+	group := NewDialerGroup(
+		option,
+		"failover-connectivity-init",
+		dialers,
+		annotations,
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+			if !alive || !isInit {
+				t.Fatalf("connectivity callback = alive:%v isInit:%v, want true/true", alive, isInit)
+			}
+			initialized[networkType.Index()] = true
+		},
+		failoverCfg,
+	)
+	defer group.Close()
+
+	for _, networkType := range standardSelectionNetworkTypes() {
+		if !initialized[networkType.Index()] {
+			t.Errorf("connectivity slot %q was not initialized", networkType.String())
+		}
+	}
+}
+
 func markDialersDead(set *dialer.AliveDialerSet, dialers ...*dialer.Dialer) {
 	for _, d := range dialers {
 		set.NotifyLatencyChange(d, false)

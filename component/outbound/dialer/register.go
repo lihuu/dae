@@ -68,6 +68,19 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 		}
 	}
 
+	if p.Address != "" {
+		baseDialer = newProxyTransportDiagnosticDialer(baseDialer, gOption.Log, p.Name, p.Address)
+		scopedBaseDialer = scopeTransportCacheDialer(baseDialer, gOption.TransportCacheNamespace)
+		d, _p, err = D.NewNetproxyDialerFromLink(scopedBaseDialer, &gOption.ExtraOption, normalizedLink)
+		if err != nil {
+			return nil, err
+		}
+		p = Property{
+			Property:        *_p,
+			SubscriptionTag: subscriptionTag,
+		}
+	}
+
 	// Debug: log proxy address type
 	if gOption.Log != nil && gOption.Log.IsLevelEnabled(logrus.DebugLevel) {
 		needsCache := p.Address != "" && needsStickyIpCaching(p.Address)

@@ -238,6 +238,13 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		lastRes = res
 
 		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+		dialCtx = dialer.WithProxyTransportDiagnosticContext(
+			dialCtx,
+			res.DialTarget,
+			res.SniffedDomain,
+			res.Outbound.Name,
+			string(res.Outbound.GetSelectionPolicy()),
+		)
 		conn, err := res.Dialer.DialContext(dialCtx, res.Network, res.DialTarget)
 		cancel()
 		if err == nil {

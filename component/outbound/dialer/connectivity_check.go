@@ -573,15 +573,23 @@ func (d *Dialer) aliveBackground() {
 	}
 	var CheckOpts = []*CheckOption{tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt}
 
-	var unusedOnce bool
-	checkUnused := func() bool {
-		var unused int
+	hasRegisteredChecks := func() bool {
 		for _, opt := range CheckOpts {
-			if !d.hasAliveDialerSets(opt.networkType) {
-				unused++
+			if d.hasAliveDialerSets(opt.networkType) {
+				return true
 			}
 		}
-		if unused == len(CheckOpts) {
+		return false
+	}
+
+	var unusedOnce bool
+	checkUnused := func() bool {
+		// Failover dialers have no AliveDialerSet but need the background loop
+		// to observe TCP health transitions from real traffic failures.
+		if d.keepConnectivityCheck.Load() {
+			return false
+		}
+		if !hasRegisteredChecks() {
 			if !unusedOnce {
 				d.Log.WithField("dialer", d.Property().Name).
 					WithField("p", unsafe.Pointer(d)).
@@ -661,6 +669,13 @@ func (d *Dialer) aliveBackground() {
 			checkFamily = consts.L4ProtoStr_TCP
 		}
 
+		// A failover-only dialer has no periodic selection checks. Its timer is
+		// allowed to expire once, then the goroutine waits for targeted traffic
+		// failure notifications without generating background probe traffic.
+		if checkFamily == "" && d.keepConnectivityCheck.Load() && !hasRegisteredChecks() {
+			continue
+		}
+
 		d.TcpCheckOptionRaw.Reset()
 		d.CheckDnsOptionRaw.Reset()
 
@@ -696,6 +711,13 @@ func (d *Dialer) aliveBackground() {
 
 		// Targeted checks don't disturb the periodic timer — only full checks do.
 		if checkFamily != "" {
+			continue
+		}
+
+		// A dialer used only by failover has no periodic schedule to reset.
+		// Shared dialers still retain the ordinary checks required by their
+		// non-failover groups.
+		if d.keepConnectivityCheck.Load() && !hasRegisteredChecks() {
 			continue
 		}
 
@@ -738,8 +760,13 @@ func filterCheckOptsByFamily(opts []*CheckOption, family consts.L4ProtoStr) []*C
 // submitCheckTasks submits check tasks to worker pool.
 func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opts []*CheckOption, isResuscitation bool, cycle *cycleResult) {
 	for _, opt := range opts {
-		// No need to test if there is no dialer selection policy using its latency.
-		if !d.hasAliveDialerSets(opt.networkType) {
+		hasAliveDialerSet := d.hasAliveDialerSets(opt.networkType)
+		// Targeted TCP checks also feed the failover controller, which observes
+		// dialer health transitions without owning an AliveDialerSet.
+		isFailoverTargetedCheck := d.keepConnectivityCheck.Load() &&
+			isResuscitation &&
+			opt.networkType.L4Proto == consts.L4ProtoStr_TCP
+		if !hasAliveDialerSet && !isFailoverTargetedCheck {
 			continue
 		}
 
@@ -758,7 +785,7 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 				return
 			default:
 			}
-			if isResuscitation {
+			if isResuscitation && hasAliveDialerSet {
 				// Stagger resuscitation probes to prevent thundering herd.
 				// Random delay between 0 and 2 seconds, but allow reload/cancel
 				// to interrupt the probe before it starts.

@@ -191,6 +191,9 @@ func NewDialerGroup(
 		)
 		// Failover doesn't use AliveDialerSet, so we store a minimal state.
 		group.selectionState.Store(&dialerGroupSelectionState{policy: p})
+		// Activate the primary's connectivity check so that traffic-driven
+		// TCP failures trigger the failover controller's health transition callback.
+		dialers[failoverCfg.PrimaryIdx].ActivateCheck()
 	} else {
 		state := group.buildSelectionState(p, true)
 		group.registerAliveDialerSets(state.aliveDialerSets)
@@ -198,10 +201,11 @@ func NewDialerGroup(
 	}
 	group.cachedMinCheckInterval = group.MinCheckInterval()
 
-	if p.Policy != consts.DialerSelectionPolicy_Failover {
-		for _, nt := range standardSelectionNetworkTypes() {
-			aliveChangeCallback(true, nt, true)
-		}
+	// Initialize BPF connectivity map for all outbound groups.
+	// This must be called for failover groups too, otherwise BPF will
+	// consider the outbound as dead and drop all packets.
+	for _, nt := range standardSelectionNetworkTypes() {
+		aliveChangeCallback(true, nt, true)
 	}
 
 	return group

@@ -14,12 +14,33 @@ The policy must:
   primary node for recovery.
 - Switch new TCP connections and new UDP sessions back to the primary only
   after stable TCP recovery is confirmed.
-- Avoid periodic probes while the primary node is healthy.
+- Avoid periodic network probes while the primary node is healthy.
 - Avoid reloads, service restarts, configuration rewrites, and forced
   termination of established connections during failover or failback.
 
 This feature does not attempt connection migration. Existing TCP connections
 and UDP endpoints continue using the dialer selected when they were created.
+
+### Health-worker terminology
+
+The dialer's existing connectivity-check worker is also the event consumer for
+targeted checks requested after real traffic failures. A failover group may
+keep this worker active so the dialer can continue maintaining its canonical
+TCP health state and emitting availability transitions.
+
+For this design, "periodic checking" means a timer-driven network probe that
+runs independently of a traffic failure or an active failover recovery
+schedule. Merely keeping the worker or its event channels active is not a
+periodic check and is allowed, provided that:
+
+- `primary_active` produces no timer-driven TCP or UDP network probes solely
+  because the dialer belongs to a failover group.
+- Real TCP dial failures may request a targeted TCP check through the existing
+  worker.
+- Recovery probes are scheduled only by the failover recovery controller after
+  the group enters `fallback_active`.
+- The failover controller remains an observer of the dialer's canonical TCP
+  health transitions and does not introduce a second failure counter.
 
 ## Non-goals
 
@@ -123,11 +144,13 @@ The group has four logical states.
 ### `primary_active`
 
 - New TCP connections and UDP sessions use the primary.
-- No failover recovery timer or periodic health-check ticker runs.
+- No failover recovery timer or timer-driven periodic network probe runs.
 - The policy observes TCP availability transitions produced by real traffic
   and existing explicit failure reporting.
-- Creating a failover group must not activate dae's ordinary periodic
-  latency/health checking merely because the policy exists.
+- The dialer's existing event-driven connectivity-check worker may remain
+  active to consume targeted checks caused by real TCP failures.
+- Creating a failover group must not cause dae's ordinary periodic
+  latency/health probes to run merely because the policy exists.
 - A confirmed primary TCP transition to unavailable enters
   `fallback_active`.
 
@@ -195,8 +218,10 @@ connections fail concurrently.
 
 The failover controller listens to the primary dialer's TCP availability
 transition callback. It does not require an `AliveDialerSet` to select the
-primary or fallback, and it must not use creation of an `AliveDialerSet` as a
-side effect to activate periodic checks.
+primary or fallback. It must not create an `AliveDialerSet` as a side effect of
+failover selection. The dialer's existing connectivity-check worker may be
+kept active only to process event-driven targeted checks and publish canonical
+health transitions; this must not enable ordinary periodic network probes.
 
 ### Failure of the fallback
 
@@ -236,8 +261,9 @@ Requirements:
 - Reuse the primary dialer's existing TCP health-check implementation and
   configured TCP check target.
 - Do not create a separate socket-check implementation.
-- Expose or reuse a cancellable one-shot TCP probe operation. Calling it must
-  not start the dialer's ordinary periodic health-check ticker.
+- Expose or reuse a cancellable one-shot TCP probe operation. Calling it may
+  use an already-active event worker, but must not arm or enable recurring
+  ordinary periodic network probes.
 - Do not probe the fallback periodically for this policy.
 - Ensure at most one pending recovery timer and one active recovery probe per
   failover group.
@@ -367,8 +393,10 @@ Expected areas of change:
 - Existing dialer health callbacks
   - Feed canonical primary TCP transitions into the group controller.
 - Existing TCP connectivity check
-  - Provide a cancellable one-shot probe path without activating the periodic
-    ticker.
+  - Provide a cancellable one-shot probe path without enabling recurring
+    periodic network probes.
+  - Allow the existing event-driven worker to remain active for targeted
+    checks caused by real TCP failures.
 - Reload health inheritance
   - Copy failover-controller state when role identities match.
 
@@ -405,8 +433,12 @@ The design should not add group-to-group references.
 - A failure during recovery resets success and stability state.
 - Completing both conditions switches new TCP and UDP selections to primary.
 - Sustained primary health causes no failover-specific periodic probes.
-- Constructing and using a healthy failover group does not activate ordinary
-  periodic latency checks.
+- Constructing and using a healthy failover group produces no ordinary
+  timer-driven latency or health network probes.
+- Keeping the dialer's event-driven connectivity-check worker active is
+  allowed and does not by itself fail this test.
+- A real TCP failure can request a targeted check through that worker and the
+  resulting canonical TCP transition is observed by the failover controller.
 
 ### Lifecycle and reload tests
 
@@ -430,9 +462,11 @@ The design should not add group-to-group references.
 The feature is complete when:
 
 1. A valid two-node priority configuration starts successfully.
-2. Normal operation adds no failover-specific periodic probes.
-   It also does not activate dae's ordinary periodic checker solely because
-   the group uses `policy: failover`.
+2. While the primary is healthy, normal operation produces no
+   failover-specific or ordinary timer-driven network probes solely because
+   the group uses `policy: failover`. The dialer's existing event-driven
+   connectivity-check worker may remain active to process targeted checks from
+   real TCP failures; worker activation alone is not a violation.
 3. Confirmed primary TCP unavailability switches new TCP and UDP traffic to
    the fallback without reload or restart.
 4. UDP failure alone never changes the active role.

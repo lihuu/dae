@@ -260,6 +260,7 @@ func newTestFixedOutboundGroup(dialers ...*componentdialer.Dialer) *ob.DialerGro
 			FixedIndex: 0,
 		},
 		func(bool, *componentdialer.NetworkType, bool) {},
+		nil,
 	)
 }
 

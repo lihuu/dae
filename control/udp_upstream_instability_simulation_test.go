@@ -37,6 +37,7 @@ func newTestRandomOutboundGroup(dialers ...*componentdialer.Dialer) *ob.DialerGr
 			Policy: consts.DialerSelectionPolicy_Random,
 		},
 		func(bool, *componentdialer.NetworkType, bool) {},
+		nil,
 	)
 }
 

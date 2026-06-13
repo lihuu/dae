@@ -552,6 +552,7 @@ func TestInheritDialerHealthFromUsesReloadSafeSnapshot(t *testing.T) {
 		[]*dialer.Annotation{{}},
 		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(bool, *dialer.NetworkType, bool) {},
+		nil,
 	)
 	defer func() { _ = oldGroup.Close() }()
 	newGroup := outbound.NewDialerGroup(
@@ -565,6 +566,7 @@ func TestInheritDialerHealthFromUsesReloadSafeSnapshot(t *testing.T) {
 		[]*dialer.Annotation{{}},
 		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(bool, *dialer.NetworkType, bool) {},
+		nil,
 	)
 	defer func() { _ = newGroup.Close() }()
 
@@ -629,6 +631,7 @@ func TestInheritDialerHealthFromDoesNotReviveDeadDialerWhenGroupHasCandidate(t *
 		[]*dialer.Annotation{{}, {}},
 		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(bool, *dialer.NetworkType, bool) {},
+		nil,
 	)
 	defer func() { _ = oldGroup.Close() }()
 	newGroup := outbound.NewDialerGroup(
@@ -642,6 +645,7 @@ func TestInheritDialerHealthFromDoesNotReviveDeadDialerWhenGroupHasCandidate(t *
 		[]*dialer.Annotation{{}, {}},
 		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(bool, *dialer.NetworkType, bool) {},
+		nil,
 	)
 	defer func() { _ = newGroup.Close() }()
 
@@ -705,6 +709,7 @@ func TestInheritDialerHealthFromReturnsFalseWhenNoOverlap(t *testing.T) {
 		[]*dialer.Annotation{{}},
 		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(bool, *dialer.NetworkType, bool) {},
+		nil,
 	)
 	defer func() { _ = oldGroup.Close() }()
 	newGroup := outbound.NewDialerGroup(
@@ -718,6 +723,7 @@ func TestInheritDialerHealthFromReturnsFalseWhenNoOverlap(t *testing.T) {
 		[]*dialer.Annotation{{}},
 		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(bool, *dialer.NetworkType, bool) {},
+		nil,
 	)
 	defer func() { _ = newGroup.Close() }()
 

@@ -12,7 +12,7 @@
 - [x] Implement config validation (exactly 2 dialers, valid priorities 0/1, no duplicates, valid durations, etc.)
 
 ### State Machine
-- [x] Implement `primary_active` state — select primary, no probes
+- [x] Implement `primary_active` state — select primary, no timer-driven network probes; event worker may remain active
 - [x] Implement `fallback_active` state — select fallback, start recovery probe schedule
 - [x] Implement `recovering` state — select fallback, probe primary, count consecutive successes + stable time
 - [x] Implement `fallback_unavailable` — fallback dial error returns error, no infinite loop
@@ -24,7 +24,7 @@
 
 ### Health & Probing
 - [x] Wire primary TCP health transitions (`alive -> not alive`) into failover controller
-- [x] Implement cancellable one-shot TCP probe (reuse existing health-check, no periodic ticker)
+- [x] Implement cancellable one-shot TCP probe (reuse existing health-check, no recurring periodic network probes)
 - [x] Exponential backoff: `initial, initial*2, initial*4, ... max`
 - [x] After first success: reset backoff, probe at `initial` interval, require `recovery_successes` + `recovery_stable_time`
 

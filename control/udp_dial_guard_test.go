@@ -120,6 +120,7 @@ func TestShouldRejectNewUdpDialSelection_SingleDialerFallbackStillRejects(t *tes
 			Policy: consts.DialerSelectionPolicy_Random,
 		},
 		func(bool, *componentdialer.NetworkType, bool) {},
+		nil,
 	)
 
 	d.ReportUnavailableForced(udp6, nil)

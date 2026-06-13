@@ -819,7 +819,11 @@ func TestFailoverControllerExplicitProbeFailureResetsSuccesses(t *testing.T) {
 	}
 }
 
-func TestFailoverGroupDoesNotKeepOrdinaryPeriodicCheckerActive(t *testing.T) {
+func TestFailoverGroupActivatesPrimaryConnectivityCheck(t *testing.T) {
+	// Failover groups must activate the primary's connectivity check so that
+	// traffic-driven TCP failures trigger the health transition callback.
+	// The connectivity check goroutine stays alive (via keepConnectivityCheck)
+	// but does NOT create AliveDialerSets for selection.
 	option := &dialer.GlobalOption{
 		Log:               log,
 		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
@@ -850,12 +854,14 @@ func TestFailoverGroupDoesNotKeepOrdinaryPeriodicCheckerActive(t *testing.T) {
 	)
 	defer group.Close()
 
-	primary.ActivateCheck()
-	deadline := time.Now().Add(time.Second)
-	for primary.ConnectivityCheckActive() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	// Connectivity check should be active for the primary dialer.
+	if !primary.ConnectivityCheckActive() {
+		t.Fatal("failover group should activate primary connectivity check")
 	}
-	if primary.ConnectivityCheckActive() {
-		t.Fatal("failover group kept ordinary periodic checker active")
+
+	// But the group must NOT create AliveDialerSets (selection is via
+	// failover controller, not latency-based selection).
+	if state := group.currentSelectionState(); state.aliveDialerSets[0] != nil {
+		t.Fatal("failover group must not create AliveDialerSet")
 	}
 }

@@ -110,6 +110,9 @@ func NewFailoverController(
 
 	// Register for primary's TCP health transitions.
 	primary.RegisterAliveTransitionCallback(fc.onPrimaryHealthChange)
+	// Keep the primary's connectivity check goroutine alive so that
+	// traffic-driven failures are detected and the above callback fires.
+	primary.MarkKeepConnectivityCheck()
 
 	return fc
 }
