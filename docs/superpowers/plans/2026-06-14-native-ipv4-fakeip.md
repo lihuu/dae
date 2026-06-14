@@ -4,7 +4,7 @@
 
 **Goal:** Add native IPv4 FakeIP DNS answers and transparent TCP/UDP forwarding while preserving the existing independent DNS-routing and business-routing pipelines.
 
-**Architecture:** `dns.routing.request` gains a built-in `fakeip` outbound backed by a persistent, append-only IPv4 mapping store. DNS answers publish the domain bitmap against the synthetic address, eBPF always redirects FakeIP destinations to userspace while preserving its first and only business-routing result, and userspace reverses the synthetic address only to construct the dial target. Proxy outbounds receive the original domain; `direct` and `must_direct` resolve that domain through the configured `direct_upstream` without re-entering DNS request routing.
+**Architecture:** `dns.routing.request` gains a built-in `fakeip` outbound backed by a persistent, append-only IPv4 mapping store. DNS answers publish the domain bitmap against the synthetic address, eBPF redirects FakeIP destinations to userspace while preserving its first and only business-routing result, and userspace reverses the synthetic address only to construct the dial target. Proxy outbounds receive the original domain. Ordinary real-IP direct traffic must retain dae's eBPF kernel fast path; the first-version `direct_upstream` handling is only a safety fallback for the undesirable `FakeIP + direct` intersection and is explicitly tracked as future optimization debt.
 
 **Tech Stack:** Go 1.26, miekg/dns, cilium/ebpf, bbolt, Linux TC eBPF, existing dae DNS controller and TCP/UDP endpoint pool, Go tests, BPF C tests.
 
@@ -709,6 +709,11 @@ git commit -m "feat(fakeip): dial proxy TCP by authoritative domain"
 - Test: `control/dns_fakeip_test.go`
 - Test: `control/tcp_fakeip_test.go`
 
+This task implements a correctness fallback, not the desired steady-state
+direct architecture. Known direct domains must use real DNS and remain on the
+existing eBPF kernel fast path. Instrument this path so later work can measure
+and eliminate `FakeIP + direct` traffic.
+
 - [ ] **Step 1: Write failing named-upstream and direct tests**
 
 ```go
@@ -716,6 +721,7 @@ func TestDNSLookupNamedUpstream(t *testing.T)
 func TestResolveAWithNamedUpstreamBypassesDNSRequestRouting(t *testing.T)
 func TestTCPFakeIPDirectResolvesWithConfiguredUpstream(t *testing.T)
 func TestTCPFakeIPDirectResolutionFailureDoesNotFallback(t *testing.T)
+func TestRealIPDirectTrafficRetainsKernelFastPath(t *testing.T)
 ```
 
 The bypass test must configure DNS request fallback `fakeip`, then call the direct resolver and prove only the named `cn` upstream received the A query.
@@ -891,11 +897,15 @@ State explicitly:
 - DNS request routing and business routing remain independent.
 - A uses FakeIP; AAAA and other qtypes routed to FakeIP return NODATA.
 - Proxy traffic sends the domain to the remote endpoint.
-- Direct traffic uses only `direct_upstream`.
+- Ordinary direct traffic uses real DNS and retains the eBPF kernel fast path.
+- `FakeIP + direct` uses `direct_upstream` only as a first-version safety
+  fallback and is a tracked performance issue, not the final architecture.
 - No automatic allocation reuse exists in v1.
 - Changing enabled state, CIDR, or store path requires restart.
 - TTL and `direct_upstream` are reloadable.
 - `auto` DNS routing, IPv6 FakeIP, reclamation, and inspection commands are future work.
+- Eliminating or minimizing `FakeIP + direct` is mandatory future work; broad
+  userspace forwarding of direct traffic is not acceptable.
 
 - [ ] **Step 2: Verify docs and commit**
 
@@ -1064,8 +1074,9 @@ Update operational documentation only with verified facts: installed version, ac
 - [ ] China, local, proxy-node, and explicitly excluded domains continue using their selected real upstreams.
 - [ ] AAAA and non-A queries selected for FakeIP return NODATA.
 - [ ] eBPF performs business routing once and preserves the selected outbound into userspace.
+- [ ] Existing real-IP direct traffic remains on the eBPF kernel fast path and does not enter userspace because FakeIP is enabled.
 - [ ] Proxy TCP/UDP sends the original domain to the selected proxy without local foreign resolution.
-- [ ] Direct/must-direct TCP/UDP resolves only through `direct_upstream`.
+- [ ] The exceptional `FakeIP + direct/must_direct` path resolves only through `direct_upstream` and is observable for later elimination.
 - [ ] Unknown FakeIP addresses never reach the WAN.
 - [ ] Mappings survive reload and restart; DNS cache eviction does not reclaim them.
 - [ ] Pool exhaustion and persistence failures return SERVFAIL without publishing partial mappings.

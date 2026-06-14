@@ -13,6 +13,8 @@ The first version must:
   `fakeip`, `asis`, and `reject`.
 - Return stable synthetic IPv4 addresses for queries routed to `fakeip`.
 - Preserve dae's existing business `routing` rules and eBPF routing model.
+- Preserve dae's kernel fast path for ordinary direct traffic. Adding FakeIP
+  must not turn real-IP direct traffic into a userspace-forwarded path.
 - Route each connection exactly once using the existing business routing
   pipeline and the connection's complete metadata.
 - Send the original domain name to proxy outbounds without resolving that
@@ -356,6 +358,45 @@ The eBPF data plane must:
 This forced userspace path applies even if a rule would otherwise select
 `direct` or `must_direct`.
 
+### Known performance issue: FakeIP selected as direct
+
+This forced path creates an important first-version performance exception:
+
+- Proxy traffic already requires dae userspace to implement the proxy
+  protocol, so FakeIP reverse lookup adds little structural overhead.
+- Ordinary real-IP traffic selected as `direct` remains in the existing eBPF
+  kernel fast path and must not be redirected to userspace.
+- A FakeIP destination whose business result is `direct` or `must_direct`
+  cannot use that kernel fast path. Userspace must currently recover the
+  domain, resolve a real address, and relay the connection.
+
+The third case loses one of dae's primary architectural advantages. It is a
+correctness and safety fallback, not an acceptable steady-state design for a
+large portion of direct traffic.
+
+The first version therefore has this operational invariant:
+
+```text
+domain expected to be direct
+  -> dns.routing.request selects a real DNS upstream
+  -> client connects to a real IP
+  -> eBPF selects direct
+  -> kernel forwards without dae userspace relay
+
+domain selected for FakeIP
+  -> business routing should normally select a proxy or block
+```
+
+Operators must keep known direct domains outside FakeIP through explicit DNS
+request rules. A `FakeIP + direct` result indicates incomplete agreement
+between DNS request routing and business routing, or a business decision that
+depends on metadata unavailable at DNS-query time.
+
+This limitation must remain visible in implementation logs, tests, and
+documentation. Future work must reduce or eliminate the `FakeIP + direct`
+intersection rather than accepting broad userspace forwarding as the final
+architecture.
+
 ### Business routing
 
 When a FakeIP is allocated, dae computes the same domain-rule bitmap that it
@@ -412,6 +453,10 @@ This is primarily a safety path for DNS and business-rule disagreement or
 business rules whose final result depends on port, protocol, source, MAC, or
 process metadata. Operators should normally exclude known direct domains from
 FakeIP through explicit DNS request rules.
+
+This safety path is intentionally not considered performance-equivalent to
+dae's normal direct path. It must not be used to justify routing all public
+domains to FakeIP without measuring how many flows later resolve to `direct`.
 
 ### Blocked traffic
 
@@ -616,6 +661,31 @@ define deterministic behavior for:
 
 Until those semantics are defined, explicit `dns.routing.request` rules remain
 the authoritative DNS-answer policy.
+
+### Preserve the eBPF direct fast path
+
+The preferred optimization direction is to prevent domains that will use
+`direct` from receiving FakeIP answers, so their traffic continues to use
+dae's real-IP eBPF fast path.
+
+The future design must:
+
+- Reuse business domain rules where their result is deterministic at DNS-query
+  time.
+- Keep explicit DNS routing available for rules whose result depends on port,
+  protocol, source address, MAC address, process name, mark, or other
+  connection-only metadata.
+- Expose the number of `FakeIP + direct` flows so configuration disagreement is
+  measurable.
+- Avoid silently converting ordinary direct traffic into permanent userspace
+  relaying.
+- Preserve the rule that proxy domains are sent to the proxy as domains and do
+  not require local foreign DNS resolution.
+
+`fallback: auto` is one possible mechanism, but it is not sufficient by itself
+for metadata-dependent business rules. The optimization requires an explicit
+policy for ambiguous domains, such as requiring a DNS override or choosing a
+conservative real-DNS answer.
 
 ### Safe reclamation
 
