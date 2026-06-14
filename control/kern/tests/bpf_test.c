@@ -1570,3 +1570,170 @@ int testcheck_not_mismtach(struct __sk_buff *skb)
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
+
+/* Helper to enable FakeIP for tests with a /15 prefix (198.18.0.0/15).
+ * Network and mask are stored in LE byte order matching the packet bytes. */
+static __always_inline void enable_fakeip_198_18(void)
+{
+	__u32 zero = 0;
+	struct fakeip_test_override ov = {};
+
+	/* 198.18.0.0 = 0xC6120000 in network byte order bytes: [C6,12,00,00]
+	 * As LE uint32: 0x000012C6 */
+	ov.network = 0x000012C6;
+	/* /15 mask = [FF,FE,00,00] in network order bytes
+	 * As LE uint32: 0x0000FEFF */
+	ov.mask = 0x0000FEFF;
+	ov.enabled = 1;
+	bpf_map_update_elem(&fakeip_test_override_map, &zero, &ov, BPF_ANY);
+}
+
+static __always_inline void disable_fakeip(void)
+{
+	__u32 zero = 0;
+	bpf_map_delete_elem(&fakeip_test_override_map, &zero);
+}
+
+/* FakeIP + routing DIRECT → redirect to userspace */
+SEC("tc/pktgen/fakeip_tcp_direct")
+int testpktgen_fakeip_tcp_direct(struct __sk_buff *skb)
+{
+	/* Destination 198.18.5.6 is within 198.18.0.0/15 */
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/fakeip_tcp_direct")
+int testsetup_fakeip_tcp_direct(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+
+	/* fallback: direct */
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_tcp_direct")
+int testcheck_fakeip_tcp_direct(struct __sk_buff *skb)
+{
+	/* Even though routing says DIRECT, FakeIP dest should redirect */
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_REDIRECT,
+					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19233, 80,
+					    OUTBOUND_DIRECT, 0, true);
+}
+
+/* FakeIP + routing PROXY → redirect (same as normal proxy) */
+SEC("tc/pktgen/fakeip_tcp_proxy")
+int testpktgen_fakeip_tcp_proxy(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/fakeip_tcp_proxy")
+int testsetup_fakeip_tcp_proxy(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+
+	/* fallback: proxy */
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_tcp_proxy")
+int testcheck_fakeip_tcp_proxy(struct __sk_buff *skb)
+{
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_REDIRECT,
+					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19233, 80,
+					    OUTBOUND_USER_DEFINED_MIN, 0, true);
+}
+
+/* FakeIP + routing BLOCK → drop */
+SEC("tc/pktgen/fakeip_tcp_block")
+int testpktgen_fakeip_tcp_block(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/fakeip_tcp_block")
+int testsetup_fakeip_tcp_block(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+
+	/* fallback: block */
+	set_routing_fallback(OUTBOUND_BLOCK, false);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_tcp_block")
+int testcheck_fakeip_tcp_block(struct __sk_buff *skb)
+{
+	return TC_ACT_SHOT;
+}
+
+/* Non-FakeIP + routing DIRECT → pass through (TC_ACT_OK) */
+SEC("tc/pktgen/non_fakeip_direct")
+int testpktgen_non_fakeip_direct(struct __sk_buff *skb)
+{
+	/* Destination 1.1.1.1 is NOT within 198.18.0.0/15 */
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(1,1,1,1), 19233, 80);
+}
+
+SEC("tc/setup/non_fakeip_direct")
+int testsetup_non_fakeip_direct(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/non_fakeip_direct")
+int testcheck_non_fakeip_direct(struct __sk_buff *skb)
+{
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_OK,
+					    IPV4(192,168,0,1), IPV4(1,1,1,1),
+					    19233, 80,
+					    OUTBOUND_DIRECT, 0, true);
+}
+
+/* FakeIP disabled + routing DIRECT → pass through */
+SEC("tc/pktgen/fakeip_disabled_direct")
+int testpktgen_fakeip_disabled_direct(struct __sk_buff *skb)
+{
+	/* Same destination as fakeip_tcp_direct but FakeIP is disabled */
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/fakeip_disabled_direct")
+int testsetup_fakeip_disabled_direct(struct __sk_buff *skb)
+{
+	disable_fakeip();
+
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_disabled_direct")
+int testcheck_fakeip_disabled_direct(struct __sk_buff *skb)
+{
+	/* Without FakeIP enabled, DIRECT passes through */
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_OK,
+					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19233, 80,
+					    OUTBOUND_DIRECT, 0, true);
+}

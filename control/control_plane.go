@@ -7,6 +7,7 @@ package control
 
 import (
 	"context"
+	"encoding/binary"
 	stderrors "errors"
 	"fmt"
 	"net"
@@ -495,9 +496,46 @@ func newControlPlaneWithContextOptions(
 		}
 	} else {
 		bpf = new(bpfObjects)
+		// Parse FakeIP prefix for BPF constants. The prefix is converted to
+		// network-byte-order network/mask values that the eBPF program uses
+		// to test destination addresses via byte-level bitwise AND.
+		var fakeIPV4Network, fakeIPV4Mask uint32
+		fakeIPEnabled := false
+		if dnsConfig.FakeIP.Enabled {
+			fakeIPEnabled = true
+			prefix, err := netip.ParsePrefix(dnsConfig.FakeIP.Inet4Range)
+			if err != nil {
+				return nil, fmt.Errorf("parse fakeip inet4_range: %w", err)
+			}
+			masked := prefix.Masked()
+			// Network address bytes (network byte order, big-endian).
+			addrBytes := masked.Addr().As4()
+			// Build mask bytes in network order.
+			var maskBytes [4]byte
+			bits := masked.Bits()
+			for i := 0; i < 4; i++ {
+				if bits >= 8 {
+					maskBytes[i] = 0xFF
+					bits -= 8
+				} else if bits > 0 {
+					maskBytes[i] = ^uint8(0xFF >> bits)
+					bits = 0
+				} else {
+					maskBytes[i] = 0
+				}
+			}
+			// Reinterpret the network-order bytes as a little-endian uint32 so
+			// that when written to BPF .rodata on LE targets the byte layout
+			// matches the packet's network-order bytes for bitwise AND.
+			fakeIPV4Network = binary.LittleEndian.Uint32(addrBytes[:])
+			fakeIPV4Mask = binary.LittleEndian.Uint32(maskBytes[:])
+		}
 		if err = fullLoadBpfObjects(log, bpf, &loadBpfOptions{
 			PinPath:           pinPath,
 			CollectionOptions: collectionOpts,
+			FakeIPEnabled:    fakeIPEnabled,
+			FakeIPV4Network:  fakeIPV4Network,
+			FakeIPV4Mask:     fakeIPV4Mask,
 		}, global.SoMarkFromDae); err != nil {
 			if log.Level == logrus.PanicLevel {
 				log.Panicln(err)

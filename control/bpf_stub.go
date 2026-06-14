@@ -37,6 +37,10 @@ type bpfDaeParam struct {
 	HasBpfGetCurrentTask uint8
 	Padding2             uint16
 	DaeSocketMark        uint32 // mark set on dae's own sockets to identify them in eBPF
+	FakeipV4Network      uint32 // FakeIP IPv4 network address in network byte order
+	FakeipV4Mask         uint32 // FakeIP IPv4 prefix mask in network byte order
+	FakeipEnabled        uint8  // 0=disabled, 1=enabled
+	FakeipPadding        [3]uint8
 }
 
 type bpfDomainRouting struct {
@@ -373,6 +377,9 @@ type loadBpfOptions struct {
 	PinPath             string
 	BigEndianTproxyPort uint32
 	CollectionOptions   *ebpf.CollectionOptions
+	FakeIPEnabled       bool
+	FakeIPV4Network     uint32
+	FakeIPV4Mask        uint32
 }
 
 const fastSockPlaceholderMaxEntries = 1

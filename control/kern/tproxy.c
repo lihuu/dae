@@ -182,12 +182,67 @@ struct dae_param {
 	// When bpf_sk_lookup_* finds a socket, we check this mark to skip dae's own sockets.
 	// This prevents false positives in NAT loopback detection for transparent proxying.
 	__u32 dae_socket_mark;
+	// FakeIP interception: when enabled, destinations within the configured
+	// IPv4 prefix are redirected to userspace even if routing result is DIRECT.
+	__u32 fakeip_v4_network; // network address in network byte order
+	__u32 fakeip_v4_mask;    // prefix mask in network byte order
+	__u8 fakeip_enabled;     // 0=disabled, 1=enabled
+	__u8 fakeip_padding[3];
 };
 
 /* Use const volatile for cilium/ebpf v0.20.0 compatibility.
  * This ensures the variable is placed in .rodata section and
  * can be rewritten from userspace via RewriteConstants. */
 const volatile struct dae_param PARAM = {};
+
+#ifdef __BPF_TEST_ENABLE_DEBUG
+/* Test-only override for FakeIP parameters. When this map exists and entry 0
+ * is populated, it takes precedence over PARAM for FakeIP checks. This allows
+ * BPF tests to enable FakeIP without rewriting .rodata constants. */
+struct fakeip_test_override {
+	__u32 network;
+	__u32 mask;
+	__u8 enabled;
+	__u8 padding[3];
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct fakeip_test_override);
+	__uint(max_entries, 1);
+} fakeip_test_override_map SEC(".maps");
+#endif
+
+/* is_fakeip_v4_destination checks whether the destination IPv4 address falls
+ * within the configured FakeIP prefix. Works on IPv4-mapped IPv6 addresses
+ * where the IPv4 portion is in u6_addr32[3]. */
+static __always_inline bool
+is_fakeip_v4_destination(const struct tuples_key *five)
+{
+	__u32 network, mask;
+	__u8 enabled;
+
+#ifdef __BPF_TEST_ENABLE_DEBUG
+	__u32 zero = 0;
+	struct fakeip_test_override *ov =
+		bpf_map_lookup_elem(&fakeip_test_override_map, &zero);
+	if (ov) {
+		enabled = ov->enabled;
+		network = ov->network;
+		mask = ov->mask;
+	} else
+#endif
+	{
+		enabled = PARAM.fakeip_enabled;
+		network = PARAM.fakeip_v4_network;
+		mask = PARAM.fakeip_v4_mask;
+	}
+
+	if (!enabled)
+		return false;
+	__be32 dst = five->dip.u6_addr32[3];
+	return (dst & mask) == network;
+}
 
 /* fast_sock map and sk_msg programs are preserved here strictly for ABI compatibility
  * with Go's generated bpf2go code (bpf_stub.go) and tcp_offload_linux.go.
@@ -2302,7 +2357,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link_h_le
 		outbound = tcp_state->meta.data.outbound;
 		mark = tcp_state->meta.data.mark;
 
-		if (outbound == OUTBOUND_DIRECT) {
+		if (outbound == OUTBOUND_DIRECT &&
+		    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 			skb->mark = mark;
 			return TC_ACT_OK;
 		}
@@ -2349,7 +2405,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link_h_le
 				__u8 outbound = udp_state->meta.data.outbound;
 				__u32 mark = udp_state->meta.data.mark;
 
-				if (outbound == OUTBOUND_DIRECT) {
+				if (outbound == OUTBOUND_DIRECT &&
+				    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 					skb->mark = mark;
 					goto direct;
 				} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
@@ -2508,8 +2565,11 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link_h_le
 	// If we couldn't store conn state for a TCP packet that needs proxying,
 	// we MUST drop it to prevent traffic leakage on subsequent packets.
 	if (pkt->l4proto == IPPROTO_TCP && !tcp_state) {
-		if (outbound == OUTBOUND_DIRECT && mark == 0) {
-			// Direct connection with default routing - no state needed
+		if (outbound == OUTBOUND_DIRECT && mark == 0 &&
+		    !is_fakeip_v4_destination(&pkt->tuples.five)) {
+			// Direct connection with default routing - no state needed.
+			// FakeIP destinations require userspace redirection even when
+			// routing says DIRECT, so they need conn state.
 			skb->mark = mark;
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			bpf_printk("tcp(lan): GO OUTBOUND_DIRECT (MAP FULL)");
@@ -2541,8 +2601,12 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link_h_le
 	}
 #endif
 
-	// Handle routing result: DIRECT, BLOCK, or proxy
-	if (outbound == OUTBOUND_DIRECT) {
+	// Handle routing result: DIRECT, BLOCK, or proxy.
+	// FakeIP destinations are always redirected to userspace (even when
+	// routing says DIRECT) so userspace can resolve the authoritative domain
+	// and dial the real address.
+	if (outbound == OUTBOUND_DIRECT &&
+	    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 		// Direct connection - pass through to kernel stack
 		skb->mark = mark;
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
