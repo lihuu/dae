@@ -6,6 +6,9 @@
 package config
 
 import (
+	"fmt"
+	"net/netip"
+
 	"github.com/daeuniverse/dae/common"
 	"github.com/sirupsen/logrus"
 	"strings"
@@ -21,6 +24,7 @@ var patches = []patch{
 	patchTcpCheckHttpMethod,
 	patchEmptyDns,
 	patchMustOutbound,
+	patchDnsFakeIP,
 }
 
 func patchBootstrapResolver(params *Config) error {
@@ -70,5 +74,53 @@ func patchMustOutbound(params *Config) error {
 		})
 		params.Routing.Fallback = f
 	}
+	return nil
+}
+
+func patchDnsFakeIP(params *Config) error {
+	fakeip := &params.Dns.FakeIP
+	if !fakeip.Enabled {
+		return nil
+	}
+
+	prefix, err := netip.ParsePrefix(fakeip.Inet4Range)
+	if err != nil {
+		return fmt.Errorf("dns.fakeip.inet4_range: %w", err)
+	}
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("dns.fakeip.inet4_range: must be an IPv4 prefix")
+	}
+	if prefix.Bits() > 30 {
+		return fmt.Errorf("dns.fakeip.inet4_range: /%d has no allocatable IPv4 addresses", prefix.Bits())
+	}
+
+	if fakeip.TTL <= 0 {
+		return fmt.Errorf("dns.fakeip.ttl: ttl must be positive")
+	}
+
+	if fakeip.Store == "" {
+		return fmt.Errorf("dns.fakeip.store: store path must not be empty")
+	}
+
+	if fakeip.DirectUpstream == "" {
+		return fmt.Errorf("dns.fakeip.direct_upstream is required when fakeip is enabled")
+	}
+
+	switch strings.ToLower(fakeip.DirectUpstream) {
+	case "fakeip", "asis", "reject":
+		return fmt.Errorf("dns.fakeip.direct_upstream must be a real DNS upstream, not %q", fakeip.DirectUpstream)
+	}
+
+	upstreamNames := make(map[string]bool)
+	for _, upstreamRaw := range params.Dns.Upstream {
+		tag, _ := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
+		if tag != "" {
+			upstreamNames[tag] = true
+		}
+	}
+	if !upstreamNames[fakeip.DirectUpstream] {
+		return fmt.Errorf("dns.fakeip.direct_upstream: upstream %q not found in dns.upstream", fakeip.DirectUpstream)
+	}
+
 	return nil
 }

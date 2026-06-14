@@ -423,5 +423,26 @@ func dnsConfigFingerprint(dns config.Dns) string {
 	b.WriteString("max_cache_size=")
 	b.WriteString(strconv.Itoa(dns.MaxCacheSize))
 	b.WriteByte(';')
+	b.WriteString("fakeip.enabled=")
+	b.WriteString(strconv.FormatBool(dns.FakeIP.Enabled))
+	b.WriteByte(';')
+	b.WriteString("fakeip.inet4_range=")
+	b.WriteString(strconv.Quote(dns.FakeIP.Inet4Range))
+	b.WriteByte(';')
+	b.WriteString("fakeip.ttl=")
+	b.WriteString(strconv.Itoa(dns.FakeIP.TTL))
+	b.WriteByte(';')
+	b.WriteString("fakeip.store=")
+	b.WriteString(strconv.Quote(dns.FakeIP.Store))
+	b.WriteByte(';')
+	b.WriteString("fakeip.direct_upstream=")
+	b.WriteString(strconv.Quote(dns.FakeIP.DirectUpstream))
+	b.WriteByte(';')
 	return b.String()
+}
+
+// fakeIPStoreIdentity returns a stable identity for FakeIP store compatibility
+// across reloads. Changes to enabled, inet4_range, or store require a full restart.
+func fakeIPStoreIdentity(dns config.Dns) string {
+	return dns.FakeIP.StoreIdentity()
 }

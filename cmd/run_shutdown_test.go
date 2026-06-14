@@ -516,6 +516,7 @@ func TestDNSConfigFingerprintCoversAllDnsFields(t *testing.T) {
 		"OptimisticCache":    {},
 		"OptimisticCacheTtl": {},
 		"MaxCacheSize":       {},
+		"FakeIP":             {},
 	}
 
 	dnsType := reflect.TypeOf(config.Dns{})

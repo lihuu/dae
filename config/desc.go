@@ -29,9 +29,10 @@ mac: Match source MAC address. It works on LAN mode.`,
 }
 
 var SectionDescription = map[string]Desc{
-	"GlobalDesc": GlobalDesc,
-	"DnsDesc":    DnsDesc,
-	"GroupDesc":  GroupDesc,
+	"GlobalDesc":      GlobalDesc,
+	"DnsDesc":         DnsDesc,
+	"DnsFakeIPDesc":   DnsFakeIPDesc,
+	"GroupDesc":       GroupDesc,
 }
 
 var GlobalDesc = Desc{
@@ -75,6 +76,15 @@ Internal selectors only affect dae's own requests, must point to names defined i
 	"response": `DNS responses will follow this routing.
 Built-in outbound: accept, reject.
 Available functions: qname, qtype, ip, upstream`,
+	"fakeip": "FakeIP configuration for synthetic DNS responses. When enabled, DNS queries routed to the built-in 'fakeip' outbound receive stable synthetic IPv4 addresses without querying an external DNS upstream.",
+}
+
+var DnsFakeIPDesc = Desc{
+	"enabled":         "Enable FakeIP mode. Default: false.",
+	"inet4_range":     "IPv4 prefix for synthetic addresses. Default: 198.18.0.0/15. Network and broadcast addresses are reserved.",
+	"ttl":             "TTL in seconds for synthetic A records. Default: 60. TTL expiration does not release the mapping.",
+	"store":           "Persistent database path for FakeIP domain-to-IP mappings. Default: /var/lib/dae/fakeip.db.",
+	"direct_upstream": "Name of a real DNS upstream declared in dns.upstream. Required when FakeIP is enabled. Used only when business routing selects direct for a FakeIP destination.",
 }
 
 var GroupDesc = Desc{

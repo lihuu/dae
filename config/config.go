@@ -150,6 +150,24 @@ type DnsRouting struct {
 	Request  DnsRequestRouting  `mapstructure:"request"`
 	Response DnsResponseRouting `mapstructure:"response"`
 }
+
+type DnsFakeIP struct {
+	Enabled        bool   `mapstructure:"enabled" default:"false"`
+	Inet4Range     string `mapstructure:"inet4_range" default:"198.18.0.0/15"`
+	TTL            int    `mapstructure:"ttl" default:"60"`
+	Store          string `mapstructure:"store" default:"/var/lib/dae/fakeip.db"`
+	DirectUpstream string `mapstructure:"direct_upstream"`
+}
+
+// StoreIdentity returns a stable identity for FakeIP store compatibility
+// across reloads. Changes to enabled, inet4_range, or store require a full restart.
+func (f DnsFakeIP) StoreIdentity() string {
+	if !f.Enabled {
+		return "disabled"
+	}
+	return f.Inet4Range + "\x00" + f.Store
+}
+
 type KeyableString string
 
 // Dns is intentionally mirrored by cmd.dnsConfigFingerprint for staged reload
@@ -164,6 +182,7 @@ type Dns struct {
 	OptimisticCache    bool            `mapstructure:"optimistic_cache" default:"true"`
 	OptimisticCacheTtl int             `mapstructure:"optimistic_cache_ttl" default:"60"`
 	MaxCacheSize       int             `mapstructure:"max_cache_size" default:"0"`
+	FakeIP             DnsFakeIP       `mapstructure:"fakeip" desc:"DnsFakeIPDesc"`
 }
 
 type Routing struct {
