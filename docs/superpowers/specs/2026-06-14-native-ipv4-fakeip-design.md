@@ -392,10 +392,10 @@ request rules. A `FakeIP + direct` result indicates incomplete agreement
 between DNS request routing and business routing, or a business decision that
 depends on metadata unavailable at DNS-query time.
 
-This limitation must remain visible in implementation logs, tests, and
-documentation. Future work must reduce or eliminate the `FakeIP + direct`
-intersection rather than accepting broad userspace forwarding as the final
-architecture.
+This limitation must remain visible in tests and documentation. Flow counting
+and diagnostic logs are deferred until after the first version is complete.
+Future work must reduce or eliminate the `FakeIP + direct` intersection rather
+than accepting broad userspace forwarding as the final architecture.
 
 ### Business routing
 
@@ -675,8 +675,6 @@ The future design must:
 - Keep explicit DNS routing available for rules whose result depends on port,
   protocol, source address, MAC address, process name, mark, or other
   connection-only metadata.
-- Expose the number of `FakeIP + direct` flows so configuration disagreement is
-  measurable.
 - Avoid silently converting ordinary direct traffic into permanent userspace
   relaying.
 - Preserve the rule that proxy domains are sent to the proxy as domains and do
@@ -686,6 +684,28 @@ The future design must:
 for metadata-dependent business rules. The optimization requires an explicit
 policy for ambiguous domains, such as requiring a DNS override or choosing a
 conservative real-DNS answer.
+
+### Measure `FakeIP + direct`
+
+After the first version is complete, add rate-limited diagnostic logs and
+counters for flows whose DNS answer was FakeIP but whose final business
+outbound is `direct` or `must_direct`.
+
+At minimum, expose:
+
+```text
+fakeip_direct_tcp_flows
+fakeip_direct_udp_flows
+fakeip_proxy_flows
+```
+
+Diagnostic logs should include the recovered domain, protocol, destination
+port, and selected outbound without logging every packet. These measurements
+will show whether the safety fallback is rare as expected and identify domains
+that should move to real DNS rules or be handled by the future `auto` policy.
+
+This measurement work is explicitly not part of the first-version
+implementation plan.
 
 ### Safe reclamation
 

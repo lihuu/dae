@@ -711,8 +711,8 @@ git commit -m "feat(fakeip): dial proxy TCP by authoritative domain"
 
 This task implements a correctness fallback, not the desired steady-state
 direct architecture. Known direct domains must use real DNS and remain on the
-existing eBPF kernel fast path. Instrument this path so later work can measure
-and eliminate `FakeIP + direct` traffic.
+existing eBPF kernel fast path. Per-flow counters and diagnostic logs for this
+path are deferred to the post-v1 optimization work recorded in the Spec.
 
 - [ ] **Step 1: Write failing named-upstream and direct tests**
 
@@ -1076,7 +1076,7 @@ Update operational documentation only with verified facts: installed version, ac
 - [ ] eBPF performs business routing once and preserves the selected outbound into userspace.
 - [ ] Existing real-IP direct traffic remains on the eBPF kernel fast path and does not enter userspace because FakeIP is enabled.
 - [ ] Proxy TCP/UDP sends the original domain to the selected proxy without local foreign resolution.
-- [ ] The exceptional `FakeIP + direct/must_direct` path resolves only through `direct_upstream` and is observable for later elimination.
+- [ ] The exceptional `FakeIP + direct/must_direct` path resolves only through `direct_upstream`; flow counting is deferred to post-v1 optimization work.
 - [ ] Unknown FakeIP addresses never reach the WAN.
 - [ ] Mappings survive reload and restart; DNS cache eviction does not reclaim them.
 - [ ] Pool exhaustion and persistence failures return SERVFAIL without publishing partial mappings.
