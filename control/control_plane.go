@@ -1485,7 +1485,13 @@ func (c *ControlPlane) replayFakeIPMappings() {
 	if c.routingMatcher.domainMatcher == nil {
 		return
 	}
-	count := c.dnsController.replayFakeIPMappings(c.routingMatcher.domainMatcher.MatchDomainBitmap)
+	if c.core == nil {
+		return
+	}
+	publishFn := func(domain string, addr netip.Addr, domainBitmap []uint32) error {
+		return c.core.UpdateDomainRoutingForAddr(addr, domainBitmap)
+	}
+	count := c.dnsController.replayFakeIPMappings(c.routingMatcher.domainMatcher.MatchDomainBitmap, publishFn)
 	if count > 0 {
 		c.log.Infof("Replayed %d persistent FakeIP mappings with new domain bitmaps", count)
 	}
@@ -1562,6 +1568,7 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 	cache := c.CloneDnsCache()
 	c.pendingDnsReloadCache = cache
 	c.replayDnsReloadCache()
+	c.replayFakeIPMappings()
 	return nil
 }
 

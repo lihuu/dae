@@ -105,7 +105,7 @@ func TestFakeIPStoreSharedAcrossCompatibleReload(t *testing.T) {
 
 // TestFakeIPMappingsReplayDomainBitmapAfterReload verifies that after reload,
 // every persistent FakeIP mapping is republished with the new domain bitmap
-// through the CacheAccessCallback.
+// through the dedicated UpdateDomainRoutingForAddr helper.
 //
 // This simulates the control plane's replayFakeIPMappings flow:
 //  1. Allocate several mappings in the store.
@@ -126,7 +126,7 @@ func TestFakeIPMappingsReplayDomainBitmapAfterReload(t *testing.T) {
 		allocatedIPs[d] = ip
 	}
 
-	// Phase 2: Track all publications through the cache access callback.
+	// Phase 2: Track all publications through the publish callback.
 	type publishedEntry struct {
 		ownerKey     string
 		domainBitmap []uint32
@@ -197,7 +197,19 @@ func TestFakeIPMappingsReplayDomainBitmapAfterReload(t *testing.T) {
 	publications = nil
 	pubMu.Unlock()
 
-	reused.replayFakeIPMappings(matchBitmap)
+	publishFn := func(domain string, addr netip.Addr, domainBitmap []uint32) error {
+		pubMu.Lock()
+		defer pubMu.Unlock()
+		bitmap := make([]uint32, len(domainBitmap))
+		copy(bitmap, domainBitmap)
+		publications = append(publications, publishedEntry{
+			ownerKey:     "fakeip:" + domain,
+			domainBitmap: bitmap,
+			ips:          []netip.Addr{addr},
+		})
+		return nil
+	}
+	reused.replayFakeIPMappings(matchBitmap, publishFn)
 
 	// Phase 5: Verify every persistent mapping was published with the new bitmap.
 	pubMu.Lock()

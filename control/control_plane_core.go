@@ -18,6 +18,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
+	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
@@ -878,6 +879,34 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 		return nil
 	}
 	return c.domainRouting.syncOwner(bpf.DomainRoutingMap, cache.RouteOwnerKey, snapshot)
+}
+
+// UpdateDomainRoutingForAddr publishes a single IP/bitmap pair to the BPF
+// domain_routing_map through the domain routing tracker. This dedicated helper
+// is used by FakeIP replay to republish each synthetic address without
+// constructing a full DnsCache.
+func (c *controlPlaneCore) UpdateDomainRoutingForAddr(addr netip.Addr, domainBitmap []uint32) error {
+	if c == nil {
+		return nil
+	}
+	if c.domainRouting == nil {
+		c.domainRouting = newDomainRoutingTracker()
+	}
+	if len(domainBitmap) != len(bpfDomainRouting{}.Bitmap) {
+		return fmt.Errorf("domain bitmap length not sync with kern program")
+	}
+	var snapshot domainRoutingOwnerSnapshot
+	copy(snapshot.bitmap.Bitmap[:], domainBitmap)
+	ip6 := addr.As16()
+	snapshot.ips = map[[4]uint32]struct{}{
+		common.Ipv6ByteSliceToUint32Array(ip6[:]): {},
+	}
+	bpf := c.PeekBpf()
+	if bpf == nil {
+		return nil
+	}
+	ownerKey := "fakeip:" + addr.String()
+	return c.domainRouting.syncOwner(bpf.DomainRoutingMap, ownerKey, snapshot)
 }
 
 // BatchRemoveDomainRouting remove bpf map domain_routing.

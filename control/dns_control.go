@@ -333,7 +333,8 @@ func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDo
 // replayFakeIPMappings re-publishes every persistent FakeIP domain→IP mapping
 // to the eBPF domain_routing_map using the supplied matchDomainBitmap function
 // to recompute domain bitmaps under the (possibly changed) routing rules of the
-// new generation.
+// new generation. Each IP/bitmap pair is published through the supplied
+// publishFn, which is typically wired to controlPlaneCore.UpdateDomainRoutingForAddr.
 //
 // This is called after clearReloadDomainRoutingMap wipes the map so that the
 // kernel-space routing table is repopulated with the new bitmaps for all
@@ -341,7 +342,10 @@ func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDo
 // depend on the DNS cache — it reads directly from the persistent BoltDB store.
 //
 // Returns the number of mappings successfully republished.
-func (c *DnsController) replayFakeIPMappings(matchDomainBitmap func(string) []uint32) int {
+func (c *DnsController) replayFakeIPMappings(
+	matchDomainBitmap func(string) []uint32,
+	publishFn func(domain string, addr netip.Addr, domainBitmap []uint32) error,
+) int {
 	if c == nil {
 		return 0
 	}
@@ -349,35 +353,14 @@ func (c *DnsController) replayFakeIPMappings(matchDomainBitmap func(string) []ui
 	if store == nil || store.fakeIPStore == nil {
 		return 0
 	}
-	rt := c.runtime()
-	if rt == nil || rt.cacheAccessCallback == nil {
-		return 0
-	}
-	if matchDomainBitmap == nil {
+	if matchDomainBitmap == nil || publishFn == nil {
 		return 0
 	}
 
 	count := 0
 	_ = store.fakeIPStore.Range(func(domain string, ip netip.Addr) error {
 		bitmap := matchDomainBitmap(domain)
-		ip4 := ip.As4()
-		answer := &dnsmessage.A{
-			Hdr: dnsmessage.RR_Header{
-				Name:   domain,
-				Rrtype: dnsmessage.TypeA,
-				Class:  dnsmessage.ClassINET,
-				Ttl:    60, // placeholder TTL; the real TTL comes from runtime state
-			},
-			A: net.IPv4(ip4[0], ip4[1], ip4[2], ip4[3]),
-		}
-		cache := &DnsCache{
-			RouteOwnerKey:    "fakeip:" + domain,
-			DomainBitmap:     bitmap,
-			Answer:           []dnsmessage.RR{answer},
-			Deadline:         time.Now().Add(time.Hour),
-			OriginalDeadline: time.Now().Add(time.Hour),
-		}
-		if err := rt.cacheAccessCallback(cache); err != nil && c.log != nil {
+		if err := publishFn(domain, ip, bitmap); err != nil && c.log != nil {
 			c.log.WithError(err).Warnf("failed to replay FakeIP mapping for %s", domain)
 		} else {
 			count++
