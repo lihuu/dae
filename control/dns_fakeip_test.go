@@ -201,10 +201,10 @@ func TestFakeIPConcurrentQueriesShareOneAllocation(t *testing.T) {
 
 	const N = 32
 	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		ips   = make([]netip.Addr, 0, N)
-		errs  = make([]error, 0, N)
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		ips  = make([]netip.Addr, 0, N)
+		errs = make([]error, 0, N)
 	)
 
 	wg.Add(N)

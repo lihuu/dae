@@ -533,9 +533,9 @@ func newControlPlaneWithContextOptions(
 		if err = fullLoadBpfObjects(log, bpf, &loadBpfOptions{
 			PinPath:           pinPath,
 			CollectionOptions: collectionOpts,
-			FakeIPEnabled:    fakeIPEnabled,
-			FakeIPV4Network:  fakeIPV4Network,
-			FakeIPV4Mask:     fakeIPV4Mask,
+			FakeIPEnabled:     fakeIPEnabled,
+			FakeIPV4Network:   fakeIPV4Network,
+			FakeIPV4Mask:      fakeIPV4Mask,
 		}, global.SoMarkFromDae); err != nil {
 			if log.Level == logrus.PanicLevel {
 				log.Panicln(err)

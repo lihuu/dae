@@ -61,11 +61,11 @@ func TestFakeIPStoreSharedAcrossCompatibleReload(t *testing.T) {
 
 	// Phase 1: Create the initial DNS controller with FakeIP enabled.
 	ctrl, err := NewDnsController(routing, &DnsControllerOption{
-		Log:              logrus.New(),
-		LifecycleContext: context.Background(),
-		FakeIPEnabled:    true,
-		FakeIPTTL:        60,
-		FakeIPStore:      store,
+		Log:                 logrus.New(),
+		LifecycleContext:    context.Background(),
+		FakeIPEnabled:       true,
+		FakeIPTTL:           60,
+		FakeIPStore:         store,
 		CacheAccessCallback: func(*DnsCache) error { return nil },
 		CacheRemoveCallback: func(*DnsCache) error { return nil },
 	})

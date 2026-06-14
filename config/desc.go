@@ -29,10 +29,10 @@ mac: Match source MAC address. It works on LAN mode.`,
 }
 
 var SectionDescription = map[string]Desc{
-	"GlobalDesc":      GlobalDesc,
-	"DnsDesc":         DnsDesc,
-	"DnsFakeIPDesc":   DnsFakeIPDesc,
-	"GroupDesc":       GroupDesc,
+	"GlobalDesc":    GlobalDesc,
+	"DnsDesc":       DnsDesc,
+	"DnsFakeIPDesc": DnsFakeIPDesc,
+	"GroupDesc":     GroupDesc,
 }
 
 var GlobalDesc = Desc{

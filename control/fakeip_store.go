@@ -26,12 +26,12 @@ var (
 )
 
 var (
-	bucketMetadata    = []byte("metadata")
-	bucketDomainToIP  = []byte("domain_to_ip")
-	bucketIPToDomain  = []byte("ip_to_domain")
-	keySchemaVersion  = []byte("schema_version")
-	keyPrefix         = []byte("prefix")
-	keyNext           = []byte("next")
+	bucketMetadata     = []byte("metadata")
+	bucketDomainToIP   = []byte("domain_to_ip")
+	bucketIPToDomain   = []byte("ip_to_domain")
+	keySchemaVersion   = []byte("schema_version")
+	keyPrefix          = []byte("prefix")
+	keyNext            = []byte("next")
 	schemaVersionValue = []byte("1")
 )
 
