@@ -82,6 +82,9 @@ type DnsControllerOption struct {
 	OptimisticCache       bool
 	OptimisticCacheTtl    int // 0 means never expire (rely on LRU eviction)
 	MaxCacheSize          int // maximum number of cache entries (0 = unlimited)
+	FakeIPEnabled         bool
+	FakeIPTTL             int
+	FakeIPStore           *FakeIPStore
 }
 
 type dnsControllerRuntimeState struct {
@@ -94,6 +97,9 @@ type dnsControllerRuntimeState struct {
 	bestDialerChooser     func(ctx context.Context, req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
 	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 	fixedDomainTtl        map[string]int
+	fakeIPEnabled         bool
+	fakeIPTTL             int
+	fakeIPStore           *FakeIPStore
 }
 
 type dnsControllerStore struct {
@@ -422,6 +428,9 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		bestDialerChooser:     option.BestDialerChooser,
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 		fixedDomainTtl:        option.FixedDomainTtl,
+		fakeIPEnabled:         option.FakeIPEnabled,
+		fakeIPTTL:             option.FakeIPTTL,
+		fakeIPStore:           option.FakeIPStore,
 	})
 	return nil
 }
@@ -673,6 +682,8 @@ func (c *DnsController) responseCacheScope(req *udpRequest, upstreamIndex consts
 		return "asis"
 	case consts.DnsRequestOutboundIndex_Reject:
 		return "reject"
+	case consts.DnsRequestOutboundIndex_FakeIP:
+		return "fakeip"
 	default:
 		if upstream != nil {
 			return "upstream@" + upstream.String()
@@ -2220,6 +2231,12 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 			return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
 		}
 
+		// FakeIP path: synthesize a response from the persistent store
+		// without forwarding to any real upstream.
+		if upstreamIndex == consts.DnsRequestOutboundIndex_FakeIP {
+			return c.handleFakeIPQuery(dnsMessage, req, responseWriter, responseCacheKey)
+		}
+
 		// Check cache after routing (non-reject case)
 		if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
 			// Cache hit - return immediately without singleflight
@@ -2618,6 +2635,126 @@ func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, re
 // sendRejectWithResponseWriter_ send empty answer.
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, "Reject", req, responseWriter)
+}
+
+// handleFakeIPQuery synthesizes a FakeIP DNS response without forwarding to a
+// real upstream. For A queries it allocates (or loads) a persistent synthetic
+// IPv4 from the FakeIPStore and returns it in an authoritative A record. For
+// all other qtypes it returns NODATA (RcodeSuccess with an empty answer
+// section). The synthetic response is pushed through the DNS cache so that the
+// existing NewCache callback computes the domain bitmap and publishes it to the
+// eBPF domain_routing_map.
+//
+// On store or cache errors, SERVFAIL is returned. The persistent store mapping
+// is intentionally NOT removed when the DNS cache entry expires or is evicted.
+func (c *DnsController) handleFakeIPQuery(
+	dnsMessage *dnsmessage.Msg,
+	req *udpRequest,
+	responseWriter dnsmessage.ResponseWriter,
+	responseCacheKey string,
+) error {
+	if len(dnsMessage.Question) == 0 {
+		return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure,
+			"FakeIP: no question", req, responseWriter)
+	}
+
+	rt := c.runtime()
+	q := dnsMessage.Question[0]
+	qname := q.Name
+	qtype := q.Qtype
+
+	// Non-A queries: return NODATA (RcodeSuccess with empty answer section).
+	// The domain exists, but FakeIP only synthesizes A records.
+	if qtype != dnsmessage.TypeA {
+		dnsMessage.Answer = nil
+		dnsMessage.Rcode = dnsmessage.RcodeSuccess
+		dnsMessage.Response = true
+		dnsMessage.Authoritative = true
+		dnsMessage.RecursionAvailable = true
+		dnsMessage.Truncated = false
+		dnsMessage.Compress = true
+		if responseWriter != nil {
+			return responseWriter.WriteMsg(dnsMessage)
+		}
+		if req == nil || req.lConn == nil {
+			return nil
+		}
+		data, err := dnsMessage.Pack()
+		if err != nil {
+			return fmt.Errorf("pack FakeIP NODATA response: %w", err)
+		}
+		return sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder())
+	}
+
+	// A query: allocate or load the canonical domain→IP mapping from the store.
+	if rt == nil || !rt.fakeIPEnabled || rt.fakeIPStore == nil {
+		return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure,
+			"FakeIP: not configured", req, responseWriter)
+	}
+
+	ttl := rt.fakeIPTTL
+	if ttl <= 0 {
+		ttl = 60
+	}
+
+	ip, _, err := rt.fakeIPStore.GetOrAllocate(qname)
+	if err != nil {
+		if c.log != nil {
+			c.log.WithFields(logrus.Fields{
+				"domain": strings.ToLower(qname),
+			}).Warnf("FakeIP store allocation failed: %v", err)
+		}
+		return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure,
+			"FakeIP: store allocation failed", req, responseWriter)
+	}
+
+	// Build an authoritative-looking successful response with one A RR.
+	ip4 := ip.As4()
+	answer := &dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{
+			Name:   qname,
+			Rrtype: dnsmessage.TypeA,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    uint32(ttl),
+		},
+		A: net.IPv4(ip4[0], ip4[1], ip4[2], ip4[3]),
+	}
+
+	dnsMessage.Answer = []dnsmessage.RR{answer}
+	dnsMessage.Rcode = dnsmessage.RcodeSuccess
+	dnsMessage.Response = true
+	dnsMessage.Authoritative = true
+	dnsMessage.RecursionAvailable = true
+	dnsMessage.Truncated = false
+	dnsMessage.Compress = true
+
+	// Push through the DNS cache so the domain bitmap gets published to
+	// the eBPF domain_routing_map. Cache write failure → SERVFAIL.
+	if cacheErr := c.UpdateDnsCacheTtlWithKey(
+		responseCacheKey, qname, dnsmessage.TypeA,
+		dnsMessage.Answer, nil, nil, ttl,
+	); cacheErr != nil {
+		if c.log != nil {
+			c.log.WithFields(logrus.Fields{
+				"domain": strings.ToLower(qname),
+			}).Warnf("FakeIP: failed to update DNS cache: %v", cacheErr)
+		}
+		return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure,
+			"FakeIP: cache update failed", req, responseWriter)
+	}
+
+	// Send the synthesized response to the client.
+	if responseWriter != nil {
+		return responseWriter.WriteMsg(dnsMessage)
+	}
+	if req == nil || req.lConn == nil {
+		return nil
+	}
+	data, err := dnsMessage.Pack()
+	if err != nil {
+		return fmt.Errorf("pack FakeIP A response: %w", err)
+	}
+	return sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder())
 }
 
 // applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay.
