@@ -593,6 +593,29 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 		// Not a valid DNS packet (port 53 but not DNS format) - fall through to normal UDP path
 	}
 
+	// FakeIP destination handling for UDP: reverse the synthetic address to
+	// the authoritative domain, skip QUIC sniffing, and force destination-affine
+	// endpoint keys so different domains using the same FakeIP prefix don't
+	// share endpoints.
+	var authoritativeDomain bool
+	fakeIPDomain, isFakeIP, fakeIPErr := c.lookupFakeIPDestination(realDst.Addr())
+	if isFakeIP {
+		if fakeIPErr != nil {
+			// Unknown FakeIP: reject to prevent synthetic-address leakage.
+			if c.log.IsLevelEnabled(logrus.WarnLevel) {
+				c.log.WithFields(logrus.Fields{
+					"src": src.String(),
+					"dst": realDst.String(),
+				}).Warn("Unknown FakeIP UDP destination; dropping packet")
+			}
+			return nil
+		}
+		domain = fakeIPDomain
+		authoritativeDomain = true
+		skipSniffing = true
+		forceSymmetricKey = true // destination-affine endpoint key
+	}
+
 	var ue *UdpEndpoint
 	var ueExists bool
 	var replayPackets []pool.PB
@@ -987,16 +1010,17 @@ getNew:
 			NowNano:        nowNano,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
-					Outbound:    consts.OutboundIndex(routingResult.Outbound),
-					Domain:      domain,
-					Mac:         routingResult.Mac,
-					Dscp:        routingResult.Dscp,
-					ProcessName: routingResult.Pname,
-					Src:         realSrc,
-					Dest:        realDst,
-					Mark:        routingResult.Mark,
-					Network:     "udp",
-					Excluded:    excludedDialer,
+					Outbound:            consts.OutboundIndex(routingResult.Outbound),
+					Domain:              domain,
+					Mac:                 routingResult.Mac,
+					Dscp:                routingResult.Dscp,
+					ProcessName:         routingResult.Pname,
+					Src:                 realSrc,
+					Dest:                realDst,
+					Mark:                routingResult.Mark,
+					Network:             "udp",
+					Excluded:            excludedDialer,
+					AuthoritativeDomain: authoritativeDomain,
 				}
 
 				res, err := c.chooseProxyDialer(ctx, dialParam)
