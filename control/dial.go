@@ -8,7 +8,9 @@ package control
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
@@ -29,6 +31,11 @@ type proxyDialParam struct {
 	Mark        uint32
 	Network     string         // e.g. "tcp", "udp"
 	Excluded    *dialer.Dialer // Dialer to exclude in selection
+	// AuthoritativeDomain indicates that Domain is the true destination and
+	// must not trigger business rerouting. Used by FakeIP: the eBPF routing
+	// result is final, and the domain (recovered from the FakeIP store) is
+	// what the proxy outbound should dial.
+	AuthoritativeDomain bool
 }
 
 type proxyDialResult struct {
@@ -107,9 +114,20 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	dst := p.Dest
 	mark := p.Mark
 
-	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain)
-	if shouldReroute {
-		outboundIndex = consts.OutboundControlPlaneRouting
+	var dialTarget string
+	var dialIp bool
+
+	if p.AuthoritativeDomain && domain != "" {
+		// FakeIP authoritative domain: the eBPF routing result is final and
+		// must not be changed. Construct domain:port directly without rerouting.
+		dialTarget = net.JoinHostPort(domain, strconv.Itoa(int(dst.Port())))
+		dialIp = false
+	} else {
+		var shouldReroute bool
+		dialTarget, shouldReroute, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
+		if shouldReroute {
+			outboundIndex = consts.OutboundControlPlaneRouting
+		}
 	}
 
 	if outboundIndex == consts.OutboundControlPlaneRouting {

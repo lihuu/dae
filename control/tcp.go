@@ -154,10 +154,35 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		lConn = &bufioConn{Conn: lConn, reader: bufReader}
 	}
 
+	// FakeIP destination handling: reverse the synthetic address to the
+	// authoritative domain before sniffing. The eBPF program has already
+	// performed business routing and preserved the outbound; we must not
+	// reroute. For unknown FakeIP addresses (inside prefix but no mapping),
+	// reject the connection to prevent leakage.
 	var (
-		domain     string
-		lRelayConn netproxy.Conn = lConn
+		domain              string
+		lRelayConn          netproxy.Conn = lConn
+		authoritativeDomain bool
 	)
+	fakeIPDomain, isFakeIP, fakeIPErr := c.lookupFakeIPDestination(dst.Addr())
+	if isFakeIP {
+		if fakeIPErr != nil {
+			// Unknown FakeIP: the address is in the configured prefix but has
+			// no persistent mapping. Reject to prevent synthetic-address leakage.
+			if c.log.IsLevelEnabled(logrus.WarnLevel) {
+				c.log.WithFields(logrus.Fields{
+					"src": src.String(),
+					"dst": dst.String(),
+				}).Warn("Unknown FakeIP destination; rejecting connection")
+			}
+			return fmt.Errorf("unknown fakeip destination %v", dst)
+		}
+		domain = fakeIPDomain
+		authoritativeDomain = true
+		// Skip TCP sniffing: we already know the authoritative domain.
+		goto buildDialParam
+	}
+
 	if c.shouldTryTcpSniff(dst, routingResult) {
 		cacheKey := newTcpSniffNegKey(dst, routingResult)
 		now := time.Now()
@@ -218,16 +243,18 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		}
 	}
 
+buildDialParam:
 	dialParam := &proxyDialParam{
-		Outbound:    consts.OutboundIndex(routingResult.Outbound),
-		Domain:      domain,
-		Mac:         routingResult.Mac,
-		ProcessName: routingResult.Pname,
-		Dscp:        routingResult.Dscp,
-		Src:         src,
-		Dest:        dst,
-		Mark:        routingResult.Mark,
-		Network:     "tcp",
+		Outbound:            consts.OutboundIndex(routingResult.Outbound),
+		Domain:              domain,
+		Mac:                 routingResult.Mac,
+		ProcessName:         routingResult.Pname,
+		Dscp:                routingResult.Dscp,
+		Src:                 src,
+		Dest:                dst,
+		Mark:                routingResult.Mark,
+		Network:             "tcp",
+		AuthoritativeDomain: authoritativeDomain,
 	}
 	// Dial and relay.
 	rConn, res, err := c.routeDial(ctx, dialParam)

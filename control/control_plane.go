@@ -3917,6 +3917,28 @@ func (c *ControlPlane) FakeIPStore() *FakeIPStore {
 	return c.fakeIPStore
 }
 
+// lookupFakeIPDestination reverses a synthetic FakeIP destination to its
+// authoritative domain. Returns:
+//   - domain, true, nil: known FakeIP mapping
+//   - "", false, nil: address is not a FakeIP destination
+//   - "", false, err: address is inside the FakeIP prefix but has no mapping
+//     (indicates an unknown/stale synthetic address; caller should reject)
+func (c *ControlPlane) lookupFakeIPDestination(addr netip.Addr) (domain string, isFakeIP bool, err error) {
+	store := c.fakeIPStore
+	if store == nil {
+		return "", false, nil
+	}
+	prefix := store.Stats().Prefix
+	if !prefix.Contains(addr) {
+		return "", false, nil
+	}
+	d, ok := store.LookupDomain(addr)
+	if !ok {
+		return "", true, ErrUnknownFakeIP
+	}
+	return d, true, nil
+}
+
 func (c *ControlPlane) SetPreparedDNSStartHook(hook func() error) {
 	if c == nil {
 		return
