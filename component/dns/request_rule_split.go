@@ -56,6 +56,18 @@ func classifyRequestRule(rule *config_parser.RoutingRule) (RequestRuleCategory, 
 		return RequestRuleCategoryDNS, nil
 	}
 
+	// Internal selectors (sub/node/subnode) require real DNS upstreams for
+	// bootstrap resolution. Reject fakeip as their outbound target.
+	if rule.Outbound.Name == consts.DnsRequestOutboundIndex_FakeIP.String() {
+		for _, f := range rule.AndFunctions {
+			switch f.Name {
+			case "sub", "node", "subnode":
+				return 0, fmt.Errorf("internal dae DNS selector %q cannot use %q as outbound; subscription and node bootstrap require real DNS upstreams",
+					f.Name, consts.DnsRequestOutboundIndex_FakeIP.String())
+			}
+		}
+	}
+
 	var (
 		internalCategory RequestRuleCategory
 		hasInternal      bool

@@ -158,9 +158,10 @@ func (s *Dns) RequestSelect(ctx context.Context, qname string, qtype uint16) (up
 	if err != nil {
 		return 0, nil, err
 	}
-	// nil indicates AsIs.
+	// nil indicates AsIs, Reject, or FakeIP.
 	if upstreamIndex == consts.DnsRequestOutboundIndex_AsIs ||
-		upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
+		upstreamIndex == consts.DnsRequestOutboundIndex_Reject ||
+		upstreamIndex == consts.DnsRequestOutboundIndex_FakeIP {
 		return upstreamIndex, nil, nil
 	}
 	if int(upstreamIndex) >= len(s.upstream) {

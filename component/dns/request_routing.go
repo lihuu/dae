@@ -53,6 +53,8 @@ func (b *RequestMatcherBuilder) registerProgramParsers(rulesBuilder *routing.Rul
 
 func (b *RequestMatcherBuilder) upstreamToId(upstream string) (upstreamId consts.DnsRequestOutboundIndex, err error) {
 	switch upstream {
+	case consts.DnsRequestOutboundIndex_FakeIP.String():
+		upstreamId = consts.DnsRequestOutboundIndex_FakeIP
 	case consts.DnsRequestOutboundIndex_Reject.String():
 		upstreamId = consts.DnsRequestOutboundIndex_Reject
 	case consts.DnsRequestOutboundIndex_AsIs.String():

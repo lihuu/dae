@@ -86,6 +86,47 @@ func TestSplitRequestRulesRejectsMixedInternalSelectors(t *testing.T) {
 	}
 }
 
+func TestSplitRequestRulesRejectsFakeIPOutboundForInternalSelectors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   string
+	}{
+		{"sub", "sub"},
+		{"node", "node"},
+		{"subnode", "subnode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, _, err := SplitRequestRules([]*config_parser.RoutingRule{
+				testRequestRule(
+					"fakeip",
+					testFunction(tc.fn, testParam("", "tag")),
+				),
+			})
+			if err == nil {
+				t.Fatalf("expected %s() -> fakeip to fail", tc.fn)
+			}
+			if !strings.Contains(err.Error(), "cannot use") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestSplitRequestRulesAllowsFakeIPOutboundForDNSRules(t *testing.T) {
+	dnsRules, _, _, _, err := SplitRequestRules([]*config_parser.RoutingRule{
+		testRequestRule(
+			"fakeip",
+			testFunction("qname", testParam("suffix", "example.com")),
+		),
+	})
+	if err != nil {
+		t.Fatalf("qname -> fakeip should be allowed: %v", err)
+	}
+	if len(dnsRules) != 1 {
+		t.Fatalf("expected 1 dns rule, got %d", len(dnsRules))
+	}
+}
+
 func testRequestRule(outbound string, andFunctions ...*config_parser.Function) *config_parser.RoutingRule {
 	return &config_parser.RoutingRule{
 		AndFunctions: andFunctions,
