@@ -231,7 +231,14 @@ func (m *reloadManager) installPreparedDNSHandoffHooks(log *logrus.Logger, curre
 	if handoff == nil {
 		return
 	}
-	hooks := buildPreparedDNSHandoffHooks(log, dnsConfigEqual(handoff.oldConf, conf), preparedDNSHandoffHookCallbacks{
+	// The DNS controller can be reused when either:
+	// (a) the full DNS config fingerprint is unchanged (cheap: no runtime update needed), or
+	// (b) only generation-local runtime fields changed (TTL, direct_upstream) while the
+	//     persistent FakeIP store identity is unchanged. TryUpdateRuntime will swap the
+	//     runtime state in place, preserving the shared FakeIP store across reload.
+	reuseController := dnsConfigEqual(handoff.oldConf, conf) ||
+		fakeIPStoreIdentity(handoff.oldConf.Dns) == fakeIPStoreIdentity(conf.Dns)
+	hooks := buildPreparedDNSHandoffHooks(log, reuseController, preparedDNSHandoffHookCallbacks{
 		reuseController: func() bool {
 			return current.ReuseDNSControllerFrom(handoff.oldControlPlane)
 		},
@@ -445,4 +452,23 @@ func dnsConfigFingerprint(dns config.Dns) string {
 // across reloads. Changes to enabled, inet4_range, or store require a full restart.
 func fakeIPStoreIdentity(dns config.Dns) string {
 	return dns.FakeIP.StoreIdentity()
+}
+
+// validateFakeIPReloadCompatibility checks whether the FakeIP store identity
+// (enabled, inet4_range, store path) has changed between the old and new
+// configurations. If the identity differs, the persistent BoltDB-backed FakeIP
+// store cannot be shared across reload, and a full dae restart is required.
+//
+// TTL and direct_upstream changes are reload-compatible (they only affect
+// generation-local runtime state, not the store identity).
+//
+// Returns nil if either config is nil (first start or reload-from-nothing).
+func validateFakeIPReloadCompatibility(oldConf, newConf *config.Config) error {
+	if oldConf == nil || newConf == nil {
+		return nil
+	}
+	if fakeIPStoreIdentity(oldConf.Dns) != fakeIPStoreIdentity(newConf.Dns) {
+		return fmt.Errorf("dns.fakeip inet4_range/store changes require a full dae restart")
+	}
+	return nil
 }

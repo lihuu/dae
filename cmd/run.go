@@ -325,7 +325,7 @@ func (r *Runner) Run() (err error) {
 	// New ControlPlane.
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
-	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs)
+	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, nil)
 	if err != nil {
 		cancel()
 		return err
@@ -443,6 +443,18 @@ func (r *Runner) Run() (err error) {
 			log.SetOutput(oldLogOutput) // NOTE: Restore log output after creating new logger during reload.
 			logrus.SetOutput(oldLogOutput)
 
+			// Reject FakeIP store identity changes early — these require a full
+			// dae restart and cannot be handled by the in-process reload path.
+			if fakeIPErr := validateFakeIPReloadCompatibility(conf, newConf); fakeIPErr != nil {
+				log.WithError(fakeIPErr).Errorln("[Reload] FakeIP store identity changed; rejecting reload")
+				_ = sdnotify.Ready()
+				_ = setRunSignalProgress(consts.ReloadError, fakeIPErr.Error())
+				reloadManager.setReloadError(fakeIPErr)
+				reloadManager.reloadActive.Store(false)
+				clearReloadPending(&reloadManager.reloadPending)
+				continue
+			}
+
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			stagedHotHandoff := !portChanged && listener != nil
 
@@ -468,7 +480,7 @@ func (r *Runner) Run() (err error) {
 			if stagedHotHandoff {
 				log.Warnln("[Reload] Prepare staged same-port handoff")
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs)
+				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, c.FakeIPStore())
 				dnsCache = nil
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -531,7 +543,7 @@ func (r *Runner) Run() (err error) {
 
 			log.Warnln("[Reload] Load new control plane")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs)
+			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, c.FakeIPStore())
 			dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 			var newCancel context.CancelFunc
@@ -548,7 +560,7 @@ func (r *Runner) Run() (err error) {
 					obj = nil
 				}
 				ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs)
+				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs, c.FakeIPStore())
 				err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 				if err != nil {
 					_ = sdnotify.Stopping()
@@ -1097,15 +1109,15 @@ func shutdownAfterSignalWithHandoff(
 	return nil
 }
 
-func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false)
+func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, reuseFakeIPStore)
 }
 
-func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true)
+func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, reuseFakeIPStore)
 }
 
-func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool) (c *control.ControlPlane, err error) {
+func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 	if conf.Global.SoMarkFromDae == 0 {
@@ -1304,6 +1316,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Global,
 			&conf.Dns,
 			externGeoDataDirs,
+			reuseFakeIPStore,
 		)
 	} else {
 		c, err = control.NewControlPlaneWithContext(
@@ -1317,6 +1330,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Global,
 			&conf.Dns,
 			externGeoDataDirs,
+			reuseFakeIPStore,
 		)
 	}
 	if err != nil {

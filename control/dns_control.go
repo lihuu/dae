@@ -110,6 +110,11 @@ type dnsControllerStore struct {
 	dnsForwarderCache sync.Map // map[dnsForwarderKey]*cachedDnsForwarder
 	sf                singleflight.Group
 
+	// fakeIPStore is the long-lived persistent FakeIP domain→IP store.
+	// Opened once when FakeIP is first enabled and shared across reloads
+	// via the dnsControllerStore. Closed inside closeOnce on final shutdown.
+	fakeIPStore *FakeIPStore
+
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}
 	evictorDone  chan struct{}
@@ -252,16 +257,31 @@ func (c *DnsController) currentOptimisticCacheConfig() (enabled bool, ttl int, m
 
 // ReuseForReload updates the current facade to the replacement generation's
 // runtime and returns a fresh facade that shares the same long-lived store.
-// The shared store carries DNS cache, forwarders, janitors, and async BPF
-// update workers across reloads, while each facade owns its generation-local
-// runtime pointer and behavior config. The old control plane publishes the new
-// facade as a handoff bridge so ActiveDnsController observes the replacement
-// runtime without a nil window during reload retirement.
+// The shared store carries DNS cache, forwarders, janitors, async BPF
+// update workers, and the FakeIP persistent store across reloads, while each
+// facade owns its generation-local runtime pointer and behavior config. The
+// old control plane publishes the new facade as a handoff bridge so
+// ActiveDnsController observes the replacement runtime without a nil window
+// during reload retirement.
+//
+// When the caller omits FakeIPStore from the option (the normal reload path),
+// the FakeIP store from the shared dnsControllerStore is reused. Only TTL and
+// direct_upstream are updated in generation-local runtime state; the persistent
+// store identity (enabled, inet4_range, store path) is unchanged because
+// validateFakeIPReloadCompatibility rejected identity-changing reloads before
+// this method was reached.
 func (c *DnsController) ReuseForReload(option *DnsControllerOption, routing *dns.Dns) (*DnsController, error) {
 	if c == nil {
 		return nil, nil
 	}
-	c.ensureStoreForReload()
+	store := c.ensureStoreForReload()
+	// When the reload option omits the FakeIP store, inherit the one that was
+	// installed into the shared store during the original NewDnsController.
+	// This preserves the persistent BoltDB handle across reloads without
+	// requiring the caller to thread it through every reload path.
+	if option.FakeIPStore == nil && store != nil && store.fakeIPStore != nil {
+		option.FakeIPStore = store.fakeIPStore
+	}
 	if err := c.TryUpdateRuntime(option, routing); err != nil {
 		return nil, err
 	}
@@ -307,6 +327,63 @@ func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDo
 		c.triggerBpfUpdateIfNeeded(v, now)
 		count++
 	}
+	return count
+}
+
+// replayFakeIPMappings re-publishes every persistent FakeIP domain→IP mapping
+// to the eBPF domain_routing_map using the supplied matchDomainBitmap function
+// to recompute domain bitmaps under the (possibly changed) routing rules of the
+// new generation.
+//
+// This is called after clearReloadDomainRoutingMap wipes the map so that the
+// kernel-space routing table is repopulated with the new bitmaps for all
+// synthetic FakeIP addresses. Unlike ordinary DNS cache replay, this does not
+// depend on the DNS cache — it reads directly from the persistent BoltDB store.
+//
+// Returns the number of mappings successfully republished.
+func (c *DnsController) replayFakeIPMappings(matchDomainBitmap func(string) []uint32) int {
+	if c == nil {
+		return 0
+	}
+	store := c.dnsControllerStore
+	if store == nil || store.fakeIPStore == nil {
+		return 0
+	}
+	rt := c.runtime()
+	if rt == nil || rt.cacheAccessCallback == nil {
+		return 0
+	}
+	if matchDomainBitmap == nil {
+		return 0
+	}
+
+	count := 0
+	_ = store.fakeIPStore.Range(func(domain string, ip netip.Addr) error {
+		bitmap := matchDomainBitmap(domain)
+		ip4 := ip.As4()
+		answer := &dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{
+				Name:   domain,
+				Rrtype: dnsmessage.TypeA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    60, // placeholder TTL; the real TTL comes from runtime state
+			},
+			A: net.IPv4(ip4[0], ip4[1], ip4[2], ip4[3]),
+		}
+		cache := &DnsCache{
+			RouteOwnerKey:    "fakeip:" + domain,
+			DomainBitmap:     bitmap,
+			Answer:           []dnsmessage.RR{answer},
+			Deadline:         time.Now().Add(time.Hour),
+			OriginalDeadline: time.Now().Add(time.Hour),
+		}
+		if err := rt.cacheAccessCallback(cache); err != nil && c.log != nil {
+			c.log.WithError(err).Warnf("failed to replay FakeIP mapping for %s", domain)
+		} else {
+			count++
+		}
+		return nil
+	})
 	return count
 }
 
@@ -385,6 +462,10 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		log:                 option.Log,
 		dnsForwarderIdleTTL: dnsForwarderIdleTTL, // Use package-level default
 	}
+	// Install the FakeIP store into the long-lived shared store so it survives
+	// reloads. ReuseForReload will reuse this same store for identical store
+	// identity (enabled, inet4_range, store path).
+	controller.dnsControllerStore.fakeIPStore = option.FakeIPStore
 	controller.qtypePrefer.Store(uint32(prefer))
 	controller.optimisticCacheEnabled.Store(optimisticCacheEnabled)
 	controller.optimisticCacheTtl.Store(int64(optimisticCacheTtl))
@@ -508,6 +589,14 @@ func (c *DnsController) Close() error {
 		}
 		if c.evictorDone != nil {
 			evictorDone = c.evictorDone
+		}
+		// Close the persistent FakeIP store (if any) on final shutdown.
+		// closeOnce guarantees this runs exactly once even when multiple
+		// facades share the same dnsControllerStore.
+		if c.fakeIPStore != nil {
+			if err := c.fakeIPStore.Close(); err != nil && c.log != nil {
+				c.log.WithError(err).Warn("failed to close FakeIP store during final shutdown")
+			}
 		}
 	})
 	c.bpfUpdateStopMu.Unlock()

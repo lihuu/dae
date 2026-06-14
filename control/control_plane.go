@@ -113,11 +113,23 @@ type ControlPlane struct {
 	sharedBpfReload                bool
 	closeOnce                      sync.Once
 	closeErr                       error
+
+	// fakeIPStore is the persistent FakeIP domain→IP store opened at control
+	// plane startup. On reload, the new control plane inherits this store from
+	// the retiring generation via ReuseFakeIPStoreFrom, ensuring the BoltDB
+	// handle is never opened twice concurrently.
+	fakeIPStore *FakeIPStore
 }
 
 type controlPlaneBuildOptions struct {
 	delayDatapathCommit   bool
 	delayDNSListenerStart bool
+
+	// reuseFakeIPStore carries the FakeIP store from the retiring control plane
+	// generation so the new generation can reuse the same BoltDB handle instead
+	// of opening a concurrent one (which would fail on platforms with exclusive
+	// file locking). When nil, the constructor opens a fresh store.
+	reuseFakeIPStore *FakeIPStore
 }
 
 const (
@@ -295,6 +307,7 @@ func NewControlPlaneWithContext(
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
+	reuseFakeIPStore *FakeIPStore,
 ) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
@@ -307,7 +320,9 @@ func NewControlPlaneWithContext(
 		global,
 		dnsConfig,
 		externGeoDataDirs,
-		controlPlaneBuildOptions{},
+		controlPlaneBuildOptions{
+			reuseFakeIPStore: reuseFakeIPStore,
+		},
 	)
 }
 
@@ -324,6 +339,7 @@ func NewPreparedControlPlaneWithContext(
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
+	reuseFakeIPStore *FakeIPStore,
 ) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
@@ -339,6 +355,7 @@ func NewPreparedControlPlaneWithContext(
 		controlPlaneBuildOptions{
 			delayDatapathCommit:   true,
 			delayDNSListenerStart: true,
+			reuseFakeIPStore:      reuseFakeIPStore,
 		},
 	)
 }
@@ -790,6 +807,31 @@ func newControlPlaneWithContextOptions(
 	dnsControllerOption.OptimisticCacheTtl = dnsConfig.OptimisticCacheTtl
 	dnsControllerOption.MaxCacheSize = dnsConfig.MaxCacheSize
 	dnsControllerOption.IpVersionPrefer = dnsConfig.IpVersionPrefer
+
+	// FakeIP store lifecycle: open on first start, reuse from retiring generation
+	// across reload, and close on final control plane shutdown. The store is
+	// shared via dnsControllerStore so it survives DNS controller reuse.
+	if dnsConfig.FakeIP.Enabled {
+		if buildOpts.reuseFakeIPStore != nil {
+			// Inherit the store from the retiring generation to avoid opening
+			// the BoltDB file twice concurrently (exclusive file lock).
+			plane.fakeIPStore = buildOpts.reuseFakeIPStore
+		} else if plane.fakeIPStore == nil {
+			fakeIPPrefix, err := netip.ParsePrefix(dnsConfig.FakeIP.Inet4Range)
+			if err != nil {
+				return nil, fmt.Errorf("parse fakeip inet4_range: %w", err)
+			}
+			store, err := OpenFakeIPStore(dnsConfig.FakeIP.Store, fakeIPPrefix, log)
+			if err != nil {
+				return nil, fmt.Errorf("open fakeip store: %w", err)
+			}
+			plane.fakeIPStore = store
+		}
+		dnsControllerOption.FakeIPEnabled = true
+		dnsControllerOption.FakeIPTTL = dnsConfig.FakeIP.TTL
+		dnsControllerOption.FakeIPStore = plane.fakeIPStore
+	}
+
 	plane.dnsController, err = NewDnsController(dnsUpstream, dnsControllerOption)
 	if err != nil {
 		return nil, err
@@ -834,6 +876,7 @@ func newControlPlaneWithContextOptions(
 			}
 		}
 		plane.replayDnsReloadCache()
+		plane.replayFakeIPMappings()
 		plane.markReady()
 	}
 	return plane, nil
@@ -1430,6 +1473,24 @@ func (c *ControlPlane) replayDnsReloadCache() {
 	c.pendingDnsReloadCache = nil
 }
 
+// replayFakeIPMappings re-publishes every persistent FakeIP domain→IP mapping
+// to the eBPF domain_routing_map with the current generation's domain bitmaps.
+// This is called after clearReloadDomainRoutingMap wipes the map so that the
+// kernel-space routing table is repopulated for all synthetic FakeIP addresses.
+// Unlike ordinary DNS cache replay, this does not depend on the DNS cache.
+func (c *ControlPlane) replayFakeIPMappings() {
+	if c == nil || c.dnsController == nil || c.routingMatcher == nil {
+		return
+	}
+	if c.routingMatcher.domainMatcher == nil {
+		return
+	}
+	count := c.dnsController.replayFakeIPMappings(c.routingMatcher.domainMatcher.MatchDomainBitmap)
+	if count > 0 {
+		c.log.Infof("Replayed %d persistent FakeIP mappings with new domain bitmaps", count)
+	}
+}
+
 func (c *ControlPlane) registerIncomingConnection(conn net.Conn) bool {
 	if c == nil || conn == nil {
 		return false
@@ -1477,6 +1538,7 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 		}
 	}
 	c.replayDnsReloadCache()
+	c.replayFakeIPMappings()
 	c.startConnStateJanitor()
 	c.preparedDatapathCommit = false
 	return nil
@@ -3780,6 +3842,34 @@ func (c *ControlPlane) ReuseDNSControllerFrom(previous *ControlPlane) bool {
 		c.log,
 		previous.SetDNSHandoffController,
 	)
+}
+
+// ReuseFakeIPStoreFrom inherits the persistent FakeIP store from a retiring
+// control plane generation. This ensures the BoltDB handle is not opened twice
+// concurrently: the new generation takes ownership of the same store pointer,
+// and the old generation's Close will no longer close it (because only the
+// dnsControllerStore.closeOnce drives the actual Close, and on reload that
+// closeOnce is preserved via DNS controller reuse).
+//
+// Returns true if a store was inherited.
+func (c *ControlPlane) ReuseFakeIPStoreFrom(previous *ControlPlane) bool {
+	if c == nil || previous == nil {
+		return false
+	}
+	if previous.fakeIPStore == nil {
+		return false
+	}
+	c.fakeIPStore = previous.fakeIPStore
+	return true
+}
+
+// FakeIPStore returns the persistent FakeIP store owned by this control plane,
+// or nil if FakeIP is not enabled.
+func (c *ControlPlane) FakeIPStore() *FakeIPStore {
+	if c == nil {
+		return nil
+	}
+	return c.fakeIPStore
 }
 
 func (c *ControlPlane) SetPreparedDNSStartHook(hook func() error) {
