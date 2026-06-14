@@ -215,3 +215,99 @@ dns {
   }
 }
 ```
+
+## FakeIP
+
+FakeIP is a DNS response synthesis mechanism that assigns synthetic IPv4 addresses
+to domains, allowing dae to route traffic based on the domain rather than the
+resolved IP. This is useful when you want proxy routing decisions to be made
+before DNS resolution.
+
+### Configuration
+
+```dae
+dns {
+  fakeip {
+    enabled: true
+    inet4_range: 198.18.0.0/15
+    ttl: 60
+    store: /var/lib/dae/fakeip.db
+    direct_upstream: cn
+  }
+
+  routing {
+    request {
+      fallback: fakeip
+    }
+  }
+}
+```
+
+### Fields
+
+- `enabled` (bool, default: `false`): Enable or disable FakeIP.
+- `inet4_range` (string, default: `198.18.0.0/15`): The IPv4 prefix used for
+  synthetic addresses. Must be IPv4, at least /30 (to reserve network and
+  broadcast addresses).
+- `ttl` (int, default: `60`): TTL in seconds for synthetic DNS answers.
+- `store` (string, default: `/var/lib/dae/fakeip.db`): Path to the persistent
+  bbolt database storing domain-to-IP mappings.
+- `direct_upstream` (string, required): The named DNS upstream to use when
+  resolving domains for traffic that matches `direct` routing rules.
+
+### Behavior
+
+- **DNS request routing and business routing remain independent.** The `fakeip`
+  outbound in DNS request routing only affects DNS answers.
+- **A queries** routed to `fakeip` return a stable synthetic IPv4 address.
+- **AAAA and other qtypes** routed to `fakeip` return NODATA (success with empty
+  answer section, not NXDOMAIN).
+- **Proxy traffic** sends the original domain to the proxy endpoint. The
+  synthetic IP is never sent to the proxy.
+- **Ordinary direct traffic** (non-FakeIP) uses real DNS and retains the eBPF
+  kernel fast path. Enabling FakeIP does not affect real-IP direct traffic.
+- **FakeIP + direct traffic** resolves the domain through `direct_upstream` as
+  a first-version safety fallback. This is a tracked performance issue; the
+  final architecture will eliminate or minimize this path.
+
+### Constraints
+
+- **No automatic allocation reuse** in v1. Each domain gets a unique synthetic
+  address until the pool is exhausted.
+- **Changing `enabled`, `inet4_range`, or `store`** requires a full dae restart
+  (not reloadable).
+- **Changing `ttl` or `direct_upstream`** is reloadable.
+- IPv6 FakeIP, reclamation, and inspection commands are future work.
+
+### Example
+
+```dae
+dns {
+  ipversion_prefer: 4
+
+  fakeip {
+    enabled: true
+    inet4_range: 198.18.0.0/15
+    ttl: 60
+    store: /var/lib/dae/fakeip.db
+    direct_upstream: cn
+  }
+
+  upstream {
+    cn: udp://223.5.5.5:53
+    local: udp://192.168.1.1:53
+  }
+
+  routing {
+    request {
+      subnode() -> cn
+      qname(suffix: home.arpa, suffix: local) -> local
+      qname(suffix: cn) && qname(geosite:cn) -> cn
+      fallback: fakeip
+    }
+    response {
+      fallback: accept
+    }
+  }
+}
+```

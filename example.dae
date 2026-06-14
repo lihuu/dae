@@ -240,6 +240,21 @@ dns {
 
         # doh_custom_path: 'https://dns.example.com:443/custom-path'
     }
+
+    # FakeIP: synthesize IPv4 answers for domains to enable proxy routing
+    # decisions before real DNS resolution. Synthetic IPs are persistent
+    # (survive restart/reload) and unique per domain. Proxy traffic sends
+    # the domain to the remote endpoint, not the synthetic IP.
+    # Changing enabled/inet4_range/store requires a full restart;
+    # ttl and direct_upstream are reloadable.
+    #fakeip {
+    #    enabled: true
+    #    inet4_range: 198.18.0.0/15
+    #    ttl: 60
+    #    store: /var/lib/dae/fakeip.db
+    #    direct_upstream: alidns
+    #}
+
     routing {
         # According to the request of dns query, decide to use which DNS upstream.
         # Match rules from top to bottom.
