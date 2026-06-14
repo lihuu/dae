@@ -3150,3 +3150,85 @@ func heapifyMin(entries []cacheEntry, i, n int) {
 		i = smallest
 	}
 }
+
+// ResolveAWithUpstream resolves a domain's A records using the named upstream
+// directly, bypassing DNS request routing, response cache, and FakeIP allocation.
+// Returns only IPv4 A answers. Returns an error on timeout, NODATA, or upstream
+// failure; does not try another upstream.
+func (c *DnsController) ResolveAWithUpstream(
+	ctx context.Context,
+	domain string,
+	upstreamName string,
+	req *udpRequest,
+) ([]netip.Addr, error) {
+	rt := c.runtime()
+	if rt == nil {
+		return nil, fmt.Errorf("dns controller runtime not available")
+	}
+	if rt.routing == nil {
+		return nil, fmt.Errorf("dns component not available")
+	}
+
+	// 1. Obtain the named upstream directly.
+	upstream, err := rt.routing.GetUpstreamByName(ctx, upstreamName)
+	if err != nil {
+		return nil, fmt.Errorf("get upstream %q: %w", upstreamName, err)
+	}
+
+	// 2. Get a dialer via the existing chooser.
+	if rt.bestDialerChooser == nil {
+		return nil, fmt.Errorf("bestDialerChooser not configured")
+	}
+	dialArg, err := rt.bestDialerChooser(ctx, req, upstream)
+	if err != nil {
+		return nil, fmt.Errorf("choose dialer for upstream %q: %w", upstreamName, err)
+	}
+
+	// 3. Create a forwarder for this upstream.
+	forwarder, err := newDnsForwarder(upstream, *dialArg, c.log)
+	if err != nil {
+		return nil, fmt.Errorf("create forwarder for upstream %q: %w", upstreamName, err)
+	}
+	defer forwarder.Close()
+
+	// 4. Build an A query.
+	qname := dnsmessage.CanonicalName(domain)
+	msg := new(dnsmessage.Msg)
+	msg.RecursionDesired = true
+	msg.Question = []dnsmessage.Question{
+		{
+			Name:   qname,
+			Qtype:  dnsmessage.TypeA,
+			Qclass: dnsmessage.ClassINET,
+		},
+	}
+	data, err := msg.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns query: %w", err)
+	}
+
+	// 5. Send the query.
+	resp, err := forwarder.ForwardDNS(ctx, data)
+	if err != nil {
+		return nil, fmt.Errorf("forward dns to upstream %q: %w", upstreamName, err)
+	}
+	if resp.Rcode != dnsmessage.RcodeSuccess {
+		return nil, fmt.Errorf("upstream %q returned rcode %v for %q", upstreamName, resp.Rcode, domain)
+	}
+
+	// 6. Extract A records only.
+	var addrs []netip.Addr
+	for _, ans := range resp.Answer {
+		switch r := ans.(type) {
+		case *dnsmessage.A:
+			addr, ok := netip.AddrFromSlice(r.A[:])
+			if ok {
+				addrs = append(addrs, addr.Unmap())
+			}
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no A records for %q from upstream %q", domain, upstreamName)
+	}
+	return addrs, nil
+}

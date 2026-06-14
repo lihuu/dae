@@ -30,6 +30,8 @@ type Dns struct {
 	upstream2Index sync.Map
 	reqMatcher     *RequestMatcher
 	respMatcher    *ResponseMatcher
+	// nameToIndex maps upstream tag names to their indices for named lookup.
+	nameToIndex map[string]uint8
 }
 
 type NewOption struct {
@@ -82,6 +84,7 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		upstreamName2Id[tag] = uint8(len(s.upstream))
 		s.upstream = append(s.upstream, r)
 	}
+	s.nameToIndex = upstreamName2Id
 	requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
 		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
 		&routing.MergeAndSortRulesOptimizer{},
@@ -233,4 +236,17 @@ func (s *Dns) ResponseSelect(ctx context.Context, msg *dnsmessage.Msg, fromUpstr
 		upstream = nil
 	}
 	return upstreamIndex, upstream, nil
+}
+
+// GetUpstreamByName returns the upstream resolver identified by its tag name.
+// Returns an error if the name is unknown.
+func (s *Dns) GetUpstreamByName(ctx context.Context, name string) (*Upstream, error) {
+	idx, ok := s.nameToIndex[name]
+	if !ok {
+		return nil, fmt.Errorf("upstream %q not found", name)
+	}
+	if int(idx) >= len(s.upstream) {
+		return nil, fmt.Errorf("bad upstream index: %v not in [0, %v]", idx, len(s.upstream)-1)
+	}
+	return s.upstream[idx].GetUpstream(ctx)
 }
