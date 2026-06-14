@@ -864,6 +864,17 @@ func newControlPlaneWithContextOptions(
 				return nil, fmt.Errorf("open fakeip store: %w", err)
 			}
 			plane.fakeIPStore = store
+			// Log FakeIP startup status with store statistics.
+			stats := store.Stats()
+			log.WithFields(logrus.Fields{
+				"prefix":        stats.Prefix.String(),
+				"store":         stats.StorePath,
+				"allocated":     stats.Allocated,
+				"capacity":      stats.Capacity,
+				"remaining":     stats.Remaining,
+				"next":          stats.Next.String(),
+				"recovered_dbs": stats.RecoveredDBs,
+			}).Info("FakeIP store opened")
 		}
 		dnsControllerOption.FakeIPEnabled = true
 		dnsControllerOption.FakeIPTTL = dnsConfig.FakeIP.TTL
@@ -3937,6 +3948,15 @@ func (c *ControlPlane) lookupFakeIPDestination(addr netip.Addr) (domain string, 
 		return "", true, ErrUnknownFakeIP
 	}
 	return d, true, nil
+}
+
+// FakeIPStats returns a snapshot of the FakeIP store statistics, or (zero, false)
+// if FakeIP is not enabled.
+func (c *ControlPlane) FakeIPStats() (FakeIPStats, bool) {
+	if c == nil || c.fakeIPStore == nil {
+		return FakeIPStats{}, false
+	}
+	return c.fakeIPStore.Stats(), true
 }
 
 func (c *ControlPlane) SetPreparedDNSStartHook(hook func() error) {
