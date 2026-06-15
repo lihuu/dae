@@ -1786,3 +1786,62 @@ int testcheck_fakeip_ipv6_direct(struct __sk_buff *skb)
 					    19233, 80,
 					    OUTBOUND_DIRECT, 0, true);
 }
+
+/* FakeIP PARAM constant interception test (no override map) */
+SEC("tc/pktgen/fakeip_param_interception")
+int testpktgen_fakeip_param_interception(struct __sk_buff *skb)
+{
+	/* Destination 198.18.5.6 is within 198.18.0.0/15 */
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/fakeip_param_interception")
+int testsetup_fakeip_param_interception(struct __sk_buff *skb)
+{
+	/* fallback: direct */
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+
+	/* FakeIP interception happens at LAN ingress, not WAN egress */
+	bpf_tail_call(skb, &entry_call_map, 1);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_param_interception")
+int testcheck_fakeip_param_interception(struct __sk_buff *skb)
+{
+	/* Even though routing says DIRECT, FakeIP dest should redirect */
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_REDIRECT,
+					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19233, 80,
+					    OUTBOUND_DIRECT, 0, true);
+}
+
+/* FakeIP PARAM constant outside test (no override map) */
+SEC("tc/pktgen/fakeip_param_outside")
+int testpktgen_fakeip_param_outside(struct __sk_buff *skb)
+{
+	/* Destination 1.1.1.1 is outside 198.18.0.0/15 */
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(1,1,1,1), 19233, 80);
+}
+
+SEC("tc/setup/fakeip_param_outside")
+int testsetup_fakeip_param_outside(struct __sk_buff *skb)
+{
+	/* fallback: direct */
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+
+	bpf_tail_call(skb, &entry_call_map, 1);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_param_outside")
+int testcheck_fakeip_param_outside(struct __sk_buff *skb)
+{
+	/* Non-FakeIP destination should pass through since it is DIRECT */
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_OK,
+					    IPV4(192,168,0,1), IPV4(1,1,1,1),
+					    19233, 80,
+					    OUTBOUND_DIRECT, 0, true);
+}

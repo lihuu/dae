@@ -9,8 +9,10 @@
 package tests
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"syscall"
@@ -349,6 +351,9 @@ func Test(t *testing.T) {
 	var zeroEntry []byte
 
 	for _, progset := range progsets {
+		if strings.HasPrefix(progset.id, "FakeipParam") {
+			continue
+		}
 		if err = obj.RoutingMetaMap.Update(key, activeRulesLen, ebpf.UpdateAny); err != nil {
 			t.Fatalf("failed to initialize routing_meta_map: %v", err)
 		}
@@ -409,4 +414,191 @@ func TestWanEgressDirectMarkReroute(t *testing.T) {
 
 func TestConntrackArgsScratchReset(t *testing.T) {
 	runProgramSetByID(t, "ConntrackArgsScratchReset")
+}
+
+func collectProgramsWithParam(t *testing.T, fakeIPEnabled bool, fakeIPV4Network, fakeIPV4Mask uint32) (obj *bpftestObjects, progset []programSet, err error) {
+	obj = &bpftestObjects{}
+	spec, err := loadBpftest()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = disableAllPinnedMapsForTests(spec); err != nil {
+		return nil, nil, err
+	}
+
+	// Rewrite PARAM in spec exactly as control_plane/bpf_utils does
+	constants := map[string]interface{}{
+		"PARAM": struct {
+			tproxyPort           uint32
+			controlPlanePid      uint32
+			dae0Ifindex          uint32
+			daeNetnsId           uint32
+			dae0peerMac          [6]byte
+			paddingAfterMac      [2]uint8
+			useRedirectPeer      uint8
+			hasBpfGetCurrentTask uint8
+			padding2             uint16
+			daeSocketMark        uint32
+			fakeipV4Network      uint32
+			fakeipV4Mask         uint32
+			fakeipEnabled        uint8
+			fakeipPadding        [3]uint8
+		}{
+			tproxyPort:           1234,
+			controlPlanePid:      5678,
+			dae0Ifindex:          9,
+			daeNetnsId:           10,
+			dae0peerMac:          [6]byte{1, 2, 3, 4, 5, 6},
+			paddingAfterMac:      [2]uint8{0, 0},
+			useRedirectPeer:      1,
+			hasBpfGetCurrentTask: 1,
+			padding2:             0,
+			daeSocketMark:        999,
+			fakeipV4Network:      fakeIPV4Network,
+			fakeipV4Mask:         fakeIPV4Mask,
+			fakeipEnabled:        func() uint8 {
+				if fakeIPEnabled {
+					return 1
+				}
+				return 0
+			}(),
+			fakeipPadding:        [3]uint8{0, 0, 0},
+		},
+	}
+
+	for name, value := range constants {
+		if err := spec.Variables[name].Set(value); err != nil {
+			return nil, nil, fmt.Errorf("set variable %s: %w", name, err)
+		}
+	}
+
+	if err = spec.LoadAndAssign(obj,
+		&ebpf.CollectionOptions{
+			Programs: ebpf.ProgramOptions{},
+		},
+	); err != nil {
+		var (
+			ve          *ebpf.VerifierError
+			verifierLog string
+		)
+		if errors.As(err, &ve) {
+			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
+		}
+		t.Fatalf("Failed to load objects: %s\n%+v", verifierLog, err)
+		return nil, nil, err
+	}
+
+	if err = obj.LpmArrayMap.Update(uint32(0), obj.UnusedLpmType, ebpf.UpdateAny); err != nil {
+		t.Fatalf("Failed to update LpmArrayMap: %s", err)
+		return
+	}
+
+	v := reflect.ValueOf(obj.bpftestPrograms)
+	typeOfV := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		progname := typeOfV.Field(i).Name
+		if strings.HasPrefix(progname, "Testsetup") {
+			progid := strings.TrimPrefix(progname, "Testsetup")
+			progset = append(progset, programSet{
+				id:     progid,
+				pktgen: v.FieldByName("Testpktgen" + progid).Interface().(*ebpf.Program),
+				setup:  v.FieldByName("Testsetup" + progid).Interface().(*ebpf.Program),
+				check:  v.FieldByName("Testcheck" + progid).Interface().(*ebpf.Program),
+			})
+		}
+	}
+	return
+}
+
+func TestFakeipParamInterception(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	// Prepare FakeIP network/mask bytes matching big-endian (network order) layout in memory
+	addrBytes := [4]byte{198, 18, 0, 0}
+	fakeIPV4Network := binary.LittleEndian.Uint32(addrBytes[:])
+	maskBytes := [4]byte{255, 254, 0, 0}
+	fakeIPV4Mask := binary.LittleEndian.Uint32(maskBytes[:])
+
+	obj, progsets, err := collectProgramsWithParam(t, true, fakeIPV4Network, fakeIPV4Mask)
+	if err != nil {
+		t.Fatalf("failed to collect programs with PARAM: %v", err)
+	}
+	defer obj.Close()
+
+	// Filter and run only the FakeipParam test sets
+	var targets []programSet
+	for i := range progsets {
+		if strings.HasPrefix(progsets[i].id, "FakeipParam") {
+			targets = append(targets, progsets[i])
+		}
+	}
+
+	if len(targets) == 0 {
+		t.Fatal("no FakeipParam test cases found")
+	}
+
+	key := uint32(0)
+	activeRulesLen := uint32(testMaxMatchSetLen)
+
+	// Mark outbounds alive
+	aliveVal := uint32(1)
+	for i := uint32(0); i < 256; i++ {
+		for j := uint32(0); j < 6; j++ {
+			ck := i*6 + j
+			obj.OutboundConnectivityMap.Update(ck, aliveVal, ebpf.UpdateAny)
+		}
+	}
+
+	var zeroEntry []byte
+
+	for _, progset := range targets {
+		if err = obj.RoutingMetaMap.Update(key, activeRulesLen, ebpf.UpdateAny); err != nil {
+			t.Fatalf("failed to initialize routing_meta_map: %v", err)
+		}
+
+		if zeroEntry == nil {
+			zeroEntry = make([]byte, obj.RoutingMap.ValueSize())
+		}
+		for i := uint32(0); i < testMaxMatchSetLen; i++ {
+			if err = obj.RoutingMap.Update(i, zeroEntry, ebpf.UpdateAny); err != nil {
+				t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
+			}
+		}
+
+		t.Logf("Running parameter test: %s\n", progset.id)
+		data := make([]byte, 4096-256-320)
+		ctx := make([]byte, 256)
+
+		statusCode, data, ctx, err := runBpfProgram(progset.pktgen, data, ctx)
+		if err != nil {
+			t.Fatalf("error while running pktgen prog: %s", err)
+		}
+		if statusCode != 0 {
+			printBpfDebugLog(t)
+			t.Fatalf("error while running pktgen program: unexpected status code: %d", statusCode)
+		}
+
+		statusCode, data, ctx, err = runBpfProgram(progset.setup, data, ctx)
+		if err != nil {
+			printBpfDebugLog(t)
+			t.Fatalf("error while running setup prog: %s", err)
+		}
+
+		status := make([]byte, 4)
+		nl.NativeEndian().PutUint32(status, statusCode)
+		data = append(status, data...)
+
+		statusCode, data, ctx, err = runBpfProgram(progset.check, data, ctx)
+		if err != nil {
+			t.Fatalf("error while running check program: %+v", err)
+		}
+		if statusCode != 0 {
+			printBpfDebugLog(t)
+			t.Fatalf("error while running check program: unexpected status code: %d", statusCode)
+		}
+
+		consumeBpfDebugLog(t)
+	}
 }

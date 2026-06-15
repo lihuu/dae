@@ -436,36 +436,21 @@ retryLoadBpf:
 	}
 
 	constants := map[string]interface{}{
-		"PARAM": struct {
-			tproxyPort           uint32
-			controlPlanePid      uint32
-			dae0Ifindex          uint32
-			daeNetnsId           uint32
-			dae0peerMac          [6]byte
-			paddingAfterMac      [2]uint8
-			useRedirectPeer      uint8
-			hasBpfGetCurrentTask uint8
-			padding2             uint16
-			daeSocketMark        uint32
-			fakeipV4Network      uint32
-			fakeipV4Mask         uint32
-			fakeipEnabled        uint8
-			fakeipPadding        [3]uint8
-		}{
-			tproxyPort:           opts.BigEndianTproxyPort,
-			controlPlanePid:      uint32(os.Getpid()),
-			dae0Ifindex:          uint32(GetDaeNetns().Dae0().Attrs().Index),
-			daeNetnsId:           uint32(netnsID),
-			dae0peerMac:          peerMac,
-			paddingAfterMac:      [2]uint8{0, 0},
-			useRedirectPeer:      useRedirectPeer,
-			hasBpfGetCurrentTask: hasBpfGetCurrentTask,
-			padding2:             0,
-			daeSocketMark:        soMarkFromDae,
-			fakeipV4Network:      opts.FakeIPV4Network,
-			fakeipV4Mask:         opts.FakeIPV4Mask,
-			fakeipEnabled:        boolToUint8(opts.FakeIPEnabled),
-			fakeipPadding:        [3]uint8{0, 0, 0},
+		"PARAM": bpfDaeParam{
+			TproxyPort:           opts.BigEndianTproxyPort,
+			ControlPlanePid:      uint32(os.Getpid()),
+			Dae0Ifindex:          uint32(GetDaeNetns().Dae0().Attrs().Index),
+			DaeNetnsId:           uint32(netnsID),
+			Dae0peerMac:          peerMac,
+			PaddingAfterMac:      [2]uint8{0, 0},
+			UseRedirectPeer:      useRedirectPeer,
+			HasBpfGetCurrentTask: hasBpfGetCurrentTask,
+			Padding2:             0,
+			DaeSocketMark:        soMarkFromDae,
+			FakeipV4Network:      opts.FakeIPV4Network,
+			FakeipV4Mask:         opts.FakeIPV4Mask,
+			FakeipEnabled:        boolToUint8(opts.FakeIPEnabled),
+			FakeipPadding:        [3]uint8{0, 0, 0},
 		},
 	}
 	if err = loadBpfObjectsWithConstantsAndCustomizer(
