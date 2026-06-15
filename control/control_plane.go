@@ -105,6 +105,7 @@ type ControlPlane struct {
 	lastConnectionErrorLogTime     atomic.Int64
 	lastDnsFastPathErrorLogTime    atomic.Int64
 	lastDnsFastPathServfailLogTime atomic.Int64
+	lastUnknownFakeIPLogTime       atomic.Int64
 	listenerPublishMu              sync.Mutex
 	listenerFiles                  []*os.File
 	preparedDatapathCommit         bool
@@ -230,6 +231,7 @@ var (
 	// also rejects expired handoff entries on read.
 	routingHandoffSteadyInterval = 5 * time.Second
 	dnsFastPathErrorLogInterval  = 5 * time.Second
+	unknownFakeIPLogInterval     = 5 * time.Second
 
 	// TCP connection state timeout constants.
 	// TCP connections are longer-lived but we still need to clean up closed connections.
@@ -2929,6 +2931,19 @@ func (c *ControlPlane) allowDnsFastPathServfailLog(now time.Time) bool {
 			return false
 		}
 		if c.lastDnsFastPathServfailLogTime.CompareAndSwap(last, nowNano) {
+			return true
+		}
+	}
+}
+
+func (c *ControlPlane) allowUnknownFakeIPLog(now time.Time) bool {
+	nowNano := now.UnixNano()
+	for {
+		last := c.lastUnknownFakeIPLogTime.Load()
+		if nowNano-last < int64(unknownFakeIPLogInterval) {
+			return false
+		}
+		if c.lastUnknownFakeIPLogTime.CompareAndSwap(last, nowNano) {
 			return true
 		}
 	}

@@ -602,7 +602,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 	if isFakeIP {
 		if fakeIPErr != nil {
 			// Unknown FakeIP: reject to prevent synthetic-address leakage.
-			if c.log.IsLevelEnabled(logrus.WarnLevel) {
+			if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowUnknownFakeIPLog(time.Now()) {
 				c.log.WithFields(logrus.Fields{
 					"src": src.String(),
 					"dst": realDst.String(),

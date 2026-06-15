@@ -1626,7 +1626,6 @@ int testcheck_fakeip_tcp_direct(struct __sk_buff *skb)
 					    19233, 80,
 					    OUTBOUND_DIRECT, 0, true);
 }
-
 /* FakeIP + routing PROXY → redirect (same as normal proxy) */
 SEC("tc/pktgen/fakeip_tcp_proxy")
 int testpktgen_fakeip_tcp_proxy(struct __sk_buff *skb)
@@ -1742,6 +1741,48 @@ int testcheck_fakeip_disabled_direct(struct __sk_buff *skb)
 	return check_routing_ipv4_tcp_state(skb,
 					    TC_ACT_OK,
 					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19233, 80,
+					    OUTBOUND_DIRECT, 0, true);
+}
+
+/* FakeIP enabled + native IPv6 destination matching FakeIP suffix → bypass to DIRECT (TC_ACT_OK) */
+SEC("tc/pktgen/fakeip_ipv6_direct")
+int testpktgen_fakeip_ipv6_direct(struct __sk_buff *skb)
+{
+	/* Destination is a native IPv6 address: 2001:db8::198.18.5.6 (last 32 bits match 198.18.5.6)
+	 * 198.18.5.6 is 0xc6120506.
+	 * Word 0: 0x20010db8
+	 * Word 1: 0
+	 * Word 2: 0
+	 * Word 3: 0xc6120506
+	 */
+	return set_ipv6_tcp_with_dscp(skb,
+				      0x20010db8, 0, 0, 1,
+				      0x20010db8, 0, 0, 0xc6120506,
+				      19233, 80, 0);
+}
+
+SEC("tc/setup/fakeip_ipv6_direct")
+int testsetup_fakeip_ipv6_direct(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_ipv6_direct")
+int testcheck_fakeip_ipv6_direct(struct __sk_buff *skb)
+{
+	/* Since it is a native IPv6 address and NOT IPv4-mapped, it should NOT be intercepted as FakeIP.
+	 * Therefore, it should pass through (TC_ACT_OK) instead of being redirected.
+	 */
+	return check_routing_ipv6_tcp_state(skb,
+					    TC_ACT_OK,
+					    0x20010db8, 0, 0, 1,
+					    0x20010db8, 0, 0, 0xc6120506,
 					    19233, 80,
 					    OUTBOUND_DIRECT, 0, true);
 }

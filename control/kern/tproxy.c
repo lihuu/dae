@@ -218,6 +218,12 @@ struct {
 static __always_inline bool
 is_fakeip_v4_destination(const struct tuples_key *five)
 {
+	if (five->dip.u6_addr32[0] != 0 ||
+	    five->dip.u6_addr32[1] != 0 ||
+	    five->dip.u6_addr32[2] != bpf_htonl(0x0000ffff)) {
+		return false;
+	}
+
 	__u32 network, mask;
 	__u8 enabled;
 

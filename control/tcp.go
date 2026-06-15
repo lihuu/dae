@@ -169,7 +169,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		if fakeIPErr != nil {
 			// Unknown FakeIP: the address is in the configured prefix but has
 			// no persistent mapping. Reject to prevent synthetic-address leakage.
-			if c.log.IsLevelEnabled(logrus.WarnLevel) {
+			if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowUnknownFakeIPLog(time.Now()) {
 				c.log.WithFields(logrus.Fields{
 					"src": src.String(),
 					"dst": dst.String(),
