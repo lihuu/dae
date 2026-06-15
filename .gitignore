@@ -17,3 +17,5 @@ venv
 CLAUDE.md
 AGENTS.md
 .sisyphustst
+.qwen
+tests/
