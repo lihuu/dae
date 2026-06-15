@@ -717,7 +717,13 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 			// It is quic ...
 			// Fast path.
 			domain = ue.SniffedDomain
-			dialTarget := realDst.String()
+			// Use the endpoint's actual dial target (which may be a domain for
+			// FakeIP or sniffed QUIC) instead of the raw destination IP. This
+			// ensures the proxy receives the domain name, not a synthetic IP.
+			dialTarget := ue.DialTarget
+			if dialTarget == "" {
+				dialTarget = realDst.String()
+			}
 
 			if !c.checkUdpEndpointHealth(ue, ueKey, true) {
 				ue = nil
@@ -1009,18 +1015,45 @@ getNew:
 			Log:            c.log,
 			NowNano:        nowNano,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
+				outboundIdx := consts.OutboundIndex(routingResult.Outbound)
+				dest := realDst
+				authDomain := authoritativeDomain
+
+				// FakeIP + DIRECT: resolve the domain via direct_upstream to
+				// get the real IP. Without this, the direct dialer would
+				// resolve the domain via the FakeIP DNS controller (looping
+				// back to the synthetic IP). We keep realDst unchanged so the
+				// endpoint key (based on the FakeIP) still matches subsequent
+				// packets in the same flow.
+				if authDomain {
+					if resolvedAddr, resolveErr := c.resolveFakeIPDirect(ctx, domain, authDomain, outboundIdx); resolveErr != nil {
+						if c.log.IsLevelEnabled(logrus.WarnLevel) {
+							c.log.WithFields(logrus.Fields{
+								"src":      realSrc.String(),
+								"dst":      realDst.String(),
+								"domain":   domain,
+								"outbound": "direct",
+								"err":      resolveErr.Error(),
+							}).Warn("FakeIP direct resolution failed; falling back to domain dial (may loop)")
+						}
+					} else if resolvedAddr.IsValid() {
+						dest = netip.AddrPortFrom(resolvedAddr, realDst.Port())
+						authDomain = false
+					}
+				}
+
 				dialParam := &proxyDialParam{
-					Outbound:            consts.OutboundIndex(routingResult.Outbound),
+					Outbound:            outboundIdx,
 					Domain:              domain,
 					Mac:                 routingResult.Mac,
 					Dscp:                routingResult.Dscp,
 					ProcessName:         routingResult.Pname,
 					Src:                 realSrc,
-					Dest:                realDst,
+					Dest:                dest,
 					Mark:                routingResult.Mark,
 					Network:             "udp",
 					Excluded:            excludedDialer,
-					AuthoritativeDomain: authoritativeDomain,
+					AuthoritativeDomain: authDomain,
 				}
 
 				res, err := c.chooseProxyDialer(ctx, dialParam)
@@ -1052,9 +1085,17 @@ getNew:
 					return nil, ob.ErrNoAliveDialer
 				}
 
+				// Use the dial target from chooseProxyDialer so that FakeIP
+				// destinations dial the authoritative domain (e.g.,
+				// "www.google.com:443") rather than the synthetic IP.
+				// When res.DialTarget is empty, fall back to the original
+				// destination (non-FakeIP path).
+				target := dialTarget
+				if res.DialTarget != "" {
+					target = res.DialTarget
+				}
 				return &DialOption{
-					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
-					Target:        dialTarget,
+					Target:        target,
 					Dialer:        res.Dialer,
 					Outbound:      res.Outbound,
 					Network:       res.Network,
@@ -1075,6 +1116,12 @@ getNew:
 			}
 			return nil
 		}
+		// Sync dialTarget with the endpoint's actual target. For FakeIP destinations,
+		// GetDialOption sets ue.DialTarget to the authoritative domain:port (via
+		// chooseProxyDialer). This ensures subsequent WriteTo uses the domain target
+		// (so the proxy receives the domain, not the synthetic IP) and that retry
+		// iterations use the correct target.
+		dialTarget = ue.DialTarget
 	}
 
 	// If GetOrCreate reused an existing endpoint on the slow path, re-check the

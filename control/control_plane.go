@@ -120,6 +120,12 @@ type ControlPlane struct {
 	// the retiring generation via ReuseFakeIPStoreFrom, ensuring the BoltDB
 	// handle is never opened twice concurrently.
 	fakeIPStore *FakeIPStore
+
+	// directUpstreamName is the named DNS upstream for resolving FakeIP
+	// destinations when business routing selects direct outbound. It bypasses
+	// the FakeIP DNS synthesis, returning the real IP so direct dialers can
+	// reach the actual destination instead of looping back to the synthetic IP.
+	directUpstreamName string
 }
 
 type controlPlaneBuildOptions struct {
@@ -879,6 +885,7 @@ func newControlPlaneWithContextOptions(
 		dnsControllerOption.FakeIPEnabled = true
 		dnsControllerOption.FakeIPTTL = dnsConfig.FakeIP.TTL
 		dnsControllerOption.FakeIPStore = plane.fakeIPStore
+		plane.directUpstreamName = dnsConfig.FakeIP.DirectUpstream
 	}
 
 	plane.dnsController, err = NewDnsController(dnsUpstream, dnsControllerOption)
@@ -3948,6 +3955,46 @@ func (c *ControlPlane) lookupFakeIPDestination(addr netip.Addr) (domain string, 
 		return "", true, ErrUnknownFakeIP
 	}
 	return d, true, nil
+}
+
+// resolveFakeIPDirect resolves a FakeIP destination's domain via the configured
+// direct_upstream when business routing selected direct outbound. This bypasses
+// the FakeIP DNS synthesis and returns the real IP, allowing the direct dialer
+// to reach the actual destination instead of looping back through the FakeIP
+// DNS controller.
+//
+// Returns (zero, nil) when direct resolution is not applicable (FakeIP not
+// enabled, authoritativeDomain false, outbound not direct, or no direct_upstream
+// configured). Returns (addr, nil) on successful resolution, or (zero, err) on
+// resolution failure.
+func (c *ControlPlane) resolveFakeIPDirect(
+	ctx context.Context,
+	domain string,
+	authoritativeDomain bool,
+	outbound consts.OutboundIndex,
+) (netip.Addr, error) {
+	if !authoritativeDomain || domain == "" {
+		return netip.Addr{}, nil
+	}
+	if outbound != consts.OutboundDirect {
+		return netip.Addr{}, nil
+	}
+	upstreamName := c.directUpstreamName
+	if upstreamName == "" {
+		return netip.Addr{}, nil
+	}
+	dnsCtrl := c.dnsController
+	if dnsCtrl == nil {
+		return netip.Addr{}, nil
+	}
+	addrs, err := dnsCtrl.ResolveAWithUpstream(ctx, domain, upstreamName, nil)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("resolve %q via direct_upstream %q: %w", domain, upstreamName, err)
+	}
+	if len(addrs) == 0 {
+		return netip.Addr{}, fmt.Errorf("direct_upstream %q returned no A records for %q", upstreamName, domain)
+	}
+	return addrs[0], nil
 }
 
 // FakeIPStats returns a snapshot of the FakeIP store statistics, or (zero, false)

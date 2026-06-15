@@ -179,6 +179,24 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		}
 		domain = fakeIPDomain
 		authoritativeDomain = true
+		// FakeIP + DIRECT: resolve the domain via direct_upstream to get the
+		// real IP. Without this, the direct dialer would try to resolve the
+		// domain via the system resolver, which loops back through the FakeIP
+		// DNS controller (returning the synthetic IP again).
+		if realAddr, err := c.resolveFakeIPDirect(ctx, domain, true, consts.OutboundIndex(routingResult.Outbound)); err != nil {
+			if c.log.IsLevelEnabled(logrus.WarnLevel) {
+				c.log.WithFields(logrus.Fields{
+					"src":     src.String(),
+					"dst":     dst.String(),
+					"domain":  domain,
+					"outbound": "direct",
+					"err":     err.Error(),
+				}).Warn("FakeIP direct resolution failed; falling back to domain dial (may loop)")
+			}
+		} else if realAddr.IsValid() {
+			dst = netip.AddrPortFrom(realAddr, dst.Port())
+			authoritativeDomain = false // dialParam now dials the resolved IP directly
+		}
 		// Skip TCP sniffing: we already know the authoritative domain.
 		goto buildDialParam
 	}
