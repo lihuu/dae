@@ -211,6 +211,9 @@ func TestFakeIPMappingsReplayDomainBitmapAfterReload(t *testing.T) {
 	}
 	reused.replayFakeIPMappings(matchBitmap, publishFn)
 
+	// Snapshot the replay call count before the verification loop also calls matchBitmap.
+	replayCalls := newBitmapCalls.Load()
+
 	// Phase 5: Verify every persistent mapping was published with the new bitmap.
 	pubMu.Lock()
 	got := make([]publishedEntry, len(publications))
@@ -236,8 +239,8 @@ func TestFakeIPMappingsReplayDomainBitmapAfterReload(t *testing.T) {
 			"replay must preserve the original domain→IP mapping for %s", d)
 	}
 
-	require.EqualValues(t, len(domains), newBitmapCalls.Load(),
-		"MatchDomainBitmap should be called once per persistent mapping")
+	require.EqualValues(t, len(domains), replayCalls,
+		"MatchDomainBitmap should be called once per persistent mapping during replay")
 }
 
 // TestFakeIPTTLAndDirectUpstreamAllowReload verifies that changing TTL or

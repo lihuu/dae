@@ -35,8 +35,8 @@ func TestTCPFakeIPProxyUsesDomainAndPreservesOutbound(t *testing.T) {
 	if !isFakeIP {
 		t.Fatal("expected isFakeIP=true")
 	}
-	if domain != "www.google.com" {
-		t.Fatalf("domain = %q, want %q", domain, "www.google.com")
+	if domain != "www.google.com." {
+		t.Fatalf("domain = %q, want %q", domain, "www.google.com.")
 	}
 
 	// Verify chooseProxyDialer respects AuthoritativeDomain.
@@ -53,8 +53,8 @@ func TestTCPFakeIPProxyUsesDomainAndPreservesOutbound(t *testing.T) {
 	// verify the dial target construction logic via ChooseDialTarget bypass.
 	// The AuthoritativeDomain path constructs domain:port directly.
 	expectedTarget := net.JoinHostPort(domain, "443")
-	if p.Domain != "www.google.com" {
-		t.Fatalf("Domain = %q, want www.google.com", p.Domain)
+	if p.Domain != "www.google.com." {
+		t.Fatalf("Domain = %q, want www.google.com.", p.Domain)
 	}
 	if !p.AuthoritativeDomain {
 		t.Fatal("AuthoritativeDomain should be true")

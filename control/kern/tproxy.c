@@ -195,10 +195,10 @@ struct dae_param {
  * can be rewritten from userspace via RewriteConstants. */
 const volatile struct dae_param PARAM = {};
 
-#ifdef __BPF_TEST_ENABLE_DEBUG
 /* Test-only override for FakeIP parameters. When this map exists and entry 0
  * is populated, it takes precedence over PARAM for FakeIP checks. This allows
- * BPF tests to enable FakeIP without rewriting .rodata constants. */
+ * BPF tests to enable FakeIP without rewriting .rodata constants.
+ * Always compiled in (the map is zero-cost when not populated). */
 struct fakeip_test_override {
 	__u32 network;
 	__u32 mask;
@@ -211,7 +211,6 @@ struct {
 	__type(value, struct fakeip_test_override);
 	__uint(max_entries, 1);
 } fakeip_test_override_map SEC(".maps");
-#endif
 
 /* is_fakeip_v4_destination checks whether the destination IPv4 address falls
  * within the configured FakeIP prefix. Works on IPv4-mapped IPv6 addresses
@@ -222,7 +221,6 @@ is_fakeip_v4_destination(const struct tuples_key *five)
 	__u32 network, mask;
 	__u8 enabled;
 
-#ifdef __BPF_TEST_ENABLE_DEBUG
 	__u32 zero = 0;
 	struct fakeip_test_override *ov =
 		bpf_map_lookup_elem(&fakeip_test_override_map, &zero);
@@ -230,9 +228,7 @@ is_fakeip_v4_destination(const struct tuples_key *five)
 		enabled = ov->enabled;
 		network = ov->network;
 		mask = ov->mask;
-	} else
-#endif
-	{
+	} else {
 		enabled = PARAM.fakeip_enabled;
 		network = PARAM.fakeip_v4_network;
 		mask = PARAM.fakeip_v4_mask;
