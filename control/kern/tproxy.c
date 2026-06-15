@@ -2263,9 +2263,10 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, &pkt->tuples,
 					   &pkt->ethh, 0)) {
-		// Failed to prepare packet (e.g., bpf_skb_change_head failed under memory pressure)
-		// Fall back to direct pass to avoid packet corruption
-		return TC_ACT_OK;
+		// SECURITY: prep failure (e.g. bpf_skb_change_head under memory pressure)
+		// must drop — not pass — because routing has already decided this packet
+		// requires proxying. TC_ACT_OK would let it leak out the WAN unprocessed.
+		return TC_ACT_SHOT;
 	}
 
 	skb->cb[0] = TPROXY_MARK;
@@ -2944,9 +2945,8 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, u32 link_h_len,
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
 					   ethh, 1)) {
-		// Failed to prepare packet (e.g., bpf_skb_change_head failed)
-		// Fall back to direct pass to avoid packet corruption
-		return TC_ACT_OK;
+		// SECURITY: prep failure must drop — packet already routed to proxy.
+		return TC_ACT_SHOT;
 	}
 	skb->cb[0] = TPROXY_MARK;
 	skb->cb[1] = tcp_listener_l4proto(tcph);
@@ -3089,7 +3089,8 @@ fast_path_skip_routing:
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
 					   ethh, 1)) {
-		return TC_ACT_OK;
+		// SECURITY: prep failure must drop — packet already routed to proxy.
+		return TC_ACT_SHOT;
 	}
 	skb->cb[0] = TPROXY_MARK;
 	skb->cb[1] = IPPROTO_UDP;
