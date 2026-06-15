@@ -131,6 +131,20 @@ func (r *controlPlaneDNSRuntime) reuseDNSControllerFrom(previous *controlPlaneDN
 
 	oldController := previous.dnsController
 	if r.dnsController != nil {
+		// Detach the FakeIP store from the temporary controller before closing
+		// it. The temporary controller was created with the same *FakeIPStore
+		// (BoltDB handle) that the old controller's shared dnsControllerStore
+		// holds. Without detaching, Close would fire the temporary store's
+		// closeOnce and close the shared BoltDB, leaving the reused controller
+		// with a dead database handle.
+		//
+		// The reused controller (from oldController.ReuseForReload below)
+		// shares the old controller's dnsControllerStore, which owns the
+		// canonical FakeIP store lifecycle. The temporary store's janitor,
+		// evictor, and BPF worker are still stopped by Close as expected.
+		if store := r.dnsController.dnsControllerStore; store != nil {
+			store.fakeIPStore = nil
+		}
 		_ = r.dnsController.Close()
 	}
 	reusedController, err := oldController.ReuseForReload(option, routing)
