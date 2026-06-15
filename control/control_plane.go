@@ -1350,6 +1350,13 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 			}
 			return nil
 		},
+		FakeIPBitmapPublisher: func(domain string, addr netip.Addr) error {
+			bitmap := c.routingMatcher.domainMatcher.MatchDomainBitmap(domain)
+			if err := c.core.UpdateDomainRoutingForAddr(addr, bitmap); err != nil {
+				return fmt.Errorf("UpdateDomainRoutingForAddr: %w", err)
+			}
+			return nil
+		},
 		NewCache: func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error) {
 			return &DnsCache{
 				DomainBitmap:     c.routingMatcher.domainMatcher.MatchDomainBitmap(fqdn),
@@ -3972,6 +3979,8 @@ func (c *ControlPlane) resolveFakeIPDirect(
 	domain string,
 	authoritativeDomain bool,
 	outbound consts.OutboundIndex,
+	src netip.AddrPort,
+	routingResult *bpfRoutingResult,
 ) (netip.Addr, error) {
 	if !authoritativeDomain || domain == "" {
 		return netip.Addr{}, nil
@@ -3987,7 +3996,11 @@ func (c *ControlPlane) resolveFakeIPDirect(
 	if dnsCtrl == nil {
 		return netip.Addr{}, nil
 	}
-	addrs, err := dnsCtrl.ResolveAWithUpstream(ctx, domain, upstreamName, nil)
+	req := &udpRequest{
+		realSrc:       src,
+		routingResult: routingResult,
+	}
+	addrs, err := dnsCtrl.ResolveAWithUpstream(ctx, domain, upstreamName, req)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("resolve %q via direct_upstream %q: %w", domain, upstreamName, err)
 	}

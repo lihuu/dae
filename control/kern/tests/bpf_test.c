@@ -19,11 +19,12 @@
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
 	__uint(key_size, sizeof(__u32));
-	__uint(max_entries, 1);
+	__uint(max_entries, 2);
 	__array(values, int());
 } entry_call_map SEC(".maps") = {
 	.values = {
 		[0] = &tproxy_wan_egress_l2,
+		[1] = &tproxy_lan_ingress_l2,
 	},
 };
 
@@ -1610,7 +1611,8 @@ int testsetup_fakeip_tcp_direct(struct __sk_buff *skb)
 	/* fallback: direct */
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
-	bpf_tail_call(skb, &entry_call_map, 0);
+	/* FakeIP interception happens at LAN ingress, not WAN egress */
+	bpf_tail_call(skb, &entry_call_map, 1);
 	return TC_ACT_OK;
 }
 
@@ -1640,7 +1642,8 @@ int testsetup_fakeip_tcp_proxy(struct __sk_buff *skb)
 	/* fallback: proxy */
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
 
-	bpf_tail_call(skb, &entry_call_map, 0);
+	/* FakeIP interception happens at LAN ingress, not WAN egress */
+	bpf_tail_call(skb, &entry_call_map, 1);
 	return TC_ACT_OK;
 }
 
@@ -1669,7 +1672,8 @@ int testsetup_fakeip_tcp_block(struct __sk_buff *skb)
 	/* fallback: block */
 	set_routing_fallback(OUTBOUND_BLOCK, false);
 
-	bpf_tail_call(skb, &entry_call_map, 0);
+	/* FakeIP interception happens at LAN ingress, not WAN egress */
+	bpf_tail_call(skb, &entry_call_map, 1);
 	return TC_ACT_OK;
 }
 

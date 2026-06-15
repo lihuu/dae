@@ -1025,8 +1025,9 @@ getNew:
 				// back to the synthetic IP). We keep realDst unchanged so the
 				// endpoint key (based on the FakeIP) still matches subsequent
 				// packets in the same flow.
+				// Spec: resolution failure rejects the connection; no fallback.
 				if authDomain {
-					if resolvedAddr, resolveErr := c.resolveFakeIPDirect(ctx, domain, authDomain, outboundIdx); resolveErr != nil {
+					if resolvedAddr, resolveErr := c.resolveFakeIPDirect(ctx, domain, authDomain, outboundIdx, realSrc, routingResult); resolveErr != nil {
 						if c.log.IsLevelEnabled(logrus.WarnLevel) {
 							c.log.WithFields(logrus.Fields{
 								"src":      realSrc.String(),
@@ -1034,8 +1035,9 @@ getNew:
 								"domain":   domain,
 								"outbound": "direct",
 								"err":      resolveErr.Error(),
-							}).Warn("FakeIP direct resolution failed; falling back to domain dial (may loop)")
+							}).Warn("FakeIP direct resolution failed; rejecting flow")
 						}
+						return nil, fmt.Errorf("fakeip direct resolution failed for %q: %w", domain, resolveErr)
 					} else if resolvedAddr.IsValid() {
 						dest = netip.AddrPortFrom(resolvedAddr, realDst.Port())
 						authDomain = false
