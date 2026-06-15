@@ -1676,7 +1676,11 @@ int testsetup_fakeip_tcp_block(struct __sk_buff *skb)
 SEC("tc/check/fakeip_tcp_block")
 int testcheck_fakeip_tcp_block(struct __sk_buff *skb)
 {
-	return TC_ACT_SHOT;
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_SHOT,
+					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19233, 80,
+					    OUTBOUND_BLOCK, 0, true);
 }
 
 /* Non-FakeIP + routing DIRECT → pass through (TC_ACT_OK) */
