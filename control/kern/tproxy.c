@@ -2857,7 +2857,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, u32 link_h_len,
 		__u32 *mark_ptr = &mark;
 		__u8 *must_ptr = &scratch->must_val;
 
-		if (outbound == OUTBOUND_DIRECT && mark == 0 && !must && !is_fakeip_v4_destination(&tuples->five)) {
+		if (outbound == OUTBOUND_DIRECT && mark == 0 && !must) {
 			outbound_ptr = NULL;
 			mark_ptr = NULL;
 			must_ptr = NULL;
@@ -2868,7 +2868,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, u32 link_h_len,
 			must_ptr, scratch->mac, dscp, pname_str, pid_val);
 
 		if (!tcp_conn) {
-			if (outbound == OUTBOUND_DIRECT && mark == 0 && !is_fakeip_v4_destination(&tuples->five))
+			if (outbound == OUTBOUND_DIRECT && mark == 0)
 				return TC_ACT_OK;
 			return TC_ACT_SHOT;
 		}
@@ -2924,8 +2924,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, u32 link_h_len,
 	}
 
 	if (outbound == OUTBOUND_DIRECT &&
-	    mark == 0 && // If mark is not zero, we should re-route it.
-	    !is_fakeip_v4_destination(&tuples->five)
+	    mark == 0 // If mark is not zero, we should re-route it.
 	) {
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("GO OUTBOUND_DIRECT");
@@ -3053,7 +3052,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, u32 link_h_len,
 
 fast_path_skip_routing:
 		if (udp_conn_state && tuples->five.dport != bpf_htons(53)) {
-			if (outbound != OUTBOUND_DIRECT || mark != 0 || must || is_fakeip_v4_destination(&tuples->five)) {
+			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
 				__builtin_memcpy(udp_conn_state->mac, mac, 6);
 				if (pid_pname) {
 					__builtin_memcpy(udp_conn_state->pname,
@@ -3079,7 +3078,7 @@ fast_path_skip_routing:
 		   tuples->five.dip.u6_addr32, bpf_ntohs(tuples->five.dport));
 #endif
 
-	if (outbound == OUTBOUND_DIRECT && mark == 0 && !is_fakeip_v4_destination(&tuples->five))
+	if (outbound == OUTBOUND_DIRECT && mark == 0)
 		return TC_ACT_OK;
 	else if (unlikely(outbound == OUTBOUND_BLOCK))
 		return TC_ACT_SHOT;
