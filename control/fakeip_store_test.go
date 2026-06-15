@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 	"net/netip"
 )
 
@@ -266,4 +267,42 @@ func TestFakeIPStoreStats(t *testing.T) {
 	stats = store.Stats()
 	require.Equal(t, uint64(1), stats.Allocated)
 	require.Equal(t, uint64(5), stats.Remaining)
+}
+
+// TestFakeIPStoreLogicalCorruptionIsIsolatedAndRebuilt verifies that a bijective
+// inconsistency in domain_to_ip ↔ ip_to_domain triggers the isolate-and-rebuild
+// recovery path rather than failing startup outright.
+func TestFakeIPStoreLogicalCorruptionIsIsolatedAndRebuilt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fakeip.db")
+	prefix := testPrefix29(t)
+
+	// Populate a valid store with one mapping.
+	store1, err := OpenFakeIPStore(path, prefix, fakeipTestLogger())
+	require.NoError(t, err)
+	_, _, err = store1.GetOrAllocate("test.com")
+	require.NoError(t, err)
+	store1.Close()
+
+	// Directly break the bijective invariant: add a domain_to_ip entry whose
+	// reverse mapping in ip_to_domain is missing.
+	db, err := bolt.Open(path, 0600, nil)
+	require.NoError(t, err)
+	err = db.Update(func(tx *bolt.Tx) error {
+		d2p := tx.Bucket(bucketDomainToIP)
+		// Write a domain → 198.18.0.2 without adding the reverse entry.
+		corruptIP := netip.MustParseAddr("198.18.0.2")
+		return d2p.Put([]byte("ghost.example.com."), addrTo4Bytes(corruptIP))
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Opening the store must recover automatically, not fail.
+	store2, err := OpenFakeIPStore(path, prefix, fakeipTestLogger())
+	require.NoError(t, err, "logical corruption should trigger isolate-and-rebuild, not fail startup")
+	defer store2.Close()
+
+	stats := store2.Stats()
+	require.Equal(t, uint64(1), stats.RecoveredDBs, "should record one recovery")
+	require.Equal(t, uint64(0), stats.Allocated, "fresh store should be empty after recovery")
 }

@@ -253,3 +253,109 @@ func TestFakeIPConcurrentQueriesShareOneAllocation(t *testing.T) {
 			"all concurrent A queries for the same domain must return the same synthetic IP")
 	}
 }
+
+// TestFakeIPBitmapPublisherCalledOnAllocation verifies that when a FakeIP is
+// allocated and written to the DNS cache, the FakeIPBitmapPublisher callback
+// is invoked with the correct domain and allocated IP. This ensures the
+// persistent "fakeip:<addr>" owner is published to the eBPF domain_routing_map
+// alongside the volatile DNS cache owner.
+func TestFakeIPBitmapPublisherCalledOnAllocation(t *testing.T) {
+	var (
+		mu            sync.Mutex
+		publishedCall []struct {
+			domain string
+			addr   netip.Addr
+		}
+	)
+
+	ctrl := newFakeIPTestController(t, "198.18.0.0/15", 60, func(opt *DnsControllerOption) {
+		opt.FakeIPBitmapPublisher = func(domain string, addr netip.Addr) error {
+			mu.Lock()
+			defer mu.Unlock()
+			publishedCall = append(publishedCall, struct {
+				domain string
+				addr   netip.Addr
+			}{domain: domain, addr: addr})
+			return nil
+		}
+	})
+
+	resp := doFakeIPQuery(t, ctrl, "publisher.example.com.", dnsmessage.TypeA)
+	require.Equal(t, dnsmessage.RcodeSuccess, resp.Rcode)
+	require.Len(t, resp.Answer, 1)
+	expectedIP, ok := netip.AddrFromSlice(resp.Answer[0].(*dnsmessage.A).A)
+	require.True(t, ok)
+	expectedIP = expectedIP.Unmap()
+
+	mu.Lock()
+	calls := make([]struct {
+		domain string
+		addr   netip.Addr
+	}, len(publishedCall))
+	copy(calls, publishedCall)
+	mu.Unlock()
+
+	require.NotEmpty(t, calls, "FakeIPBitmapPublisher should have been called at least once")
+	// Find a call matching our domain.
+	found := false
+	for _, c := range calls {
+		if c.addr == expectedIP {
+			found = true
+			// The domain may be FQDN-form ("publisher.example.com.") — check suffix.
+			require.Contains(t, c.domain, "publisher.example.com",
+				"publisher should receive the queried domain")
+			break
+		}
+	}
+	require.True(t, found,
+		"FakeIPBitmapPublisher should be called with the allocated FakeIP address %v", expectedIP)
+}
+
+// TestFakeIPBitmapPublisherRepublishesAfterCacheEviction verifies that after
+// DNS cache eviction, a subsequent FakeIP query re-publishes the persistent
+// bitmap via FakeIPBitmapPublisher. Without this, the eBPF domain_routing_map
+// entry would be lost between eviction and the next reload.
+func TestFakeIPBitmapPublisherRepublishesAfterCacheEviction(t *testing.T) {
+	var (
+		mu            sync.Mutex
+		publishedCall int
+	)
+
+	ctrl := newFakeIPTestController(t, "198.18.0.0/15", 60, func(opt *DnsControllerOption) {
+		opt.FakeIPBitmapPublisher = func(domain string, addr netip.Addr) error {
+			mu.Lock()
+			defer mu.Unlock()
+			publishedCall++
+			return nil
+		}
+	})
+
+	// Initial query: allocates FakeIP and should trigger the publisher.
+	resp1 := doFakeIPQuery(t, ctrl, "republish.example.com.", dnsmessage.TypeA)
+	require.Equal(t, dnsmessage.RcodeSuccess, resp1.Rcode)
+	require.Len(t, resp1.Answer, 1)
+
+	mu.Lock()
+	afterFirst := publishedCall
+	mu.Unlock()
+	require.GreaterOrEqual(t, afterFirst, 1,
+		"publisher should be called on initial FakeIP allocation")
+
+	// Simulate DNS cache eviction.
+	baseKeyA := ctrl.cacheKey("republish.example.com.", dnsmessage.TypeA)
+	ctrl.RemoveDnsRespCache(baseKeyA)
+	scopeKey := baseKeyA + "|" + ctrl.responseCacheScope(nil, consts.DnsRequestOutboundIndex_FakeIP, nil)
+	ctrl.RemoveDnsRespCache(scopeKey)
+
+	// Re-query: cache entry is gone, so a fresh cache write occurs.
+	// The publisher must be called again to re-establish the persistent owner.
+	resp2 := doFakeIPQuery(t, ctrl, "republish.example.com.", dnsmessage.TypeA)
+	require.Equal(t, dnsmessage.RcodeSuccess, resp2.Rcode)
+	require.Len(t, resp2.Answer, 1)
+
+	mu.Lock()
+	afterSecond := publishedCall
+	mu.Unlock()
+	require.Greater(t, afterSecond, afterFirst,
+		"publisher should be called again after cache eviction to restore the persistent owner")
+}

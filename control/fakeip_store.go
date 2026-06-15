@@ -102,7 +102,31 @@ func OpenFakeIPStore(path string, prefix netip.Prefix, log *logrus.Logger) (*Fak
 
 	if err := s.initOrRestore(); err != nil {
 		db.Close()
-		return nil, err
+		if isLogicalCorruptionError(err) {
+			// Bijective mapping or structural inconsistency — same recovery
+			// strategy as a BoltDB-level corruption: isolate the bad file and
+			// start fresh. This avoids failing startup for recoverable data
+			// damage (e.g. partial writes, manual DB edits).
+			if recoverErr := s.isolateAndRecreate(path); recoverErr != nil {
+				return nil, fmt.Errorf("logical corruption recovery failed: %w (original: %v)", recoverErr, err)
+			}
+			db, err = bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+			if err != nil {
+				return nil, fmt.Errorf("reopen after logical corruption recovery: %w", err)
+			}
+			s.db = db
+			// Reset in-memory maps — isolateAndRecreate only bumps recoveredDBs
+			// and renames the file; the maps were partially populated by the
+			// failed initOrRestore scan.
+			s.byDomain = make(map[string]netip.Addr)
+			s.byIP = make(map[netip.Addr]string)
+			if err := s.initOrRestore(); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("init fresh store after logical corruption recovery: %w", err)
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	s.updateStats()
@@ -120,6 +144,22 @@ func isCorruptionError(err error) bool {
 		strings.Contains(msg, "invalid page") ||
 		strings.Contains(msg, "txid too high") ||
 		strings.Contains(msg, "invalid database")
+}
+
+// isLogicalCorruptionError detects bijective mapping inconsistencies and
+// structural data corruption found during initOrRestore's scan of existing
+// entries. These are distinct from BoltDB-level corruption (isCorruptionError)
+// but warrant the same isolate-and-rebuild recovery strategy.
+func isLogicalCorruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "bijective inconsistency") ||
+		strings.Contains(msg, "corrupt domain_to_ip entry") ||
+		strings.Contains(msg, "corrupt entry") ||
+		strings.Contains(msg, "outside prefix") ||
+		strings.Contains(msg, "unsupported fakeip store schema version")
 }
 
 func (s *FakeIPStore) isolateAndRecreate(path string) error {

@@ -85,6 +85,14 @@ type DnsControllerOption struct {
 	FakeIPEnabled         bool
 	FakeIPTTL             int
 	FakeIPStore           *FakeIPStore
+	// FakeIPBitmapPublisher publishes a persistent IP/bitmap pair to the eBPF
+	// domain_routing_map using a stable owner key (e.g. "fakeip:<addr>") that
+	// survives DNS cache eviction. The closure receives the domain and its
+	// allocated FakeIP address; it is responsible for computing the domain
+	// bitmap and calling into the domain routing tracker. When nil, only the
+	// volatile DNS cache owner is used and the bitmap is lost when the cache
+	// entry expires.
+	FakeIPBitmapPublisher func(domain string, addr netip.Addr) error
 }
 
 type dnsControllerRuntimeState struct {
@@ -100,6 +108,7 @@ type dnsControllerRuntimeState struct {
 	fakeIPEnabled         bool
 	fakeIPTTL             int
 	fakeIPStore           *FakeIPStore
+	fakeIPBitmapPublisher func(domain string, addr netip.Addr) error
 }
 
 type dnsControllerStore struct {
@@ -495,6 +504,7 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		fakeIPEnabled:         option.FakeIPEnabled,
 		fakeIPTTL:             option.FakeIPTTL,
 		fakeIPStore:           option.FakeIPStore,
+		fakeIPBitmapPublisher: option.FakeIPBitmapPublisher,
 	})
 	return nil
 }
@@ -2813,6 +2823,22 @@ func (c *DnsController) handleFakeIPQuery(
 		}
 		return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure,
 			"FakeIP: cache update failed", req, responseWriter)
+	}
+
+	// Also publish a persistent owner ("fakeip:<addr>") so the bitmap
+	// survives DNS cache eviction. Without this, the domain routing entry
+	// in eBPF is lost when the cache entry expires (TTL/LRU) and is only
+	// restored on the next DNS query or after a reload replay.
+	if publisher := rt.fakeIPBitmapPublisher; publisher != nil {
+		if pubErr := publisher(qname, ip); pubErr != nil {
+			if c.log != nil {
+				c.log.WithFields(logrus.Fields{
+					"domain": strings.ToLower(qname),
+					"addr":   ip.String(),
+				}).Warnf("FakeIP: failed to publish persistent bitmap: %v", pubErr)
+			}
+			// Non-fatal: the cache-keyed owner is still in place.
+		}
 	}
 
 	// Send the synthesized response to the client.
