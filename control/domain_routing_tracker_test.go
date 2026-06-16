@@ -40,6 +40,22 @@ func domainRoutingACache(ownerKey string, ip string, bitmap []uint32) *DnsCache 
 	}
 }
 
+func TestBuildDomainRoutingOwnerSnapshotPreservesAddressBytes(t *testing.T) {
+	cache := domainRoutingACache("fakeip:198.18.0.102", "198.18.0.102", domainRoutingBitmap(0x1))
+
+	snapshot, err := buildDomainRoutingOwnerSnapshot(cache)
+	if err != nil {
+		t.Fatalf("buildDomainRoutingOwnerSnapshot: %v", err)
+	}
+
+	addr := netip.MustParseAddr("198.18.0.102")
+	addr16 := addr.As16()
+	want := common.Ipv6ByteSliceToUint32Array(addr16[:])
+	if _, ok := snapshot.ips[want]; !ok {
+		t.Fatalf("snapshot key = %v, want raw address key %v", snapshot.ips, want)
+	}
+}
+
 func TestDomainRoutingTrackerMergesSharedIPAcrossOwners(t *testing.T) {
 	domainMap := newJanitorTestMap(t, "domain_routing_map")
 	core := &controlPlaneCore{

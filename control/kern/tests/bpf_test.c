@@ -1595,6 +1595,77 @@ static __always_inline void disable_fakeip(void)
 	bpf_map_delete_elem(&fakeip_test_override_map, &zero);
 }
 
+/* A stateless non-SYN packet to a FakeIP must fail closed. A late ACK/RST can
+ * arrive after userspace has removed the connection state; passing it through
+ * would leak the synthetic destination onto the WAN interface. */
+SEC("tc/pktgen/fakeip_tcp_non_syn_stateless_drop")
+int testpktgen_fakeip_tcp_non_syn_stateless_drop(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp_with_flags(skb,
+				       IPV4(192,168,0,1), IPV4(198,18,5,6),
+				       19233, 443,
+				       false, true, true);
+}
+
+SEC("tc/setup/fakeip_tcp_non_syn_stateless_drop")
+int testsetup_fakeip_tcp_non_syn_stateless_drop(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/fakeip_tcp_non_syn_stateless_drop")
+int testcheck_fakeip_tcp_non_syn_stateless_drop(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
+}
+
+/* FakeIP addresses are synthetic routing tokens, not real destinations.
+ * Destination IP rules such as geoip:private must not classify them as DIRECT;
+ * routing must continue to domain rules or fallback instead. */
+SEC("tc/pktgen/fakeip_skips_destination_ip_rule")
+int testpktgen_fakeip_skips_destination_ip_rule(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19234, 443);
+}
+
+SEC("tc/setup/fakeip_skips_destination_ip_rule")
+int testsetup_fakeip_skips_destination_ip_rule(struct __sk_buff *skb)
+{
+	struct match_set ms = {};
+	struct lpm_key lpm_key = {
+		.prefixlen = 111, /* IPv4-mapped prefix + /15 */
+	};
+	__u32 lpm_value = bpf_ntohl(0x01000000);
+
+	enable_fakeip_198_18();
+
+	/* dip(198.18.0.0/15) -> direct */
+	ms.type = MatchType_IpSet;
+	ms.outbound = OUTBOUND_DIRECT;
+	bpf_map_update_elem(&routing_map, &zero_key, &ms, BPF_ANY);
+
+	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[3] = bpf_ntohl(0xc6120000);
+	bpf_map_update_elem(&unused_lpm_type, &lpm_key, &lpm_value, BPF_ANY);
+
+	/* Represents the later domain rule/fallback for a proxied FakeIP domain. */
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+
+	bpf_tail_call(skb, &entry_call_map, 1);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/fakeip_skips_destination_ip_rule")
+int testcheck_fakeip_skips_destination_ip_rule(struct __sk_buff *skb)
+{
+	return check_routing_ipv4_tcp_state(skb,
+					    TC_ACT_REDIRECT,
+					    IPV4(192,168,0,1), IPV4(198,18,5,6),
+					    19234, 443,
+					    OUTBOUND_USER_DEFINED_MIN, 0, true);
+}
+
 /* FakeIP + routing DIRECT → redirect to userspace */
 SEC("tc/pktgen/fakeip_tcp_direct")
 int testpktgen_fakeip_tcp_direct(struct __sk_buff *skb)

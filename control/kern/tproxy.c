@@ -215,12 +215,10 @@ struct {
 /* is_fakeip_v4_destination checks whether the destination IPv4 address falls
  * within the configured FakeIP prefix. Works on IPv4-mapped IPv6 addresses
  * where the IPv4 portion is in u6_addr32[3]. */
-static __always_inline bool
-is_fakeip_v4_destination(const struct tuples_key *five)
+static __always_inline bool is_fakeip_v4_addr(const __be32 dip[4])
 {
-	if (five->dip.u6_addr32[0] != 0 ||
-	    five->dip.u6_addr32[1] != 0 ||
-	    five->dip.u6_addr32[2] != bpf_htonl(0x0000ffff)) {
+	if (dip[0] != 0 || dip[1] != 0 ||
+	    dip[2] != bpf_htonl(0x0000ffff)) {
 		return false;
 	}
 
@@ -242,8 +240,14 @@ is_fakeip_v4_destination(const struct tuples_key *five)
 
 	if (!enabled)
 		return false;
-	__be32 dst = five->dip.u6_addr32[3];
+	__be32 dst = dip[3];
 	return (dst & mask) == network;
+}
+
+static __always_inline bool
+is_fakeip_v4_destination(const struct tuples_key *five)
+{
+	return is_fakeip_v4_addr(five->dip.u6_addr32);
 }
 
 /* fast_sock map and sk_msg programs are preserved here strictly for ABI compatibility
@@ -1243,6 +1247,7 @@ parse_wan_egress_packet(struct __sk_buff *skb, u32 link_h_len,
 struct route_ctx {
 	__u32 flag[8];
 	__u8 is_wan;
+	bool fakeip_v4_destination;
 	__be32 mac[4];
 	__u16 h_dport;
 	__u16 h_sport;
@@ -1471,6 +1476,13 @@ route_eval_match(struct route_ctx *ctx, const struct match_set *match_set,
 	case MatchType_IpSet:
 	case MatchType_SourceIpSet:
 	{
+		/* FakeIP addresses are synthetic domain handles. Matching them
+		 * against destination IP sets (for example geoip:private) would
+		 * classify the placeholder instead of the authoritative domain. */
+		if (match_type == MatchType_IpSet &&
+		    ctx->fakeip_v4_destination)
+			break;
+
 		struct lpm_key *lpm_key = route_select_lpm_key(ctx, match_type);
 
 #ifdef __DEBUG_ROUTING
@@ -1706,6 +1718,7 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 	__builtin_memset(ctx, 0, sizeof(*ctx));
 	__builtin_memcpy(ctx->flag, flag, sizeof(ctx->flag));
 	ctx->is_wan = _is_wan;
+	ctx->fakeip_v4_destination = is_fakeip_v4_addr(daddr);
 	__builtin_memcpy(ctx->mac, mac, sizeof(ctx->mac));
 	ctx->result = -ENOEXEC;
 
@@ -2339,9 +2352,13 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link_h_le
 					  NULL, NULL, NULL, NULL,
 					  0, NULL, 0);
 		// No cached state for an established packet: keep the historical
-		// passthrough behavior instead of recomputing routing.
-		if (!tcp_state)
+		// passthrough behavior for ordinary destinations. FakeIP must fail
+		// closed because a late ACK/RST can arrive after state cleanup.
+		if (!tcp_state) {
+			if (is_fakeip_v4_destination(&pkt->tuples.five))
+				return TC_ACT_SHOT;
 			return TC_ACT_OK;
+		}
 
 		/*
 		 * Compatibility restore for 030902f behavior and align with WAN
@@ -2351,8 +2368,11 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link_h_le
 		 */
 		if (!tcp_state->meta.data.has_routing) {
 			/* No cache: keep historical direct-pass semantics (e.g.
-			 * single-arm / reply-path traffic).
+			 * single-arm / reply-path traffic), except for FakeIP
+			 * destinations which must never escape to WAN.
 			 */
+			if (is_fakeip_v4_destination(&pkt->tuples.five))
+				return TC_ACT_SHOT;
 			return TC_ACT_OK;
 		}
 
