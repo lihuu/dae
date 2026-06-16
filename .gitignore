@@ -7,6 +7,8 @@ bpf*_bpfel*.go
 bpf*_*_bpfeb*.go
 bpf*_*_bpfel*.go
 dae
+dae-*
+docs/superpowers/handoffs/
 outline.json
 go-mod/
 node_modules/
