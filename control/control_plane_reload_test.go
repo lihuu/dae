@@ -324,3 +324,50 @@ func TestFakeIPStoreClosesOnlyAfterFinalControllerClose(t *testing.T) {
 	// Closing the second facade (reused) should be a no-op (closeOnce already fired).
 	require.NoError(t, reused.Close())
 }
+
+// TestReplayFakeIPMappingsCountsFailures verifies that replayFakeIPMappings
+// reports per-entry publish failures via the failed counter, while still
+// counting successful publishes — so reload code can distinguish a clean
+// replay from one that needs `event=fakeip_reload result=failed`.
+func TestReplayFakeIPMappingsCountsFailures(t *testing.T) {
+	store := newFakeIPStoreForTest(t, "198.18.0.0/29")
+	defer store.Close()
+	routing := newFakeIPRouting(t)
+
+	domains := []string{"ok1.example.com.", "boom.example.com.", "ok2.example.com."}
+	for _, d := range domains {
+		_, _, err := store.GetOrAllocate(d)
+		require.NoError(t, err)
+	}
+
+	ctrl, err := NewDnsController(routing, &DnsControllerOption{
+		Log:                 logrus.New(),
+		LifecycleContext:    context.Background(),
+		FakeIPEnabled:       true,
+		FakeIPTTL:           60,
+		FakeIPStore:         store,
+		CacheAccessCallback: func(*DnsCache) error { return nil },
+		CacheRemoveCallback: func(*DnsCache) error { return nil },
+	})
+	require.NoError(t, err)
+	defer ctrl.Close()
+
+	matchBitmap := func(string) []uint32 { return []uint32{1} }
+	publishFn := func(domain string, addr netip.Addr, domainBitmap []uint32) error {
+		if domain == "boom.example.com." {
+			return errReplayPublishFail
+		}
+		return nil
+	}
+
+	count, failed, rangeErr := ctrl.replayFakeIPMappings(matchBitmap, publishFn)
+	require.NoError(t, rangeErr, "store iteration must not error")
+	require.Equal(t, 2, count, "two domains should publish successfully")
+	require.Equal(t, 1, failed, "one domain should be counted as failed")
+}
+
+var errReplayPublishFail = &replayPublishErr{}
+
+type replayPublishErr struct{}
+
+func (e *replayPublishErr) Error() string { return "simulated publish failure" }

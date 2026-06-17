@@ -474,6 +474,76 @@ func TestReuseDNSControllerFromUpdatesRuntime(t *testing.T) {
 	}
 }
 
+func TestReuseDNSControllerFromPreservesFakeIPRuntime(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	store := newFakeIPStoreForTest(t, "198.18.0.0/29")
+	defer store.Close()
+
+	oldRouting := &dns.Dns{}
+	oldController, err := NewDnsController(oldRouting, &DnsControllerOption{
+		Log:              logger,
+		LifecycleContext: context.Background(),
+		FakeIPEnabled:    true,
+		FakeIPTTL:        60,
+		FakeIPStore:      store,
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController(old) error = %v", err)
+	}
+	defer oldController.Close()
+
+	oldCP := &ControlPlane{
+		log: logger,
+		ctx: context.Background(),
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsController: oldController,
+		},
+	}
+
+	newCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	newRouting := newFakeIPRouting(t)
+	newController, err := NewDnsController(newRouting, &DnsControllerOption{
+		Log:              logger,
+		LifecycleContext: newCtx,
+		FakeIPEnabled:    true,
+		FakeIPTTL:        120,
+		FakeIPStore:      store,
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController(new) error = %v", err)
+	}
+
+	newCP := &ControlPlane{
+		log: logger,
+		ctx: newCtx,
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsController: newController,
+			dnsRouting:    newRouting,
+		},
+	}
+
+	if !newCP.ReuseDNSControllerFrom(oldCP) {
+		t.Fatal("ReuseDNSControllerFrom() = false, want true")
+	}
+
+	rt := newCP.dnsController.runtime()
+	if rt == nil {
+		t.Fatal("expected reused DNS controller runtime to be configured")
+	}
+	if !rt.fakeIPEnabled {
+		t.Fatal("expected FakeIP to remain enabled after DNS controller reuse")
+	}
+	if rt.fakeIPTTL != 120 {
+		t.Fatalf("expected FakeIP TTL from new generation, got %d", rt.fakeIPTTL)
+	}
+	if rt.fakeIPStore != store {
+		t.Fatal("expected FakeIP store to survive DNS controller reuse")
+	}
+}
+
 func TestDnsRequestContextUsesNewLifecycleDuringDNSHandoff(t *testing.T) {
 	oldCtx, oldCancel := context.WithCancel(context.Background())
 	defer oldCancel()

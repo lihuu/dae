@@ -350,33 +350,36 @@ func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDo
 // synthetic FakeIP addresses. Unlike ordinary DNS cache replay, this does not
 // depend on the DNS cache — it reads directly from the persistent BoltDB store.
 //
-// Returns the number of mappings successfully republished.
+// Returns the number of mappings successfully republished, the number that
+// failed to publish, and any error from the underlying store iteration.
 func (c *DnsController) replayFakeIPMappings(
 	matchDomainBitmap func(string) []uint32,
 	publishFn func(domain string, addr netip.Addr, domainBitmap []uint32) error,
-) int {
+) (count int, failed int, rangeErr error) {
 	if c == nil {
-		return 0
+		return 0, 0, nil
 	}
 	store := c.dnsControllerStore
 	if store == nil || store.fakeIPStore == nil {
-		return 0
+		return 0, 0, nil
 	}
 	if matchDomainBitmap == nil || publishFn == nil {
-		return 0
+		return 0, 0, nil
 	}
 
-	count := 0
-	_ = store.fakeIPStore.Range(func(domain string, ip netip.Addr) error {
+	rangeErr = store.fakeIPStore.Range(func(domain string, ip netip.Addr) error {
 		bitmap := matchDomainBitmap(domain)
-		if err := publishFn(domain, ip, bitmap); err != nil && c.log != nil {
-			c.log.WithError(err).Warnf("failed to replay FakeIP mapping for %s", domain)
+		if err := publishFn(domain, ip, bitmap); err != nil {
+			failed++
+			if c.log != nil {
+				c.log.WithError(err).Warnf("failed to replay FakeIP mapping for %s", domain)
+			}
 		} else {
 			count++
 		}
 		return nil
 	})
-	return count
+	return count, failed, rangeErr
 }
 
 // bpfUpdateTask represents a BPF map update request.
@@ -2748,6 +2751,7 @@ func (c *DnsController) handleFakeIPQuery(
 	// Non-A queries: return NODATA (RcodeSuccess with empty answer section).
 	// The domain exists, but FakeIP only synthesizes A records.
 	if qtype != dnsmessage.TypeA {
+		c.logFakeIPDNSAnswerNODATA(qname, qtype)
 		dnsMessage.Answer = nil
 		dnsMessage.Rcode = dnsmessage.RcodeSuccess
 		dnsMessage.Response = true
@@ -2770,6 +2774,7 @@ func (c *DnsController) handleFakeIPQuery(
 
 	// A query: allocate or load the canonical domain→IP mapping from the store.
 	if rt == nil || !rt.fakeIPEnabled || rt.fakeIPStore == nil {
+		c.logFakeIPDNSAnswerFailed(qname, qtype, "fakeip_not_configured", nil)
 		return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure,
 			"FakeIP: not configured", req, responseWriter)
 	}
@@ -2779,8 +2784,9 @@ func (c *DnsController) handleFakeIPQuery(
 		ttl = 60
 	}
 
-	ip, _, err := rt.fakeIPStore.GetOrAllocate(qname)
+	ip, allocated, err := rt.fakeIPStore.GetOrAllocate(qname)
 	if err != nil {
+		c.logFakeIPDNSAnswerFailed(qname, qtype, "fakeip_store_error", err)
 		if c.log != nil {
 			c.log.WithFields(logrus.Fields{
 				"domain": strings.ToLower(qname),
@@ -2816,6 +2822,7 @@ func (c *DnsController) handleFakeIPQuery(
 		responseCacheKey, qname, dnsmessage.TypeA,
 		dnsMessage.Answer, nil, nil, ttl,
 	); cacheErr != nil {
+		c.logFakeIPDNSAnswerFailed(qname, qtype, "fakeip_cache_error", cacheErr)
 		if c.log != nil {
 			c.log.WithFields(logrus.Fields{
 				"domain": strings.ToLower(qname),
@@ -2840,6 +2847,8 @@ func (c *DnsController) handleFakeIPQuery(
 			// Non-fatal: the cache-keyed owner is still in place.
 		}
 	}
+
+	c.logFakeIPDNSAnswerOK(qname, ip, ttl, allocated)
 
 	// Send the synthesized response to the client.
 	if responseWriter != nil {

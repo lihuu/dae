@@ -598,15 +598,22 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 	// endpoint keys so different domains using the same FakeIP prefix don't
 	// share endpoints.
 	var authoritativeDomain bool
+	var fakeIPAddr netip.Addr
 	fakeIPDomain, isFakeIP, fakeIPErr := c.lookupFakeIPDestination(realDst.Addr())
 	if isFakeIP {
+		fakeIPAddr = realDst.Addr()
 		if fakeIPErr != nil {
 			// Unknown FakeIP: reject to prevent synthetic-address leakage.
-			if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowUnknownFakeIPLog(time.Now()) {
-				c.log.WithFields(logrus.Fields{
-					"src": src.String(),
-					"dst": realDst.String(),
-				}).Warn("Unknown FakeIP UDP destination; dropping packet")
+			// Rate-limit the structured event together with the human warn on
+			// the same token to bound log volume during synthetic-address leaks.
+			if c.allowUnknownFakeIPLog(time.Now()) {
+				c.logFakeIPUnknown(realDst.Addr(), realSrc, "udp", realDst.Port())
+				if c.log.IsLevelEnabled(logrus.WarnLevel) {
+					c.log.WithFields(logrus.Fields{
+						"src": src.String(),
+						"dst": realDst.String(),
+					}).Warn("Unknown FakeIP UDP destination; dropping packet")
+				}
 			}
 			return nil
 		}
@@ -1028,6 +1035,7 @@ getNew:
 				// Spec: resolution failure rejects the connection; no fallback.
 				if authDomain {
 					if resolvedAddr, resolveErr := c.resolveFakeIPDirect(ctx, domain, authDomain, outboundIdx, realSrc, routingResult); resolveErr != nil {
+						c.logFakeIPDirectResolveFailed(domain, realDst.Addr(), c.directUpstreamName, "udp", realDst.Port(), resolveErr)
 						if c.log.IsLevelEnabled(logrus.WarnLevel) {
 							c.log.WithFields(logrus.Fields{
 								"src":      realSrc.String(),
@@ -1039,6 +1047,7 @@ getNew:
 						}
 						return nil, fmt.Errorf("fakeip direct resolution failed for %q: %w", domain, resolveErr)
 					} else if resolvedAddr.IsValid() {
+						c.logFakeIPDirectResolveOK(domain, realDst.Addr(), c.directUpstreamName, "udp", realDst.Port(), resolvedAddr)
 						dest = netip.AddrPortFrom(resolvedAddr, realDst.Port())
 						authDomain = false
 					}
@@ -1060,6 +1069,17 @@ getNew:
 
 				res, err := c.chooseProxyDialer(ctx, dialParam)
 				if err != nil {
+					if isFakeIP {
+						outboundName := ""
+						dialTarget := ""
+						if res != nil && res.Outbound != nil {
+							outboundName = res.Outbound.Name
+						}
+						if res != nil {
+							dialTarget = res.DialTarget
+						}
+						c.logFakeIPDialError(domain, fakeIPAddr, realSrc, "udp", realDst.Port(), outboundName, dialTarget, "proxy_dial_failed", err)
+					}
 					if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 						res.Outbound.HandleNoAliveDialer(
 							res.OrigNetworkType,
@@ -1074,6 +1094,9 @@ getNew:
 					return nil, err
 				}
 				if shouldRejectNewUdpDialSelection(res) {
+					if isFakeIP {
+						c.logFakeIPDialError(domain, fakeIPAddr, realSrc, "udp", realDst.Port(), res.Outbound.Name, res.DialTarget, "proxy_dial_failed", ob.ErrNoAliveDialer)
+					}
 					if res.Outbound != nil {
 						res.Outbound.HandleNoAliveDialer(
 							res.OrigNetworkType,
@@ -1095,6 +1118,9 @@ getNew:
 				target := dialTarget
 				if res.DialTarget != "" {
 					target = res.DialTarget
+				}
+				if isFakeIP {
+					c.logFakeIPFlow(domain, fakeIPAddr, realSrc, "udp", realDst.Port(), res.Outbound.Name, string(res.Outbound.GetSelectionPolicy()), target)
 				}
 				return &DialOption{
 					Target:        target,

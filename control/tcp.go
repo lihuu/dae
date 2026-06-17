@@ -163,17 +163,24 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		domain              string
 		lRelayConn          netproxy.Conn = lConn
 		authoritativeDomain bool
+		fakeIPAddr          netip.Addr
 	)
 	fakeIPDomain, isFakeIP, fakeIPErr := c.lookupFakeIPDestination(dst.Addr())
 	if isFakeIP {
+		fakeIPAddr = dst.Addr()
 		if fakeIPErr != nil {
 			// Unknown FakeIP: the address is in the configured prefix but has
 			// no persistent mapping. Reject to prevent synthetic-address leakage.
-			if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowUnknownFakeIPLog(time.Now()) {
-				c.log.WithFields(logrus.Fields{
-					"src": src.String(),
-					"dst": dst.String(),
-				}).Warn("Unknown FakeIP destination; rejecting connection")
+			// Rate-limit both the structured event and the human log on the same
+			// token so a leaking client cannot flood the log stream.
+			if c.allowUnknownFakeIPLog(time.Now()) {
+				c.logFakeIPUnknown(dst.Addr(), src, "tcp", dst.Port())
+				if c.log.IsLevelEnabled(logrus.WarnLevel) {
+					c.log.WithFields(logrus.Fields{
+						"src": src.String(),
+						"dst": dst.String(),
+					}).Warn("Unknown FakeIP destination; rejecting connection")
+				}
 			}
 			return fmt.Errorf("unknown fakeip destination %v", dst)
 		}
@@ -185,6 +192,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		// DNS controller (returning the synthetic IP again).
 		// Spec: resolution failure rejects the connection; no fallback.
 		if realAddr, err := c.resolveFakeIPDirect(ctx, domain, true, consts.OutboundIndex(routingResult.Outbound), src, routingResult); err != nil {
+			c.logFakeIPDirectResolveFailed(domain, dst.Addr(), c.directUpstreamName, "tcp", dst.Port(), err)
 			if c.log.IsLevelEnabled(logrus.WarnLevel) {
 				c.log.WithFields(logrus.Fields{
 					"src":      src.String(),
@@ -196,6 +204,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 			}
 			return fmt.Errorf("fakeip direct resolution failed for %q: %w", domain, err)
 		} else if realAddr.IsValid() {
+			c.logFakeIPDirectResolveOK(domain, dst.Addr(), c.directUpstreamName, "tcp", dst.Port(), realAddr)
 			dst = netip.AddrPortFrom(realAddr, dst.Port())
 			authoritativeDomain = false // dialParam now dials the resolved IP directly
 		}
@@ -279,6 +288,18 @@ buildDialParam:
 	// Dial and relay.
 	rConn, res, err := c.routeDial(ctx, dialParam)
 	if err != nil {
+		if isFakeIP {
+			errorClass := "proxy_dial_failed"
+			outboundName := ""
+			dialTarget := ""
+			if res != nil && res.Outbound != nil {
+				outboundName = res.Outbound.Name
+			}
+			if res != nil {
+				dialTarget = res.DialTarget
+			}
+			c.logFakeIPDialError(domain, fakeIPAddr, src, "tcp", dst.Port(), outboundName, dialTarget, errorClass, err)
+		}
 		if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 			res.Outbound.HandleNoAliveDialer(
 				res.OrigNetworkType,
@@ -296,6 +317,10 @@ buildDialParam:
 		return fmt.Errorf("failed to dial %v: %w", dst, err)
 	}
 	defer func() { _ = rConn.Close() }()
+
+	if isFakeIP && res != nil {
+		c.logFakeIPFlow(domain, fakeIPAddr, src, "tcp", dst.Port(), res.Outbound.Name, string(res.Outbound.GetSelectionPolicy()), res.DialTarget)
+	}
 
 	offloaded := false
 	offloadReason := ""

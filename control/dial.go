@@ -204,6 +204,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	if err != nil {
 		return &proxyDialResult{
 				Outbound:                outbound,
+				DialTarget:              dialTarget,
 				IsDialIp:                strictIpVersion,
 				OrigNetworkType:         networkType.StringWithoutDns(),
 				SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),

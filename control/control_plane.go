@@ -1556,7 +1556,18 @@ func (c *ControlPlane) replayFakeIPMappings() {
 	publishFn := func(domain string, addr netip.Addr, domainBitmap []uint32) error {
 		return c.core.UpdateDomainRoutingForAddr(addr, domainBitmap)
 	}
-	count := c.dnsController.replayFakeIPMappings(c.routingMatcher.domainMatcher.MatchDomainBitmap, publishFn)
+	count, failed, rangeErr := c.dnsController.replayFakeIPMappings(c.routingMatcher.domainMatcher.MatchDomainBitmap, publishFn)
+	if c.fakeIPStore != nil {
+		stats := c.fakeIPStore.Stats()
+		switch {
+		case rangeErr != nil:
+			c.logFakeIPReloadFailed("reload_replay_failed", rangeErr)
+		case failed > 0:
+			c.logFakeIPReloadFailed("reload_replay_failed", fmt.Errorf("%d of %d mappings failed to publish", failed, count+failed))
+		default:
+			c.logFakeIPReloadOK(count, stats.StorePath, stats.Prefix.String())
+		}
+	}
 	if count > 0 {
 		c.log.Infof("Replayed %d persistent FakeIP mappings with new domain bitmaps", count)
 	}
@@ -3920,13 +3931,26 @@ func (c *ControlPlane) ReuseDNSControllerFrom(previous *ControlPlane) bool {
 	if c == nil || previous == nil {
 		return false
 	}
+	option := c.dnsControllerOption()
+	c.inheritDNSRuntimeOptions(option)
 	return c.reuseDNSControllerFrom(
 		&previous.controlPlaneDNSRuntime,
-		c.dnsControllerOption(),
+		option,
 		c.dnsRouting,
 		c.log,
 		previous.SetDNSHandoffController,
 	)
+}
+
+func (c *ControlPlane) inheritDNSRuntimeOptions(option *DnsControllerOption) {
+	if c == nil || option == nil || c.dnsController == nil {
+		return
+	}
+	if rt := c.dnsController.runtime(); rt != nil {
+		option.FakeIPEnabled = rt.fakeIPEnabled
+		option.FakeIPTTL = rt.fakeIPTTL
+		option.FakeIPStore = rt.fakeIPStore
+	}
 }
 
 // ReuseFakeIPStoreFrom inherits the persistent FakeIP store from a retiring

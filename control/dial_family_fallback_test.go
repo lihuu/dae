@@ -76,6 +76,28 @@ func TestChooseProxyDialer_FixedOutboundFallsBackToAlternateFamilyOnSameDialer(t
 	}
 }
 
+func TestChooseProxyDialer_SelectErrorPreservesAuthoritativeDomainDialTarget(t *testing.T) {
+	cp := newTestDialControlPlane(newTestSingleRandomOutboundGroup())
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound:            consts.OutboundUserDefinedMin,
+		Domain:              "www.wikipedia.org.",
+		Src:                 netip.MustParseAddrPort("192.0.2.10:34567"),
+		Dest:                netip.MustParseAddrPort("198.18.0.102:443"),
+		Network:             "tcp",
+		AuthoritativeDomain: true,
+	})
+	if err == nil {
+		t.Fatal("chooseProxyDialer() error = nil, want selection failure")
+	}
+	if res == nil {
+		t.Fatal("chooseProxyDialer() result = nil, want partial result")
+	}
+	if res.DialTarget != "www.wikipedia.org.:443" {
+		t.Fatalf("DialTarget = %q, want %q", res.DialTarget, "www.wikipedia.org.:443")
+	}
+}
+
 func TestChooseProxyDialer_SingleDialerGroupPrefersSameFamilyDnsAdmissionFallback(t *testing.T) {
 	d := newTestEndpointDialer()
 	udp6 := &componentdialer.NetworkType{
