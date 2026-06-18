@@ -1140,21 +1140,11 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	// rather than silently expanding to nothing.
 	//
 	// See docs/superpowers/specs/2026-06-18-fakeip-routing-outbound-design.md.
-	outboundNames := map[string]struct{}{
-		consts.OutboundDirect.String(): {},
-		consts.OutboundBlock.String():  {},
-	}
-	for _, g := range conf.Group {
-		outboundNames[g.Name] = struct{}{}
-	}
 	expandedRequestRules, err := control.ExpandFakeIPRoutingOutbound(
 		log,
 		conf.Dns.Routing.Request.Rules,
 		conf.Routing.Rules,
-		func(name string) bool {
-			_, ok := outboundNames[name]
-			return ok
-		},
+		staticOutboundExists(conf),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("expand routing_outbound DNS selector: %w", err)
