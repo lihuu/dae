@@ -1120,6 +1120,46 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
+
+	// Expand DNS request rule selector `routing_outbound(...) -> fakeip` into
+	// synthetic qname rules derived from the in-memory main routing rules.
+	//
+	// This MUST run before any consumer reads conf.Dns.Routing.Request.Rules.
+	// Two consumers exist on the start/reload path:
+	//   1. daedns.NewWithOption below (line ~1147)
+	//   2. control.NewControlPlaneWithContext (control_plane.go), via
+	//      dns.New / NewNormalizedRequestRoutingProgram
+	// Neither has a parser registered for `routing_outbound`; both would
+	// fail with `unknown function: routing_outbound`. Expanding once here
+	// lets both consumers see the rewritten qname(...) rules.
+	//
+	// The outbound namespace at this point is statically determined by
+	// config text: `direct` and `block` are always present; every group in
+	// conf.Group will become an outbound at runtime. We use those names for
+	// the existence check so a misspelled canary group fails loudly here
+	// rather than silently expanding to nothing.
+	//
+	// See docs/superpowers/specs/2026-06-18-fakeip-routing-outbound-design.md.
+	outboundNames := map[string]struct{}{
+		consts.OutboundDirect.String(): {},
+		consts.OutboundBlock.String():  {},
+	}
+	for _, g := range conf.Group {
+		outboundNames[g.Name] = struct{}{}
+	}
+	expandedRequestRules, err := control.ExpandFakeIPRoutingOutbound(
+		log,
+		conf.Dns.Routing.Request.Rules,
+		conf.Routing.Rules,
+		func(name string) bool {
+			_, ok := outboundNames[name]
+			return ok
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("expand routing_outbound DNS selector: %w", err)
+	}
+	conf.Dns.Routing.Request.Rules = expandedRequestRules
 	if conf.Global.SoMarkFromDae == 0 {
 		var autoSelected bool
 		conf.Global.SoMarkFromDae, autoSelected = common.ResolveSoMarkFromDae(conf.Global.SoMarkFromDae, conf.Global.SoMarkFromDaeSet)
