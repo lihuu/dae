@@ -25,6 +25,7 @@ var patches = []patch{
 	patchEmptyDns,
 	patchMustOutbound,
 	patchDnsFakeIP,
+	patchRoutingOutbound,
 }
 
 func patchBootstrapResolver(params *Config) error {
