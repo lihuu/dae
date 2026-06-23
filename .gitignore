@@ -1,5 +1,6 @@
 .vscode
 .idea
+.worktrees/
 *.o
 *.tmp
 bpf*_bpfeb*.go
