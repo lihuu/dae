@@ -18,14 +18,17 @@ import (
 
 const DefaultLogOutputStatePath = "/var/lib/dae/log-output-state"
 
-var parseLogOutputStateFunc = parseLogOutputState
-
 type LogOutputSwitch struct {
 	path string
 
 	enabled atomic.Bool
 
-	watchOnce sync.Once
+	watchOnce    sync.Once
+	stopOnce     sync.Once
+	watchStarted atomic.Bool
+	stopCh       chan struct{}
+	watchDone    chan struct{}
+	parseState   func([]byte) (bool, error)
 
 	mu       sync.Mutex
 	lastSize int64
@@ -42,7 +45,12 @@ func NewLogOutputSwitch(path string) *LogOutputSwitch {
 		path = DefaultLogOutputStatePath
 	}
 
-	sw := &LogOutputSwitch{path: path}
+	sw := &LogOutputSwitch{
+		path:       path,
+		stopCh:     make(chan struct{}),
+		watchDone:  make(chan struct{}),
+		parseState: parseLogOutputState,
+	}
 	sw.enabled.Store(loadLogOutputStateFailOpen(path))
 	return sw
 }
@@ -69,14 +77,34 @@ func (sw *LogOutputSwitch) StartWatching() {
 		return
 	}
 	sw.watchOnce.Do(func() {
+		sw.watchStarted.Store(true)
 		go func() {
+			defer close(sw.watchDone)
+
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
-			for range ticker.C {
-				sw.refreshNow()
+			for {
+				select {
+				case <-ticker.C:
+					sw.refreshNow()
+				case <-sw.stopCh:
+					return
+				}
 			}
 		}()
 	})
+}
+
+func (sw *LogOutputSwitch) StopWatching() {
+	if sw == nil {
+		return
+	}
+	sw.stopOnce.Do(func() {
+		close(sw.stopCh)
+	})
+	if sw.watchStarted.Load() {
+		<-sw.watchDone
+	}
 }
 
 func (sw *LogOutputSwitch) refreshNow() {
@@ -113,7 +141,7 @@ func (sw *LogOutputSwitch) refreshNow() {
 	sw.lastMod = info.ModTime()
 	sw.mu.Unlock()
 
-	enabled, err := parseLogOutputStateFunc(b)
+	enabled, err := sw.parseState(b)
 	if err != nil {
 		return
 	}

@@ -175,14 +175,14 @@ func TestRefreshNowDoesNotReparseUnchangedInvalidRuntimeState(t *testing.T) {
 		t.Fatalf("Enabled() = true, want false before invalid refresh")
 	}
 
-	oldParse := parseLogOutputStateFunc
+	oldParse := sw.parseState
 	parseCalls := 0
-	parseLogOutputStateFunc = func(b []byte) (bool, error) {
+	sw.parseState = func(b []byte) (bool, error) {
 		parseCalls++
 		return parseLogOutputState(b)
 	}
 	t.Cleanup(func() {
-		parseLogOutputStateFunc = oldParse
+		sw.parseState = oldParse
 	})
 
 	if err := os.WriteFile(statePath, []byte("enabled=maybe"), 0o644); err != nil {
@@ -244,9 +244,19 @@ func TestSwitchableWriterWrapNilUsesDiscard(t *testing.T) {
 func TestStartWatchingIsSafeToCallMoreThanOnce(t *testing.T) {
 	statePath := writeLogOutputState(t, "enabled=1")
 	sw := NewLogOutputSwitch(statePath)
+	defer sw.StopWatching()
 
 	sw.StartWatching()
 	sw.StartWatching()
+}
+
+func TestStopWatchingIsSafeToCallMoreThanOnce(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=1")
+	sw := NewLogOutputSwitch(statePath)
+
+	sw.StartWatching()
+	sw.StopWatching()
+	sw.StopWatching()
 }
 
 type errWriter struct {
