@@ -24,7 +24,11 @@ func SetLogger(log *logrus.Logger, logLevel string, disableTimestamp bool, logFi
 		ForceFormatting:  true,
 		TimestampFormat:  "2006-01-02 15:04:05",
 	})
+	output := log.Out
 	if logFileOpt != nil {
-		log.SetOutput(logFileOpt)
+		output = logFileOpt
 	}
+	sw := DefaultLogOutputSwitch()
+	sw.StartWatching()
+	log.SetOutput(sw.Wrap(output))
 }

@@ -18,6 +18,11 @@ import (
 
 const DefaultLogOutputStatePath = "/var/lib/dae/log-output-state"
 
+var (
+	defaultLogOutputSwitchMu sync.Mutex
+	defaultLogOutputSwitch   *LogOutputSwitch
+)
+
 type LogOutputSwitch struct {
 	path string
 
@@ -38,6 +43,16 @@ type LogOutputSwitch struct {
 type SwitchableWriter struct {
 	outputSwitch *LogOutputSwitch
 	dst          io.Writer
+}
+
+func DefaultLogOutputSwitch() *LogOutputSwitch {
+	defaultLogOutputSwitchMu.Lock()
+	defer defaultLogOutputSwitchMu.Unlock()
+
+	if defaultLogOutputSwitch == nil {
+		defaultLogOutputSwitch = NewLogOutputSwitch(DefaultLogOutputStatePath)
+	}
+	return defaultLogOutputSwitch
 }
 
 func NewLogOutputSwitch(path string) *LogOutputSwitch {
@@ -63,6 +78,9 @@ func (sw *LogOutputSwitch) Enabled() bool {
 }
 
 func (sw *LogOutputSwitch) Wrap(dst io.Writer) io.Writer {
+	if w, ok := dst.(*SwitchableWriter); ok && w != nil && w.outputSwitch == sw {
+		return dst
+	}
 	if dst == nil {
 		dst = io.Discard
 	}

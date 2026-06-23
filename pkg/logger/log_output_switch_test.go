@@ -10,7 +10,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/sirupsen/logrus"
 )
 
 func TestParseLogOutputStateAcceptsEnabledValues(t *testing.T) {
@@ -241,6 +244,95 @@ func TestSwitchableWriterWrapNilUsesDiscard(t *testing.T) {
 	}
 }
 
+func TestSetLoggerUsesDefaultSwitchWithoutChangingLevelSemantics(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=0")
+	sw := NewLogOutputSwitch(statePath)
+	defer useDefaultLogOutputSwitchForTest(sw)()
+
+	var dst bytes.Buffer
+	log := logrus.New()
+	log.SetOutput(&dst)
+
+	SetLogger(log, "warn", true, nil)
+	log.Warn("hidden while disabled")
+	if got := dst.String(); got != "" {
+		t.Fatalf("log output while switch disabled = %q, want empty", got)
+	}
+
+	if err := os.WriteFile(statePath, []byte("enabled=1"), 0o644); err != nil {
+		t.Fatalf("enable state: %v", err)
+	}
+	sw.refreshNow()
+
+	log.Info("still hidden by level")
+	log.Warn("visible after enabled")
+	got := dst.String()
+	if strings.Contains(got, "still hidden by level") {
+		t.Fatalf("info output at warn level = %q, want suppressed", got)
+	}
+	if !strings.Contains(got, "visible after enabled") {
+		t.Fatalf("log output after switch enabled = %q, want warn message", got)
+	}
+}
+
+func TestSetLoggerSharesDefaultSwitchAcrossDedicatedAndStandardLoggers(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=0")
+	sw := NewLogOutputSwitch(statePath)
+	defer useDefaultLogOutputSwitchForTest(sw)()
+
+	standard := logrus.StandardLogger()
+	oldOut := standard.Out
+	oldFormatter := standard.Formatter
+	oldLevel := standard.Level
+	t.Cleanup(func() {
+		standard.SetOutput(oldOut)
+		standard.SetFormatter(oldFormatter)
+		standard.SetLevel(oldLevel)
+	})
+
+	var dedicatedDst bytes.Buffer
+	dedicated := logrus.New()
+	dedicated.SetOutput(&dedicatedDst)
+
+	var standardDst bytes.Buffer
+	standard.SetOutput(&standardDst)
+
+	SetLogger(dedicated, "info", true, nil)
+	SetLogger(standard, "info", true, nil)
+
+	dedicated.Info("dedicated hidden")
+	standard.Info("standard hidden")
+	if dedicatedDst.Len() != 0 || standardDst.Len() != 0 {
+		t.Fatalf("disabled default switch wrote dedicated=%q standard=%q, want both empty", dedicatedDst.String(), standardDst.String())
+	}
+
+	if err := os.WriteFile(statePath, []byte("enabled=1"), 0o644); err != nil {
+		t.Fatalf("enable state: %v", err)
+	}
+	sw.refreshNow()
+
+	dedicated.Info("dedicated visible")
+	standard.Info("standard visible")
+	if !strings.Contains(dedicatedDst.String(), "dedicated visible") {
+		t.Fatalf("dedicated output = %q, want visible message", dedicatedDst.String())
+	}
+	if !strings.Contains(standardDst.String(), "standard visible") {
+		t.Fatalf("standard output = %q, want visible message", standardDst.String())
+	}
+}
+
+func TestWrapReturnsExistingSwitchableWriterForSameSwitch(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=1")
+	sw := NewLogOutputSwitch(statePath)
+	var dst bytes.Buffer
+
+	wrapped := sw.Wrap(&dst)
+	wrappedAgain := sw.Wrap(wrapped)
+	if wrappedAgain != wrapped {
+		t.Fatalf("Wrap(existing switchable writer) returned %T, want original %T", wrappedAgain, wrapped)
+	}
+}
+
 func TestStartWatchingIsSafeToCallMoreThanOnce(t *testing.T) {
 	statePath := writeLogOutputState(t, "enabled=1")
 	sw := NewLogOutputSwitch(statePath)
@@ -262,6 +354,23 @@ func TestStopWatchingIsSafeToCallMoreThanOnce(t *testing.T) {
 type errWriter struct {
 	n   int
 	err error
+}
+
+func useDefaultLogOutputSwitchForTest(sw *LogOutputSwitch) func() {
+	defaultLogOutputSwitchMu.Lock()
+	previous := defaultLogOutputSwitch
+	defaultLogOutputSwitch = sw
+	defaultLogOutputSwitchMu.Unlock()
+
+	return func() {
+		if sw != nil {
+			sw.StopWatching()
+		}
+
+		defaultLogOutputSwitchMu.Lock()
+		defaultLogOutputSwitch = previous
+		defaultLogOutputSwitchMu.Unlock()
+	}
 }
 
 func (w errWriter) Write([]byte) (int, error) {
