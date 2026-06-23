@@ -18,6 +18,8 @@ import (
 
 const DefaultLogOutputStatePath = "/var/lib/dae/log-output-state"
 
+var parseLogOutputStateFunc = parseLogOutputState
+
 type LogOutputSwitch struct {
 	path string
 
@@ -105,16 +107,18 @@ func (sw *LogOutputSwitch) refreshNow() {
 	if err != nil {
 		return
 	}
-	enabled, err := parseLogOutputState(b)
+
+	sw.mu.Lock()
+	sw.lastSize = info.Size()
+	sw.lastMod = info.ModTime()
+	sw.mu.Unlock()
+
+	enabled, err := parseLogOutputStateFunc(b)
 	if err != nil {
 		return
 	}
 
 	sw.enabled.Store(enabled)
-	sw.mu.Lock()
-	sw.lastSize = info.Size()
-	sw.lastMod = info.ModTime()
-	sw.mu.Unlock()
 }
 
 func (w *SwitchableWriter) Write(p []byte) (int, error) {

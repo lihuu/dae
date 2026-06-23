@@ -148,6 +148,63 @@ func TestRefreshNowKeepsPreviousValueForInvalidRuntimeState(t *testing.T) {
 	}
 }
 
+func TestRefreshNowKeepsPreviousValueForRuntimeReadError(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=0")
+	sw := NewLogOutputSwitch(statePath)
+	if sw.Enabled() {
+		t.Fatalf("Enabled() = true, want false before read error")
+	}
+
+	if err := os.Remove(statePath); err != nil {
+		t.Fatalf("remove state file: %v", err)
+	}
+	if err := os.Mkdir(statePath, 0o755); err != nil {
+		t.Fatalf("replace state file with directory: %v", err)
+	}
+
+	sw.refreshNow()
+	if sw.Enabled() {
+		t.Fatalf("Enabled() = true after read error, want previous false")
+	}
+}
+
+func TestRefreshNowDoesNotReparseUnchangedInvalidRuntimeState(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=0")
+	sw := NewLogOutputSwitch(statePath)
+	if sw.Enabled() {
+		t.Fatalf("Enabled() = true, want false before invalid refresh")
+	}
+
+	oldParse := parseLogOutputStateFunc
+	parseCalls := 0
+	parseLogOutputStateFunc = func(b []byte) (bool, error) {
+		parseCalls++
+		return parseLogOutputState(b)
+	}
+	t.Cleanup(func() {
+		parseLogOutputStateFunc = oldParse
+	})
+
+	if err := os.WriteFile(statePath, []byte("enabled=maybe"), 0o644); err != nil {
+		t.Fatalf("write invalid state: %v", err)
+	}
+	sw.refreshNow()
+	if parseCalls != 1 {
+		t.Fatalf("parse calls after changed invalid state = %d, want 1", parseCalls)
+	}
+	if sw.Enabled() {
+		t.Fatalf("Enabled() = true after invalid refresh, want previous false")
+	}
+
+	sw.refreshNow()
+	if parseCalls != 1 {
+		t.Fatalf("parse calls after unchanged invalid state = %d, want 1", parseCalls)
+	}
+	if sw.Enabled() {
+		t.Fatalf("Enabled() = true after unchanged invalid refresh, want previous false")
+	}
+}
+
 func TestRefreshNowFailOpenForMissingRuntimeState(t *testing.T) {
 	statePath := writeLogOutputState(t, "enabled=0")
 	sw := NewLogOutputSwitch(statePath)
@@ -162,6 +219,34 @@ func TestRefreshNowFailOpenForMissingRuntimeState(t *testing.T) {
 	if !sw.Enabled() {
 		t.Fatalf("Enabled() = false after missing refresh, want true")
 	}
+}
+
+func TestNilLogOutputSwitchEnabledFailOpen(t *testing.T) {
+	var sw *LogOutputSwitch
+	if !sw.Enabled() {
+		t.Fatalf("Enabled() = false, want true for nil switch")
+	}
+}
+
+func TestSwitchableWriterWrapNilUsesDiscard(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=1")
+	sw := NewLogOutputSwitch(statePath)
+
+	n, err := sw.Wrap(nil).Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if n != len("hello") {
+		t.Fatalf("Write() n = %d, want %d", n, len("hello"))
+	}
+}
+
+func TestStartWatchingIsSafeToCallMoreThanOnce(t *testing.T) {
+	statePath := writeLogOutputState(t, "enabled=1")
+	sw := NewLogOutputSwitch(statePath)
+
+	sw.StartWatching()
+	sw.StartWatching()
 }
 
 type errWriter struct {
