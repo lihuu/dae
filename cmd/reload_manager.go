@@ -19,6 +19,7 @@ import (
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/sirupsen/logrus"
 )
 
@@ -37,6 +38,14 @@ type reloadManager struct {
 	pendingRetirementDone        <-chan struct{}
 	pendingReloadRequestedAt     time.Time
 	pendingReloadRequestedAtMono uint64
+
+	// pendingReloadCollector carries the rules-load SummaryCollector for the
+	// in-flight reload across the goroutine boundary between the reload handler
+	// (which builds the new control plane) and the main loop (which sees the
+	// reload finish and emits the rules_load_summary event). Set by the reload
+	// handler before notifyRunStateChange; read and cleared by takePendingReloadCollector.
+	pendingReloadCollectorMu sync.Mutex
+	pendingReloadCollector   *SummaryCollector
 }
 
 func newReloadManager(reloadReqs chan reloadRequest, runStateChanges chan struct{}, sigs <-chan os.Signal) *reloadManager {
@@ -71,6 +80,45 @@ func (m *reloadManager) reloadError() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.reloadingErr
+}
+
+// setPendingReloadCollector stashes the in-flight reload's rules-load
+// SummaryCollector so the main loop can emit its summary after the reload
+// completes. Safe for nil m.
+func (m *reloadManager) setPendingReloadCollector(c *SummaryCollector) {
+	if m == nil {
+		return
+	}
+	m.pendingReloadCollectorMu.Lock()
+	m.pendingReloadCollector = c
+	m.pendingReloadCollectorMu.Unlock()
+}
+
+// takePendingReloadCollector returns and clears the SummaryCollector stashed
+// by setPendingReloadCollector. Returns nil if none was set or m is nil.
+func (m *reloadManager) takePendingReloadCollector() *SummaryCollector {
+	if m == nil {
+		return nil
+	}
+	m.pendingReloadCollectorMu.Lock()
+	defer m.pendingReloadCollectorMu.Unlock()
+	c := m.pendingReloadCollector
+	m.pendingReloadCollector = nil
+	return c
+}
+
+// peekPendingReloadCollector returns the stashed SummaryCollector without
+// clearing it. Used by the retirement goroutine to emit a follow-up
+// rules_load_stage stage=reload_retire event after the main loop has
+// already taken (and emitted) the rules_load_summary at [Reload] Finished.
+// Returns nil if none was set or m is nil.
+func (m *reloadManager) peekPendingReloadCollector() *SummaryCollector {
+	if m == nil {
+		return nil
+	}
+	m.pendingReloadCollectorMu.Lock()
+	defer m.pendingReloadCollectorMu.Unlock()
+	return m.pendingReloadCollector
 }
 
 func (m *reloadManager) coalesceReloadRequest(req reloadRequest) reloadRequest {
@@ -298,6 +346,16 @@ func (m *reloadManager) startControlPlaneRetirement(
 	staleBeforeNs := m.pendingReloadRequestedAtMono
 	m.mu.Unlock()
 
+	// Snapshot the rules-load collector for this reload (if any). The
+	// retirement goroutine emits a rules_load_stage stage=reload_retire
+	// event when it completes so operators can correlate the old-generation
+	// drain duration with the matching rules_load_summary. Picking the
+	// collector at retirement-start (rather than reading the in-flight
+	// pendingReloadCollector when retirement finishes) avoids racing with
+	// the main loop, which clears the pointer on takePendingReloadCollector.
+	retireCollector := m.peekPendingReloadCollector()
+	retireStart := time.Now()
+
 	go func(done chan struct{}) {
 		defer close(done)
 
@@ -315,6 +373,15 @@ func (m *reloadManager) startControlPlaneRetirement(
 		}
 		if log != nil {
 			log.Warnln("[Reload] Retired old control plane")
+		}
+
+		// Emit a rules_load_stage stage=reload_retire event after retirement
+		// completes so operators can identify slow drain/forced-close paths.
+		// The rules_load_summary for this reload was already emitted at
+		// [Reload] Finished; this is a follow-up stage event only.
+		if log != nil && retireCollector != nil {
+			rulesload.EmitStage(log, rulesload.LifecycleReload, rulesload.StageReloadRetire,
+				time.Since(retireStart).Milliseconds(), 0, 0, "")
 		}
 	}(retirementDone)
 }

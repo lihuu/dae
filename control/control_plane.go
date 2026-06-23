@@ -39,6 +39,7 @@ import (
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
+	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol/direct"
@@ -138,6 +139,11 @@ type controlPlaneBuildOptions struct {
 	// of opening a concurrent one (which would fail on platforms with exclusive
 	// file locking). When nil, the constructor opens a fresh store.
 	reuseFakeIPStore *FakeIPStore
+
+	// rulesLoadObserver receives routing build stage timing notifications.
+	// Set by the caller when structured observability is desired. When nil,
+	// no stage events are emitted and the existing coarse log lines remain.
+	rulesLoadObserver rulesload.Observer
 }
 
 const (
@@ -317,6 +323,7 @@ func NewControlPlaneWithContext(
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
 	reuseFakeIPStore *FakeIPStore,
+	obs rulesload.Observer,
 ) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
@@ -330,7 +337,8 @@ func NewControlPlaneWithContext(
 		dnsConfig,
 		externGeoDataDirs,
 		controlPlaneBuildOptions{
-			reuseFakeIPStore: reuseFakeIPStore,
+			reuseFakeIPStore:  reuseFakeIPStore,
+			rulesLoadObserver: obs,
 		},
 	)
 }
@@ -349,6 +357,7 @@ func NewPreparedControlPlaneWithContext(
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
 	reuseFakeIPStore *FakeIPStore,
+	obs rulesload.Observer,
 ) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
@@ -365,6 +374,7 @@ func NewPreparedControlPlaneWithContext(
 			delayDatapathCommit:   true,
 			delayDNSListenerStart: true,
 			reuseFakeIPStore:      reuseFakeIPStore,
+			rulesLoadObserver:     obs,
 		},
 	)
 }
@@ -586,9 +596,13 @@ func newControlPlaneWithContextOptions(
 	}
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
+	daeDNSStart := time.Now()
 	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
 	if err != nil {
 		return nil, err
+	}
+	if obs := buildOpts.rulesLoadObserver; obs != nil {
+		obs.RecordStage(rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0)
 	}
 
 	// Dial mode.
@@ -709,6 +723,7 @@ func newControlPlaneWithContextOptions(
 	}
 	// Apply rules optimizers.
 	log.Infoln("Optimizing and loading routing rules (this may take a while for large rule sets)...")
+	routingOptimizeStart := time.Now()
 	routingProgram, err := routing.NewNormalizedProgram(routingA.Rules, routingA.Fallback,
 		&routing.AliasOptimizer{},
 		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
@@ -717,6 +732,9 @@ func newControlPlaneWithContextOptions(
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
+	}
+	if obs := buildOpts.rulesLoadObserver; obs != nil {
+		obs.RecordStage(rulesload.StageMainRoutingOptimize, time.Since(routingOptimizeStart).Milliseconds(), len(routingA.Rules), len(routingProgram.Rules))
 	}
 	routingA.Rules = nil // Release.
 	if log.IsLevelEnabled(logrus.DebugLevel) {
@@ -728,6 +746,7 @@ func newControlPlaneWithContextOptions(
 	}
 	// Parse rules and build.
 	log.Infoln("Building routing matcher...")
+	routingMatcherStart := time.Now()
 	builder, err := NewRoutingMatcherBuilderFromProgram(log, routingProgram, outboundName2Id, core.bpf)
 	if err != nil {
 		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
@@ -749,6 +768,9 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("RoutingMatcherBuilder.BuildUserspace: %w", err)
 	}
 
+	if obs := buildOpts.rulesLoadObserver; obs != nil {
+		obs.RecordStage(rulesload.StageMainRoutingMatcher, time.Since(routingMatcherStart).Milliseconds(), 0, 0)
+	}
 	// Get referenced outbounds to limit health checks.
 	referencedOutbounds := builder.GetReferencedOutbounds()
 	if len(referencedOutbounds) > 0 {
@@ -831,6 +853,7 @@ func newControlPlaneWithContextOptions(
 	}
 
 	/// DNS upstream.
+	dnsControllerStart := time.Now()
 	dnsUpstream, err := dns.New(dnsConfig, &dns.NewOption{
 		Logger:                  log,
 		LocationFinder:          locationFinder,
@@ -845,6 +868,9 @@ func newControlPlaneWithContextOptions(
 	fixedDomainTtl, err := ParseFixedDomainTtl(dnsConfig.FixedDomainTtl)
 	if err != nil {
 		return nil, err
+	}
+	if obs := buildOpts.rulesLoadObserver; obs != nil {
+		obs.RecordStage(rulesload.StageDnsControllerBuild, time.Since(dnsControllerStart).Milliseconds(), 0, 0)
 	}
 	plane.dnsRouting = dnsUpstream
 	plane.dnsFixedDomainTtl = fixedDomainTtl

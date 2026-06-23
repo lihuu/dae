@@ -40,6 +40,7 @@ import (
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/logger"
+	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/mohae/deepcopy"
 	"github.com/okzk/sdnotify"
 	"github.com/sirupsen/logrus"
@@ -276,14 +277,17 @@ var (
 			if !disableAuthSudo {
 				internal.AutoSu()
 			}
+			startupCollector := newSummaryCollector(logrus.StandardLogger(), rulesload.LifecycleStartup)
 
 			// Read config from --config cfgFile.
+			configLoadStart := time.Now()
 			conf, includes, err := readConfig(cfgFile)
 			if err != nil {
 				logrus.WithFields(logrus.Fields{
 					"err": err,
 				}).Fatalln("Failed to read config")
 			}
+			startupCollector.RecordConfigLoad(time.Since(configLoadStart))
 
 			var logOpts *lumberjack.Logger
 			if logFile != "" {
@@ -301,15 +305,15 @@ var (
 			logger.SetLogger(logrus.StandardLogger(), conf.Global.LogLevel, disableTimestamp, logOpts)
 
 			log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
-			if err := Run(log, conf, []string{filepath.Dir(cfgFile)}); err != nil {
+			if err := Run(log, conf, []string{filepath.Dir(cfgFile)}, startupCollector); err != nil {
 				log.Fatalln(err)
 			}
 		},
 	}
 )
 
-func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (err error) {
-	return newRunner(log, conf, externGeoDataDirs).Run()
+func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string, collector *SummaryCollector) (err error) {
+	return newRunner(log, conf, externGeoDataDirs, collector).Run()
 }
 
 func (r *Runner) Run() (err error) {
@@ -325,11 +329,15 @@ func (r *Runner) Run() (err error) {
 	// New ControlPlane.
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
-	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, nil)
+	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, nil, r.collector)
 	if err != nil {
 		cancel()
 		return err
 	}
+	// Rules-load build is complete; publish the structured summary now so it
+	// appears regardless of whether Serve succeeds. emitStartupSummaryIfCollector
+	// is a no-op when r.collector is nil (validate path / tests).
+	r.emitStartupSummaryIfCollector()
 
 	var pprofServer *http.Server
 	if conf.Global.PprofPort != 0 {
@@ -404,6 +412,8 @@ func (r *Runner) Run() (err error) {
 			abortConnections := os.Remove(AbortFile) == nil
 			log.Warnln("[Reload] Load new config")
 			var newConf *config.Config
+			var reloadCollector *SummaryCollector
+			var reloadConfigStart time.Time
 			if req.isSuspend {
 				newConf, err = emptyConfig()
 				if err != nil {
@@ -422,8 +432,16 @@ func (r *Runner) Run() (err error) {
 				newConf.Global.LogLevel = "warning"
 			} else {
 				var includes []string
+				reloadCollector = newSummaryCollector(log, rulesload.LifecycleReload)
+				reloadConfigStart = time.Now()
 				newConf, includes, err = readConfig(cfgFile)
 				if err != nil {
+					configLoadMs := time.Since(reloadConfigStart).Milliseconds()
+					reloadCollector.RecordConfigLoad(time.Since(reloadConfigStart))
+					reloadCollector.SetError("config_parse_error")
+					rulesload.EmitStage(log, rulesload.LifecycleReload, rulesload.StageReadConfig,
+						configLoadMs, 0, 0, "config_parse_error")
+					reloadCollector.Emit()
 					log.WithFields(logrus.Fields{
 						"err": err,
 					}).Errorln("[Reload] Failed to reload")
@@ -433,6 +451,7 @@ func (r *Runner) Run() (err error) {
 					clearReloadPending(&reloadManager.reloadPending)
 					continue
 				}
+				reloadCollector.RecordConfigLoad(time.Since(reloadConfigStart))
 				log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			}
 			// New logger.
@@ -480,7 +499,7 @@ func (r *Runner) Run() (err error) {
 			if stagedHotHandoff {
 				log.Warnln("[Reload] Prepare staged same-port handoff")
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, c.FakeIPStore())
+				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, c.FakeIPStore(), reloadCollector)
 				dnsCache = nil
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -543,7 +562,7 @@ func (r *Runner) Run() (err error) {
 
 			log.Warnln("[Reload] Load new control plane")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, c.FakeIPStore())
+			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, c.FakeIPStore(), reloadCollector)
 			dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 			var newCancel context.CancelFunc
@@ -560,7 +579,7 @@ func (r *Runner) Run() (err error) {
 					obj = nil
 				}
 				ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs, c.FakeIPStore())
+				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs, c.FakeIPStore(), reloadCollector)
 				err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 				if err != nil {
 					_ = sdnotify.Stopping()
@@ -649,6 +668,15 @@ func (r *Runner) Run() (err error) {
 			reloadManager.clearPendingRetirement()
 			reloadManager.setPendingReloadMetadata(reloadStartedAt, reloadStartedAtMono)
 			reloadManager.beginHandoff()
+
+			// Stash the rules-load collector before starting the retire goroutine
+			// so the retirement path can attach a follow-up
+			// rules_load_stage stage=reload_retire event for the same reload.
+			// The main loop emits the rules_load_summary at [Reload] Finished
+			// via takePendingReloadCollector; the retire goroutine separately
+			// emits the reload_retire stage event via peekPendingReloadCollector
+			// when the old generation has drained.
+			reloadManager.setPendingReloadCollector(reloadCollector)
 
 			// Ready to close.
 			if oldC != nil && reloadManager.currentPendingStagedHandoff() == nil {
@@ -746,6 +774,9 @@ loop:
 					} else {
 						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 					}
+					if c := reloadManager.takePendingReloadCollector(); c != nil {
+						c.Emit()
+					}
 					log.Warnln("[Reload] Finished")
 					reloadManager.finishReloadSuccess()
 					continue
@@ -832,6 +863,9 @@ loop:
 					_ = setRunSignalProgress(consts.ReloadDone, "OK")
 				} else {
 					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+				}
+				if c := reloadManager.takePendingReloadCollector(); c != nil {
+					c.Emit()
 				}
 				log.Warnln("[Reload] Finished")
 				reloadManager.finishReloadSuccess()
@@ -1109,15 +1143,15 @@ func shutdownAfterSignalWithHandoff(
 	return nil
 }
 
-func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, reuseFakeIPStore)
+func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore, collector *SummaryCollector) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, reuseFakeIPStore, collector)
 }
 
-func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, reuseFakeIPStore)
+func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore, collector *SummaryCollector) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, reuseFakeIPStore, collector)
 }
 
-func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, reuseFakeIPStore *control.FakeIPStore) (c *control.ControlPlane, err error) {
+func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, reuseFakeIPStore *control.FakeIPStore, collector *SummaryCollector) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 
@@ -1140,6 +1174,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	// rather than silently expanding to nothing.
 	//
 	// See docs/superpowers/specs/2026-06-18-fakeip-routing-outbound-design.md.
+	fakeIPExpandStart := time.Now()
 	expandedRequestRules, err := control.ExpandFakeIPRoutingOutbound(
 		log,
 		conf.Dns.Routing.Request.Rules,
@@ -1147,9 +1182,26 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		staticOutboundExists(conf),
 	)
 	if err != nil {
+		expandMs := time.Since(fakeIPExpandStart).Milliseconds()
+		if collector != nil {
+			collector.SetError("fakeip_auto_expand_error")
+			collector.RecordStage(rulesload.StageFakeIPAutoExpand, expandMs, 0, 0)
+		}
+		if lc := collectorLifecycle(collector); lc != "" {
+			rulesload.EmitStage(log, lc, rulesload.StageFakeIPAutoExpand, expandMs, 0, 0, "fakeip_auto_expand_error")
+		}
 		return nil, fmt.Errorf("expand routing_outbound DNS selector: %w", err)
 	}
 	conf.Dns.Routing.Request.Rules = expandedRequestRules
+	fakeIPExpandMs := time.Since(fakeIPExpandStart).Milliseconds()
+	if lc := collectorLifecycle(collector); lc != "" {
+		rulesload.EmitStage(log, lc, rulesload.StageFakeIPAutoExpand, fakeIPExpandMs, 0, len(expandedRequestRules), "")
+	}
+	if collector != nil {
+		collector.RecordStage(rulesload.StageFakeIPAutoExpand, fakeIPExpandMs, 0, len(expandedRequestRules))
+		collector.SetFakeIPAutoDerived(len(expandedRequestRules))
+		collector.SetDnsRouting(len(expandedRequestRules), len(conf.Dns.Routing.Response.Rules))
+	}
 	if conf.Global.SoMarkFromDae == 0 {
 		var autoSelected bool
 		conf.Global.SoMarkFromDae, autoSelected = common.ResolveSoMarkFromDae(conf.Global.SoMarkFromDae, conf.Global.SoMarkFromDaeSet)
@@ -1174,12 +1226,16 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	direct.InitDirectDialers(conf.Global.FallbackResolver)
 	netutils.FallbackDns = netip.MustParseAddrPort(conf.Global.FallbackResolver)
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
+	daeDNSStart := time.Now()
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{LocationFinder: locationFinder})
 	if err != nil {
 		return nil, err
 	}
+	if lc := collectorLifecycle(collector); lc != "" {
 
-	// Start timing the startup process
+		rulesload.EmitStage(log, lc, rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0, "")
+		// Start timing the startup process
+	}
 	startTime := time.Now()
 	stageStart := startTime
 
@@ -1334,6 +1390,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	// Start timing the control plane creation
 	log.Infoln("Building control plane and routing rules...")
 	stageStart = time.Now()
+	controlPlaneBuildStart := time.Now()
 	if prepareOnly {
 		c, err = control.NewPreparedControlPlaneWithContext(
 			ctx,
@@ -1347,6 +1404,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Dns,
 			externGeoDataDirs,
 			reuseFakeIPStore,
+			collector,
 		)
 	} else {
 		c, err = control.NewControlPlaneWithContext(
@@ -1361,10 +1419,24 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Dns,
 			externGeoDataDirs,
 			reuseFakeIPStore,
+			collector,
 		)
 	}
+	controlPlaneBuildMs := time.Since(controlPlaneBuildStart).Milliseconds()
 	if err != nil {
+		if collector != nil {
+			collector.SetError("control_plane_build_error")
+		}
+		if lc := collectorLifecycle(collector); lc != "" {
+			rulesload.EmitStage(log, lc, rulesload.StageControlPlaneBuild, controlPlaneBuildMs, 0, 0, "control_plane_build_error")
+		}
 		return nil, err
+	}
+	if collector != nil {
+		collector.RecordStage(rulesload.StageControlPlaneBuild, controlPlaneBuildMs, 0, 0)
+	}
+	if lc := collectorLifecycle(collector); lc != "" {
+		rulesload.EmitStage(log, lc, rulesload.StageControlPlaneBuild, controlPlaneBuildMs, 0, 0, "")
 	}
 	log.Infof("Control plane built in %v", time.Since(stageStart))
 	log.Infof("Total startup time: %v", time.Since(startTime))
@@ -1431,6 +1503,13 @@ func emptyConfig() (conf *config.Config, err error) {
 		return nil, err
 	}
 	return conf, nil
+}
+
+func collectorLifecycle(c *SummaryCollector) rulesload.Lifecycle {
+	if c == nil {
+		return ""
+	}
+	return c.lifecycle
 }
 
 func init() {
