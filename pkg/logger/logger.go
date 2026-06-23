@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package logger
@@ -21,7 +21,8 @@ func SetLogger(log *logrus.Logger, logLevel string, disableTimestamp bool, logFi
 	log.SetFormatter(&prefixed.TextFormatter{
 		DisableTimestamp: disableTimestamp,
 		FullTimestamp:    true,
-		TimestampFormat:  "Jan 02 15:04:05",
+		ForceFormatting:  true,
+		TimestampFormat:  "2006-01-02 15:04:05",
 	})
 	if logFileOpt != nil {
 		log.SetOutput(logFileOpt)

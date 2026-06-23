@@ -1,6 +1,6 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
-*  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+*  Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package cmd
@@ -329,6 +329,7 @@ func (r *Runner) Run() (err error) {
 	// New ControlPlane.
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
+	configureTransparentHugePages(log, conf.Global.DisableTHP)
 	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, nil, r.collector)
 	if err != nil {
 		cancel()
@@ -535,6 +536,7 @@ func (r *Runner) Run() (err error) {
 				oldListener := listener
 
 				hasOverlap := newC.InheritDialerHealthFrom(oldC)
+				configureTransparentHugePages(log, newConf.Global.DisableTHP)
 				c = newC
 				currCancel = cancel
 				conf = newConf
@@ -646,6 +648,7 @@ func (r *Runner) Run() (err error) {
 			oldConf := conf
 
 			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			configureTransparentHugePages(log, newConf.Global.DisableTHP)
 			c = newC
 			currCancel = newCancel
 			conf = newConf
@@ -972,9 +975,11 @@ func retireControlPlaneConnections(
 			log.Infoln("[Reload] Old control plane drained active sessions; retiring immediately")
 		case controlPlaneDrainCanceled:
 			log.Warnln("[Reload] New generation ready; accelerating old generation retirement")
+			_ = c.AbortConnections()
 		case controlPlaneDrainTimeout:
 			log.WithField("active_sessions", c.ActiveSessionCount()).
 				Warnln("[Reload] Old control plane drain timed out; forcing retirement")
+			_ = c.AbortConnections()
 		}
 	}
 }
@@ -1137,6 +1142,11 @@ func shutdownAfterSignalWithHandoff(
 			}
 		}
 	}
+	// After all control planes are closed, reset global UDP state to stop
+	// background janitors and release pooled sockets. This must only run during
+	// process shutdown; hot reload must never reset shared global pools.
+	control.ResetGlobalUdpState()
+
 	if len(closeErrs) > 0 {
 		return fmt.Errorf("close control plane: %w", errors.Join(closeErrs...))
 	}
@@ -1149,6 +1159,25 @@ func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache 
 
 func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, reuseFakeIPStore *control.FakeIPStore, collector *SummaryCollector) (c *control.ControlPlane, err error) {
 	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, reuseFakeIPStore, collector)
+}
+
+func configureTransparentHugePages(log *logrus.Logger, disable bool) {
+	value := uintptr(0)
+	action := "enable"
+	if disable {
+		value = 1
+		action = "disable"
+	}
+
+	if err := unix.Prctl(unix.PR_SET_THP_DISABLE, value, 0, 0, 0); err != nil {
+		if log != nil {
+			log.WithError(err).Warnf("Failed to %s transparent huge pages for dae process", action)
+		}
+		return
+	}
+	if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+		log.Debugf("Configured transparent huge pages for dae process: disable=%v", disable)
+	}
 }
 
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, reuseFakeIPStore *control.FakeIPStore, collector *SummaryCollector) (c *control.ControlPlane, err error) {
