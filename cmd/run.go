@@ -283,10 +283,14 @@ var (
 			configLoadStart := time.Now()
 			conf, includes, err := readConfig(cfgFile)
 			if err != nil {
+				configLoadMs := time.Since(configLoadStart).Milliseconds()
+				rulesload.EmitStage(logrus.StandardLogger(), rulesload.LifecycleStartup, rulesload.StageReadConfig,
+					configLoadMs, 0, 0, "config_parse_error")
 				logrus.WithFields(logrus.Fields{
 					"err": err,
 				}).Fatalln("Failed to read config")
 			}
+			configLoadMs := time.Since(configLoadStart).Milliseconds()
 			startupCollector.RecordConfigLoad(time.Since(configLoadStart))
 
 			var logOpts *lumberjack.Logger
@@ -303,6 +307,13 @@ var (
 			log := logrus.New()
 			logger.SetLogger(log, conf.Global.LogLevel, disableTimestamp, logOpts)
 			logger.SetLogger(logrus.StandardLogger(), conf.Global.LogLevel, disableTimestamp, logOpts)
+
+			// Emit read_config stage event AFTER logger is configured so the
+			// event lands in the production log file. AC-05 requires this for
+			// startup; the event mirrors the collector's accumulated
+			// config_load_ms.
+			rulesload.EmitStage(log, rulesload.LifecycleStartup, rulesload.StageReadConfig,
+				configLoadMs, 0, 0, "")
 
 			log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			if err := Run(log, conf, []string{filepath.Dir(cfgFile)}, startupCollector); err != nil {
@@ -453,6 +464,8 @@ func (r *Runner) Run() (err error) {
 					continue
 				}
 				reloadCollector.RecordConfigLoad(time.Since(reloadConfigStart))
+				rulesload.EmitStage(log, rulesload.LifecycleReload, rulesload.StageReadConfig,
+					time.Since(reloadConfigStart).Milliseconds(), 0, 0, "")
 				log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			}
 			// New logger.
@@ -541,7 +554,7 @@ func (r *Runner) Run() (err error) {
 				currCancel = cancel
 				conf = newConf
 				listener = stagedListener
-				reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
+				reloadManager.setPendingStagedReload(&stagedReloadHandoff{
 					oldControlPlane:  oldC,
 					oldCancel:        oldCancel,
 					oldConf:          oldConf,
@@ -551,7 +564,7 @@ func (r *Runner) Run() (err error) {
 					newListener:      stagedListener,
 					abortConnections: abortConnections,
 					hasOverlap:       hasOverlap,
-				}, reloadStartedAt, reloadStartedAtMono)
+				}, reloadStartedAt, reloadStartedAtMono, reloadCollector)
 				reloadManager.beginHandoff()
 				notifyRunStateChange(runStateChanges)
 				continue
@@ -1204,7 +1217,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	//
 	// See docs/superpowers/specs/2026-06-18-fakeip-routing-outbound-design.md.
 	fakeIPExpandStart := time.Now()
-	expandedRequestRules, err := control.ExpandFakeIPRoutingOutbound(
+	expandedRequestRules, expansionSummary, err := control.ExpandFakeIPRoutingOutboundWithSummary(
 		log,
 		conf.Dns.Routing.Request.Rules,
 		conf.Routing.Rules,
@@ -1228,7 +1241,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	}
 	if collector != nil {
 		collector.RecordStage(rulesload.StageFakeIPAutoExpand, fakeIPExpandMs, 0, len(expandedRequestRules))
-		collector.SetFakeIPAutoDerived(len(expandedRequestRules))
+		collector.SetFakeIPAutoDerived(expansionSummary.DerivedRules)
 		collector.SetDnsRouting(len(expandedRequestRules), len(conf.Dns.Routing.Response.Rules))
 	}
 	if conf.Global.SoMarkFromDae == 0 {

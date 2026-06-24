@@ -63,6 +63,30 @@ func (c *SummaryCollector) RecordStage(stage string, durationMs int64, rulesIn, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.recordStageLocked(stage, durationMs, rulesOut)
+}
+
+// EmitStage implements rulesload.Observer by accumulating the stage into the
+// summary AND publishing a standalone rules_load_stage event on the collector's
+// logger using the collector's lifecycle. errorClass != "" marks the event
+// result=error.
+//
+// This is the path used by control_plane.go build sites that don't carry a
+// *logrus.Logger or lifecycle through their own arguments; the collector
+// supplies both, keeping the build code observation-agnostic.
+func (c *SummaryCollector) EmitStage(stage string, durationMs int64, rulesIn, rulesOut int, errorClass string) {
+	c.mu.Lock()
+	c.recordStageLocked(stage, durationMs, rulesOut)
+	log := c.log
+	lifecycle := c.lifecycle
+	c.mu.Unlock()
+
+	rulesload.EmitStage(log, lifecycle, stage, durationMs, rulesIn, rulesOut, errorClass)
+}
+
+// recordStageLocked is the bookkeeping half of RecordStage / EmitStage. The
+// caller must hold c.mu.
+func (c *SummaryCollector) recordStageLocked(stage string, durationMs int64, rulesOut int) {
 	d := time.Duration(durationMs) * time.Millisecond
 	switch stage {
 	case rulesload.StageFakeIPAutoExpand:

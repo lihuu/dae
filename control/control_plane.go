@@ -604,7 +604,7 @@ func newControlPlaneWithContextOptions(
 		return nil, err
 	}
 	if obs := buildOpts.rulesLoadObserver; obs != nil {
-		obs.RecordStage(rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0)
+		obs.EmitStage(rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0, "")
 	}
 
 	// Dial mode.
@@ -736,7 +736,7 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
 	}
 	if obs := buildOpts.rulesLoadObserver; obs != nil {
-		obs.RecordStage(rulesload.StageMainRoutingOptimize, time.Since(routingOptimizeStart).Milliseconds(), len(routingA.Rules), len(routingProgram.Rules))
+		obs.EmitStage(rulesload.StageMainRoutingOptimize, time.Since(routingOptimizeStart).Milliseconds(), len(routingA.Rules), len(routingProgram.Rules), "")
 	}
 	routingA.Rules = nil // Release.
 	if log.IsLevelEnabled(logrus.DebugLevel) {
@@ -771,7 +771,7 @@ func newControlPlaneWithContextOptions(
 	}
 
 	if obs := buildOpts.rulesLoadObserver; obs != nil {
-		obs.RecordStage(rulesload.StageMainRoutingMatcher, time.Since(routingMatcherStart).Milliseconds(), 0, 0)
+		obs.EmitStage(rulesload.StageMainRoutingMatcher, time.Since(routingMatcherStart).Milliseconds(), 0, 0, "")
 	}
 	// Get referenced outbounds to limit health checks.
 	referencedOutbounds := builder.GetReferencedOutbounds()
@@ -872,7 +872,7 @@ func newControlPlaneWithContextOptions(
 		return nil, err
 	}
 	if obs := buildOpts.rulesLoadObserver; obs != nil {
-		obs.RecordStage(rulesload.StageDnsControllerBuild, time.Since(dnsControllerStart).Milliseconds(), 0, 0)
+		obs.EmitStage(rulesload.StageDnsControllerBuild, time.Since(dnsControllerStart).Milliseconds(), 0, 0, "")
 	}
 	plane.dnsRouting = dnsUpstream
 	plane.dnsFixedDomainTtl = fixedDomainTtl

@@ -123,7 +123,7 @@ func validateConfigForExpansionWithCollector(conf *config.Config, collector *Sum
 	}
 
 	expandStart := time.Now()
-	expanded, err := control.ExpandFakeIPRoutingOutbound(
+	expanded, expansionSummary, err := control.ExpandFakeIPRoutingOutboundWithSummary(
 		expanderLog,
 		conf.Dns.Routing.Request.Rules,
 		conf.Routing.Rules,
@@ -141,7 +141,7 @@ func validateConfigForExpansionWithCollector(conf *config.Config, collector *Sum
 		rulesload.EmitStage(stageLog, rulesload.LifecycleValidate, rulesload.StageFakeIPAutoExpand,
 			expandMs, 0, len(expanded), "")
 		collector.RecordStage(rulesload.StageFakeIPAutoExpand, expandMs, 0, len(expanded))
-		collector.SetFakeIPAutoDerived(len(expanded))
+		collector.SetFakeIPAutoDerived(expansionSummary.DerivedRules)
 		collector.SetDnsRouting(len(expanded), len(conf.Dns.Routing.Response.Rules))
 	}
 	return nil

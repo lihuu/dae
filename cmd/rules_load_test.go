@@ -181,6 +181,95 @@ func TestRunner_emitStartupSummaryIfCollector_EmitsOnce(t *testing.T) {
 	assert.Equal(t, int64(7), e.Data["config_load_ms"])
 }
 
+func TestReloadManager_SetPendingStagedReload_PreservesCollectorForSingleSummary(t *testing.T) {
+	log, hook := newCapturingLogger()
+	collector := newSummaryCollector(log, rulesload.LifecycleReload)
+	manager := newReloadManager(nil, nil, nil)
+	handoff := &stagedReloadHandoff{}
+	requestedAt := time.Now()
+
+	manager.setPendingStagedReload(handoff, requestedAt, 42, collector)
+
+	assert.Same(t, handoff, manager.currentPendingStagedHandoff())
+	assert.Same(t, collector, manager.peekPendingReloadCollector())
+	assert.Same(t, collector, manager.takePendingReloadCollector())
+	assert.Nil(t, manager.takePendingReloadCollector())
+
+	collector.Emit()
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q event", rulesload.EventSummary)
+	}
+	assert.Equal(t, rulesload.LifecycleReload, summary.Data["lifecycle"])
+}
+
+// TestSummaryCollector_EmitStage_RecordsAndEmits verifies that EmitStage
+// both accumulates the duration into the summary AND publishes a structured
+// rules_load_stage event on the collector's logger.
+//
+// This is the Observer-side contract that lets control_plane.go emit stage
+// events (read_config / dns_controller_build / main_routing_optimize /
+// main_routing_matcher_build) without having to thread a *logrus.Logger and
+// the current lifecycle through every call site.
+//
+// Acceptance criterion AC-05 requires those stages to appear as
+// rules_load_stage events on successful startup and reload; before this
+// change, control_plane.go only called RecordStage and the events were
+// silently lost.
+func TestSummaryCollector_EmitStage_RecordsAndEmits(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	c.EmitStage(rulesload.StageDnsControllerBuild, 30, 0, 0, "")
+	c.EmitStage(rulesload.StageMainRoutingOptimize, 100, 200, 220, "")
+	c.EmitStage(rulesload.StageMainRoutingMatcher, 75, 0, 0, "")
+	c.Emit()
+
+	// Side A: stage events were emitted to the logger.
+	stages := map[string]*logrus.Entry{}
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; ok && v == rulesload.EventStage {
+			if s, ok := e.Data["stage"].(string); ok {
+				stages[s] = e
+			}
+		}
+	}
+	assert.Contains(t, stages, rulesload.StageDnsControllerBuild)
+	assert.Contains(t, stages, rulesload.StageMainRoutingOptimize)
+	assert.Contains(t, stages, rulesload.StageMainRoutingMatcher)
+	assert.Equal(t, rulesload.LifecycleStartup, stages[rulesload.StageDnsControllerBuild].Data["lifecycle"])
+	assert.Equal(t, "ok", stages[rulesload.StageMainRoutingOptimize].Data["result"])
+	assert.Equal(t, int64(100), stages[rulesload.StageMainRoutingOptimize].Data["duration_ms"])
+	assert.Equal(t, 220, stages[rulesload.StageMainRoutingOptimize].Data["rules_out"])
+
+	// Side B: durations also flowed into the summary (RecordStage equivalent).
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q event", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(30), summary.Data["dns_controller_build_ms"])
+	assert.Equal(t, int64(100), summary.Data["main_routing_optimize_ms"])
+	assert.Equal(t, int64(75), summary.Data["main_routing_matcher_build_ms"])
+	assert.Equal(t, 220, summary.Data["main_routing_rules"])
+}
+
+// TestSummaryCollector_EmitStage_ErrorClass verifies that a non-empty
+// errorClass causes the emitted stage event to carry result=error and the
+// error_class field, matching the spec contract for failed stages.
+func TestSummaryCollector_EmitStage_ErrorClass(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleReload)
+
+	c.EmitStage(rulesload.StageDnsControllerBuild, 5, 0, 0, "dns_controller_build_error")
+
+	stage := findEvent(hook.entries, rulesload.EventStage)
+	if stage == nil {
+		t.Fatalf("expected a %q event", rulesload.EventStage)
+	}
+	assert.Equal(t, "error", stage.Data["result"])
+	assert.Equal(t, "dns_controller_build_error", stage.Data["error_class"])
+}
+
 // TestSummaryCollector_RecordFakeIPAutoExpand verifies that
 // StageFakeIPAutoExpand observations propagate into the rules_load_summary
 // event as fakeip_auto_expand_ms. Without this, the spec field is always 0
@@ -275,6 +364,13 @@ func TestValidateConfigForExpansion_WithCollector(t *testing.T) {
 		mainDomainSuffixRule("proxy_canary", "example.com"),
 	}
 	cfg.Dns.Routing.Request.Rules = []*config_parser.RoutingRule{
+		{
+			AndFunctions: []*config_parser.Function{{
+				Name:   "qname",
+				Params: []*config_parser.Param{{Key: "suffix", Val: "local"}},
+			}},
+			Outbound: config_parser.Function{Name: "direct"},
+		},
 		dnsRoutingOutboundRequestRule("fakeip", "proxy_canary"),
 	}
 
@@ -298,9 +394,11 @@ func TestValidateConfigForExpansion_WithCollector(t *testing.T) {
 	assert.Equal(t, "ok", summary.Data["result"])
 	// Derived rule count: domain-suffix(example.com) expands to one qname.
 	assert.Equal(t, 1, summary.Data["fakeip_auto_derived_rules"])
-	// DNS request/response counts must flow through.
-	assert.Equal(t, 1, summary.Data["dns_request_rules"])
+	// The final DNS request program contains the original direct rule plus the
+	// one derived FakeIP rule.
+	assert.Equal(t, 2, summary.Data["dns_request_rules"])
 }
+
 // dns_response_rules counts flow into rules_load_summary and contribute to
 // rules_total. Without this, both fields are always 0.
 func TestSummaryCollector_SetDnsRouting(t *testing.T) {

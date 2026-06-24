@@ -53,7 +53,20 @@ func ExpandFakeIPRoutingOutbound(
 	mainRoutingRules []*config_parser.RoutingRule,
 	outboundExists func(name string) bool,
 ) ([]*config_parser.RoutingRule, error) {
-	return expandFakeIPRoutingOutbound(log, dnsRequestRules, mainRoutingRules, outboundExists)
+	out, _, err := expandFakeIPRoutingOutboundWithSummary(log, dnsRequestRules, mainRoutingRules, outboundExists)
+	return out, err
+}
+
+// ExpandFakeIPRoutingOutboundWithSummary performs the same rewrite as
+// ExpandFakeIPRoutingOutbound and also returns the expansion counters used by
+// load-time observability.
+func ExpandFakeIPRoutingOutboundWithSummary(
+	log *logrus.Logger,
+	dnsRequestRules []*config_parser.RoutingRule,
+	mainRoutingRules []*config_parser.RoutingRule,
+	outboundExists func(name string) bool,
+) ([]*config_parser.RoutingRule, dns.ExpansionSummary, error) {
+	return expandFakeIPRoutingOutboundWithSummary(log, dnsRequestRules, mainRoutingRules, outboundExists)
 }
 
 func expandFakeIPRoutingOutbound(
@@ -62,6 +75,16 @@ func expandFakeIPRoutingOutbound(
 	mainRoutingRules []*config_parser.RoutingRule,
 	outboundExists func(name string) bool,
 ) ([]*config_parser.RoutingRule, error) {
+	out, _, err := expandFakeIPRoutingOutboundWithSummary(log, dnsRequestRules, mainRoutingRules, outboundExists)
+	return out, err
+}
+
+func expandFakeIPRoutingOutboundWithSummary(
+	log *logrus.Logger,
+	dnsRequestRules []*config_parser.RoutingRule,
+	mainRoutingRules []*config_parser.RoutingRule,
+	outboundExists func(name string) bool,
+) ([]*config_parser.RoutingRule, dns.ExpansionSummary, error) {
 	hasSelector := false
 	for _, r := range dnsRequestRules {
 		if r == nil {
@@ -78,7 +101,7 @@ func expandFakeIPRoutingOutbound(
 		}
 	}
 	if !hasSelector {
-		return dnsRequestRules, nil
+		return dnsRequestRules, dns.ExpansionSummary{Result: "ok"}, nil
 	}
 
 	// Validate the selector(s) first — this catches non-fakeip targets,
@@ -89,7 +112,7 @@ func expandFakeIPRoutingOutbound(
 	out, summary, err := dns.ExpandRoutingOutboundSelectors(log, dnsRequestRules, mainRoutingRules, outboundExists)
 	if err != nil {
 		logFakeIPAutoExpand(log, summary, err)
-		return nil, err
+		return nil, summary, err
 	}
 
 	// After validation passes, guard against the failure mode in which the
@@ -104,12 +127,12 @@ func expandFakeIPRoutingOutbound(
 		// operators can see WHICH selectors hit the empty-input path.
 		summary.Result = "error"
 		logFakeIPAutoExpand(log, summary, err)
-		return nil, err
+		return nil, summary, err
 	}
 
 	logFakeIPAutoExpand(log, summary, nil)
 	logFakeIPAutoDerived(log, summary)
-	return out, nil
+	return out, summary, nil
 }
 
 // logFakeIPAutoExpand emits the structured summary event for one expansion

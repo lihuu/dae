@@ -154,6 +154,19 @@ func (m *reloadManager) setPendingStagedHandoff(handoff *stagedReloadHandoff, re
 	m.pendingReloadRequestedAtMono = requestedAtMono
 }
 
+func (m *reloadManager) setPendingStagedReload(
+	handoff *stagedReloadHandoff,
+	requestedAt time.Time,
+	requestedAtMono uint64,
+	collector *SummaryCollector,
+) {
+	if m == nil {
+		return
+	}
+	m.setPendingStagedHandoff(handoff, requestedAt, requestedAtMono)
+	m.setPendingReloadCollector(collector)
+}
+
 func (m *reloadManager) clearPendingStagedHandoff() {
 	if m == nil {
 		return
