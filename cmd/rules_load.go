@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/sirupsen/logrus"
 )
@@ -33,6 +34,20 @@ type SummaryCollector struct {
 	reloadHandoff       time.Duration
 	reloadRetire        time.Duration
 
+	// Config-load child stages (spec 2026-06-25).
+	configReadFiles     time.Duration
+	configParse         time.Duration
+	configIncludeExpand time.Duration
+	configMerge         time.Duration
+	configDecode        time.Duration
+	configPatch         time.Duration
+
+	// Config-load counters.
+	includedFiles   int
+	configBytes     int64
+	parsedSections  int
+	rawRoutingRules int
+
 	// Counts (set explicitly where known).
 	mainRoutingRules  int
 	dnsRequestRules   int
@@ -55,6 +70,88 @@ func (c *SummaryCollector) RecordConfigLoad(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.configLoadDur = d
+}
+
+// RecordConfigStats records the per-stage durations and counters produced by
+// the stats-aware config loader. It is additive: callers can invoke it twice
+// (e.g. once for MergeWithStats result and once for NewWithStats result) and
+// the collector aggregates everything into the final summary.
+//
+// The function does NOT emit any structured event by itself; the caller is
+// responsible for emitting per-stage rules_load_stage events via
+// EmitConfigStageOK / EmitConfigStageError. Splitting record vs emit keeps the
+// emit path explicit for AC-05 / AC-07 and lets the validate path suppress
+// stage events when --timings is off.
+func (c *SummaryCollector) RecordConfigStats(stats config.LoadStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.configReadFiles += stats.ReadFilesDuration
+	c.configParse += stats.ParseDuration
+	c.configIncludeExpand += stats.IncludeExpandDuration
+	c.configMerge += stats.MergeDuration
+	c.configDecode += stats.DecodeDuration
+	c.configPatch += stats.PatchDuration
+	if stats.IncludedFiles != 0 {
+		c.includedFiles = stats.IncludedFiles
+	}
+	if stats.ConfigBytes != 0 {
+		c.configBytes = stats.ConfigBytes
+	}
+	if stats.ParsedSections != 0 {
+		c.parsedSections = stats.ParsedSections
+	}
+	if stats.RawRoutingRules != 0 {
+		c.rawRoutingRules = stats.RawRoutingRules
+	}
+}
+
+// configCountFieldsLocked snapshots the current config-load counters as a
+// rulesload.ConfigLoadFields. Caller must hold c.mu.
+func (c *SummaryCollector) configCountFieldsLocked() rulesload.ConfigLoadFields {
+	return rulesload.ConfigLoadFields{
+		IncludedFiles:   c.includedFiles,
+		ConfigBytes:     c.configBytes,
+		ParsedSections:  c.parsedSections,
+		RawRoutingRules: c.rawRoutingRules,
+	}
+}
+
+// EmitConfigStages emits one successful rules_load_stage event per completed
+// config child stage in stats. The event carries the current accumulated
+// config-load counts (the spec guarantees they are present on every event).
+//
+// Skipped stages (zero duration AND no failure) emit nothing, so an opt-in
+// validate path that didn't actually run patches won't fabricate an event.
+//
+// This MUST be called AFTER RecordConfigStats so the count fields reflect the
+// latest stats values.
+func (c *SummaryCollector) EmitConfigStages(stats config.LoadStats) {
+	c.mu.Lock()
+	log := c.log
+	lifecycle := c.lifecycle
+	counts := c.configCountFieldsLocked()
+	c.mu.Unlock()
+
+	failed := stats.FailedStage
+	emit := func(stage string, dur time.Duration) {
+		// Skip stages we never reached: zero duration AND not the failing
+		// stage. The failing stage emits even at duration 0 so operators see
+		// the failure.
+		if dur == 0 && stage != failed {
+			return
+		}
+		errorClass := ""
+		if stage == failed {
+			errorClass = stage + "_error"
+		}
+		rulesload.EmitConfigStage(log, lifecycle, stage, dur.Milliseconds(), counts, errorClass)
+	}
+	emit(rulesload.StageConfigReadFiles, stats.ReadFilesDuration)
+	emit(rulesload.StageConfigParse, stats.ParseDuration)
+	emit(rulesload.StageConfigIncludeExpand, stats.IncludeExpandDuration)
+	emit(rulesload.StageConfigMerge, stats.MergeDuration)
+	emit(rulesload.StageConfigDecode, stats.DecodeDuration)
+	emit(rulesload.StageConfigPatch, stats.PatchDuration)
 }
 
 // RecordStage implements rulesload.Observer by accumulating per-stage durations.
@@ -144,10 +241,25 @@ func (c *SummaryCollector) Emit() {
 
 func (c *SummaryCollector) buildSnapshot() rulesload.Summary {
 	total := time.Since(c.totalStart)
+	configLoadMs := c.configLoadDur.Milliseconds()
+	configReadFilesMs := c.configReadFiles.Milliseconds()
+	configParseMs := c.configParse.Milliseconds()
+	configIncludeExpandMs := c.configIncludeExpand.Milliseconds()
+	configMergeMs := c.configMerge.Milliseconds()
+	configDecodeMs := c.configDecode.Milliseconds()
+	configPatchMs := c.configPatch.Milliseconds()
+	// Spec: config_unattributed_ms = max(0, config_load_ms - sum(child stages)).
+	childSum := configReadFilesMs + configParseMs + configIncludeExpandMs +
+		configMergeMs + configDecodeMs + configPatchMs
+	configUnattributedMs := configLoadMs - childSum
+	if configUnattributedMs < 0 {
+		configUnattributedMs = 0
+	}
+
 	return rulesload.Summary{
 		Lifecycle:             c.lifecycle,
 		TotalMs:               total.Milliseconds(),
-		ConfigLoadMs:          c.configLoadDur.Milliseconds(),
+		ConfigLoadMs:          configLoadMs,
 		FakeIPAutoExpandMs:    c.fakeipAutoExpand.Milliseconds(),
 		DaednsRouterBuildMs:   c.daednsRouterBuild.Milliseconds(),
 		DnsControllerBuildMs:  c.dnsControllerBuild.Milliseconds(),
@@ -156,6 +268,17 @@ func (c *SummaryCollector) buildSnapshot() rulesload.Summary {
 		ControlPlaneBuildMs:   c.controlPlaneBuild.Milliseconds(),
 		ReloadHandoffMs:       c.reloadHandoff.Milliseconds(),
 		ReloadRetireMs:        c.reloadRetire.Milliseconds(),
+		ConfigReadFilesMs:     configReadFilesMs,
+		ConfigParseMs:         configParseMs,
+		ConfigIncludeExpandMs: configIncludeExpandMs,
+		ConfigMergeMs:         configMergeMs,
+		ConfigDecodeMs:        configDecodeMs,
+		ConfigPatchMs:         configPatchMs,
+		ConfigUnattributedMs:  configUnattributedMs,
+		IncludedFiles:         c.includedFiles,
+		ConfigBytes:           c.configBytes,
+		ParsedSections:        c.parsedSections,
+		RawRoutingRules:       c.rawRoutingRules,
 		MainRoutingRules:      c.mainRoutingRules,
 		DnsRequestRules:       c.dnsRequestRules,
 		DnsResponseRules:      c.dnsResponseRules,

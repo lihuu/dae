@@ -281,9 +281,14 @@ var (
 
 			// Read config from --config cfgFile.
 			configLoadStart := time.Now()
-			conf, includes, err := readConfig(cfgFile)
+			conf, includes, loadStats, err := readConfigWithStats(cfgFile)
 			if err != nil {
 				configLoadMs := time.Since(configLoadStart).Milliseconds()
+				// Spec AC-04 / AC-07: attribute the failing config child
+				// stage AND keep the legacy read_config error event for
+				// backward compatibility.
+				startupCollector.RecordConfigStats(loadStats)
+				startupCollector.EmitConfigStages(loadStats)
 				rulesload.EmitStage(logrus.StandardLogger(), rulesload.LifecycleStartup, rulesload.StageReadConfig,
 					configLoadMs, 0, 0, "config_parse_error")
 				logrus.WithFields(logrus.Fields{
@@ -292,6 +297,7 @@ var (
 			}
 			configLoadMs := time.Since(configLoadStart).Milliseconds()
 			startupCollector.RecordConfigLoad(time.Since(configLoadStart))
+			startupCollector.RecordConfigStats(loadStats)
 
 			var logOpts *lumberjack.Logger
 			if logFile != "" {
@@ -314,6 +320,13 @@ var (
 			// config_load_ms.
 			rulesload.EmitStage(log, rulesload.LifecycleStartup, rulesload.StageReadConfig,
 				configLoadMs, 0, 0, "")
+
+			// Emit one rules_load_stage event per completed config child
+			// stage (AC-05). The collector's logger is the standard logrus
+			// logger which logger.SetLogger() reconfigured in place above, so
+			// these events land in the production log file alongside
+			// read_config.
+			startupCollector.EmitConfigStages(loadStats)
 
 			log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			if err := Run(log, conf, []string{filepath.Dir(cfgFile)}, startupCollector); err != nil {
@@ -446,11 +459,14 @@ func (r *Runner) Run() (err error) {
 				var includes []string
 				reloadCollector = newSummaryCollector(log, rulesload.LifecycleReload)
 				reloadConfigStart = time.Now()
-				newConf, includes, err = readConfig(cfgFile)
+				var loadStats config.LoadStats
+				newConf, includes, loadStats, err = readConfigWithStats(cfgFile)
 				if err != nil {
 					configLoadMs := time.Since(reloadConfigStart).Milliseconds()
 					reloadCollector.RecordConfigLoad(time.Since(reloadConfigStart))
+					reloadCollector.RecordConfigStats(loadStats)
 					reloadCollector.SetError("config_parse_error")
+					reloadCollector.EmitConfigStages(loadStats)
 					rulesload.EmitStage(log, rulesload.LifecycleReload, rulesload.StageReadConfig,
 						configLoadMs, 0, 0, "config_parse_error")
 					reloadCollector.Emit()
@@ -464,8 +480,10 @@ func (r *Runner) Run() (err error) {
 					continue
 				}
 				reloadCollector.RecordConfigLoad(time.Since(reloadConfigStart))
+				reloadCollector.RecordConfigStats(loadStats)
 				rulesload.EmitStage(log, rulesload.LifecycleReload, rulesload.StageReadConfig,
 					time.Since(reloadConfigStart).Milliseconds(), 0, 0, "")
+				reloadCollector.EmitConfigStages(loadStats)
 				log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			}
 			// New logger.
@@ -1525,15 +1543,29 @@ func preprocessWanInterfaceAuto(params *config.Config) error {
 }
 
 func readConfig(cfgFile string) (conf *config.Config, includes []string, err error) {
+	conf, includes, _, err = readConfigWithStats(cfgFile)
+	return conf, includes, err
+}
+
+// readConfigWithStats is the stats-aware variant of readConfig. It calls
+// MergeWithStats followed by NewWithStats, returning the combined LoadStats.
+// On failure, the returned stats still carries whatever durations and
+// counters were accumulated before the error AND the FailedStage that
+// produced it, so the caller can attribute the failing child stage in a
+// rules_load_stage event without re-running instrumentation.
+func readConfigWithStats(cfgFile string) (conf *config.Config, includes []string, stats config.LoadStats, err error) {
 	merger := config.NewMerger(cfgFile)
-	sections, includes, err := merger.Merge()
+	sections, includes, mergeStats, err := merger.MergeWithStats()
+	stats = mergeStats
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, stats, err
 	}
-	if conf, err = config.New(sections); err != nil {
-		return nil, nil, err
+	conf, newStats, err := config.NewWithStats(sections)
+	stats.Add(newStats)
+	if err != nil {
+		return nil, nil, stats, err
 	}
-	return conf, includes, nil
+	return conf, includes, stats, nil
 }
 
 func emptyConfig() (conf *config.Config, err error) {

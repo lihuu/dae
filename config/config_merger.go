@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -25,6 +26,11 @@ type Merger struct {
 	entry             string
 	entryDir          string
 	entryToSectionMap map[string]map[string][]*config_parser.Item
+
+	// stats is the in-progress accumulator written by readEntry,
+	// unsqueezeEntries, and dfsMerge. Merge() and MergeWithStats() share the
+	// same path: Merge() simply discards the resulting LoadStats.
+	stats LoadStats
 }
 
 func NewMerger(entry string) *Merger {
@@ -35,16 +41,50 @@ func NewMerger(entry string) *Merger {
 	}
 }
 
+// Merge returns the merged sections and the list of included files. It
+// preserves the historical signature so non-instrumentation callers do not
+// have to change.
 func (m *Merger) Merge() (sections []*config_parser.Section, entries []string, err error) {
+	sections, entries, _, err = m.MergeWithStats()
+	return sections, entries, err
+}
+
+// MergeWithStats is the stats-aware variant of Merge. The returned LoadStats
+// covers config_read_files, config_parse, config_include_expand, and
+// config_merge; the decode/patch stages live in NewWithStats.
+//
+// The same call always populates LoadStats even on failure: callers can
+// attribute the failing stage via stats.FailedStage and emit
+// `result=error` stage events for the completed stages without re-running
+// instrumentation.
+func (m *Merger) MergeWithStats() (sections []*config_parser.Section, entries []string, stats LoadStats, err error) {
+	mergeStart := time.Now()
 	err = m.dfsMerge(m.entry, "")
-	if err != nil {
-		return nil, nil, err
+	// MergeDuration is the wall-clock spent inside dfsMerge MINUS the time
+	// already attributed to the per-file read/parse and include-expand
+	// stages. This avoids intentional double-counting while keeping the
+	// child-stage sum diagnostic for `config_unattributed_ms`.
+	mergeTotal := time.Since(mergeStart)
+	mergeNet := mergeTotal - m.stats.ReadFilesDuration - m.stats.ParseDuration - m.stats.IncludeExpandDuration
+	if mergeNet < 0 {
+		mergeNet = 0
 	}
+	m.stats.MergeDuration = mergeNet
+
+	if err != nil {
+		if m.stats.FailedStage == "" {
+			m.stats.FailedStage = StageConfigMerge
+		}
+		return nil, nil, m.stats, err
+	}
+
 	entries, err = common.MapKeys(m.entryToSectionMap)
 	if err != nil {
-		return nil, nil, err
+		m.stats.FailedStage = StageConfigMerge
+		return nil, nil, m.stats, err
 	}
-	return m.convertMapToSections(m.entryToSectionMap[m.entry]), entries, nil
+	m.stats.IncludedFiles = len(entries)
+	return m.convertMapToSections(m.entryToSectionMap[m.entry]), entries, m.stats, nil
 }
 
 func (m *Merger) readEntry(entry string) (err error) {
@@ -62,31 +102,48 @@ func (m *Merger) readEntry(entry string) (err error) {
 	if err = common.EnsureFileInSubDir(entry, m.entryDir); err != nil {
 		return fmt.Errorf("failed in checking path of config file %v: %w", entry, err)
 	}
+	readStart := time.Now()
 	f, err := os.Open(entry)
 	if err != nil {
+		m.stats.ReadFilesDuration += time.Since(readStart)
+		m.stats.FailedStage = StageConfigReadFiles
 		return fmt.Errorf("failed to read config file %v: %w", entry, err)
 	}
 	defer func() { _ = f.Close() }()
 	// Check file access.
 	fi, err := f.Stat()
 	if err != nil {
+		m.stats.ReadFilesDuration += time.Since(readStart)
+		m.stats.FailedStage = StageConfigReadFiles
 		return err
 	}
 	if fi.IsDir() {
+		m.stats.ReadFilesDuration += time.Since(readStart)
+		m.stats.FailedStage = StageConfigReadFiles
 		return fmt.Errorf("cannot include a directory: %v", entry)
 	}
 	if fi.Mode()&0037 > 0 {
+		m.stats.ReadFilesDuration += time.Since(readStart)
+		m.stats.FailedStage = StageConfigReadFiles
 		return fmt.Errorf("permissions %04o for '%v' are too open; requires the file is NOT writable by the same group and NOT accessible by others; suggest 0640 or 0600", fi.Mode()&0777, entry)
 	}
 	// Read and parse.
 	b, err := io.ReadAll(f)
+	m.stats.ReadFilesDuration += time.Since(readStart)
 	if err != nil {
+		m.stats.FailedStage = StageConfigReadFiles
 		return err
 	}
+	m.stats.ConfigBytes += int64(len(b))
+
+	parseStart := time.Now()
 	entrySections, err := config_parser.Parse(string(b))
+	m.stats.ParseDuration += time.Since(parseStart)
 	if err != nil {
+		m.stats.FailedStage = StageConfigParse
 		return fmt.Errorf("failed to parse config file %v:\n%w", entry, err)
 	}
+	m.stats.ParsedSections += len(entrySections)
 	m.entryToSectionMap[entry] = m.convertSectionsToMap(entrySections)
 	return nil
 }
@@ -123,8 +180,12 @@ func (m *Merger) dfsMerge(entry string, fatherEntry string) (err error) {
 	// Read entry and check circular include.
 	if err = m.readEntry(entry); err != nil {
 		if errors.Is(err, ErrCircularInclude) {
+			// Circular include attribution belongs to the merge stage, not
+			// to read/parse: readEntry exits before opening the file.
+			m.stats.FailedStage = StageConfigMerge
 			return fmt.Errorf("%w: %v -> %v -> ... -> %v", err, fatherEntry, entry, fatherEntry)
 		}
+		// readEntry already set FailedStage for read/parse failures.
 		return err
 	}
 	sectionMap := m.entryToSectionMap[entry]
@@ -141,12 +202,16 @@ func (m *Merger) dfsMerge(entry string, fatherEntry string) (err error) {
 				patterEntries = append(patterEntries, filepath.Join(m.entryDir, nextEntry))
 			}
 		default:
+			m.stats.FailedStage = StageConfigMerge
 			return fmt.Errorf("unsupported include grammar in %v: %v", entry, include.String(false, false))
 		}
 	}
 	// DFS and merge children recursively.
+	expandStart := time.Now()
 	childEntries, err := unsqueezeEntries(patterEntries)
+	m.stats.IncludeExpandDuration += time.Since(expandStart)
 	if err != nil {
+		m.stats.FailedStage = StageConfigIncludeExpand
 		return err
 	}
 	for _, nextEntry := range childEntries {
