@@ -26,6 +26,15 @@ type ResponseMatcherBuilder struct {
 	simulatedDomainSet []routing.DomainSet
 	ipSet              []*trie.Trie
 	rules              []responseMatchSet
+	matcherStats       *domain_matcher.BuildStats
+}
+
+// WithStats attaches a domain_matcher.BuildStats sink. When set, the
+// internal AhocorasickSlimtrie populates the struct with per-slot counts and
+// durations during Build.
+func (b *ResponseMatcherBuilder) WithStats(stats *domain_matcher.BuildStats) *ResponseMatcherBuilder {
+	b.matcherStats = stats
+	return b
 }
 
 func NewResponseMatcherBuilder(log *logrus.Logger, rules []*config_parser.RoutingRule, upstreamName2Id map[string]uint8, fallback config.FunctionOrString) (b *ResponseMatcherBuilder, err error) {
@@ -193,7 +202,7 @@ func (b *ResponseMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrS
 func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 	var m ResponseMatcher
 	// Build domainMatcher.
-	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen).WithStats(b.matcherStats)
 	for _, domains := range b.simulatedDomainSet {
 		m.domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}

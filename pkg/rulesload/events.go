@@ -62,6 +62,14 @@ const (
 	StageDnsResponseProgramNormalize = "dns_response_program_normalize"
 	StageDnsResponseMatcherLower     = "dns_response_matcher_lower"
 	StageDnsResponseMatcherCompile   = "dns_response_matcher_compile"
+
+	// Matcher compile distribution events — break down the heavy
+	// AhocorasickSlimtrie.Build inside daedns_request_matcher_compile and
+	// main_routing_matcher_build into per-slot counts and durations. Operators
+	// read these to decide whether the parent stage's wall-clock went to AC
+	// automata, suffix tries, regex, or one giant slot.
+	StageDaednsRequestMatcherCompileDistribution  = "daedns_request_matcher_compile_distribution"
+	StageMainRoutingMatcherCompileDistribution    = "main_routing_matcher_compile_distribution"
 )
 
 const (
@@ -106,6 +114,63 @@ func EmitConfigStage(
 	errorClass string,
 ) {
 	emitStageInternal(log, lifecycle, stage, durationMs, 0, 0, errorClass, &counts)
+}
+
+// MatcherDistributionFields carries the per-slot breakdown of an
+// AhocorasickSlimtrie.Build run. All fields appear on every distribution event
+// so operators can compare distributions across stages without joining against
+// multiple log lines. Zero values are emitted verbatim: the spec mandates that
+// unknown counts are 0 rather than omitted.
+type MatcherDistributionFields struct {
+	AcSlots             int
+	AcPatterns          int
+	AcMaxSlotPatterns   int
+	AcCpuMs             int64
+	AcMaxSlotMs         int64
+	TrieSlots           int
+	TriePatterns        int
+	TrieMaxSlotPatterns int
+	TrieCpuMs           int64
+	TrieMaxSlotMs       int64
+	RegexpSlots         int
+	WallMs              int64
+}
+
+// EmitMatcherDistribution logs a rules_load_stage event for a matcher compile
+// distribution. The twelve detail fields land in the event alongside
+// `duration_ms` so the distribution line is independently useful. This is the
+// observability counterpart to the existing EmitConfigStage pattern: same
+// event type, different field set.
+func EmitMatcherDistribution(
+	log *logrus.Logger,
+	lifecycle Lifecycle,
+	stage string,
+	fields MatcherDistributionFields,
+) {
+	logFields := logrus.Fields{
+		"component":              "rules_load",
+		"event":                  EventStage,
+		"event_version":          1,
+		"lifecycle":              lifecycle,
+		"stage":                  stage,
+		"duration_ms":            fields.WallMs,
+		"rules_in":               0,
+		"rules_out":              0,
+		"result":                 "ok",
+		"ac_slots":               fields.AcSlots,
+		"ac_patterns":            fields.AcPatterns,
+		"ac_max_slot_patterns":   fields.AcMaxSlotPatterns,
+		"ac_cpu_ms":              fields.AcCpuMs,
+		"ac_max_slot_ms":         fields.AcMaxSlotMs,
+		"trie_slots":             fields.TrieSlots,
+		"trie_patterns":          fields.TriePatterns,
+		"trie_max_slot_patterns": fields.TrieMaxSlotPatterns,
+		"trie_cpu_ms":            fields.TrieCpuMs,
+		"trie_max_slot_ms":       fields.TrieMaxSlotMs,
+		"regexp_slots":           fields.RegexpSlots,
+		"wall_ms":                fields.WallMs,
+	}
+	log.WithFields(logFields).Infoln("Rules load stage: " + stage)
 }
 
 func emitStageInternal(
@@ -188,6 +253,36 @@ type Summary struct {
 	DnsResponseMatcherCompileMs   int64
 	DnsControllerUnattributedMs   int64
 
+	// daedns_request_matcher_compile_distribution fields — per-slot breakdown
+	// of the heavy AhocorasickSlimtrie.Build inside the daedns router.
+	DaednsRequestMatcherAcSlots             int
+	DaednsRequestMatcherAcPatterns          int
+	DaednsRequestMatcherAcMaxSlotPatterns   int
+	DaednsRequestMatcherAcCpuMs             int64
+	DaednsRequestMatcherAcMaxSlotMs         int64
+	DaednsRequestMatcherTrieSlots           int
+	DaednsRequestMatcherTriePatterns        int
+	DaednsRequestMatcherTrieMaxSlotPatterns int
+	DaednsRequestMatcherTrieCpuMs           int64
+	DaednsRequestMatcherTrieMaxSlotMs       int64
+	DaednsRequestMatcherRegexpSlots         int
+	DaednsRequestMatcherWallMs              int64
+
+	// main_routing_matcher_compile_distribution fields — per-slot breakdown
+	// of the heavy AhocorasickSlimtrie.Build inside the main routing matcher.
+	MainRoutingMatcherAcSlots             int
+	MainRoutingMatcherAcPatterns          int
+	MainRoutingMatcherAcMaxSlotPatterns   int
+	MainRoutingMatcherAcCpuMs             int64
+	MainRoutingMatcherAcMaxSlotMs         int64
+	MainRoutingMatcherTrieSlots           int
+	MainRoutingMatcherTriePatterns        int
+	MainRoutingMatcherTrieMaxSlotPatterns int
+	MainRoutingMatcherTrieCpuMs           int64
+	MainRoutingMatcherTrieMaxSlotMs       int64
+	MainRoutingMatcherRegexpSlots         int
+	MainRoutingMatcherWallMs              int64
+
 	// Config-load counters.
 	IncludedFiles   int
 	ConfigBytes     int64
@@ -241,6 +336,30 @@ func EmitSummary(log *logrus.Logger, s Summary) {
 		"dns_response_matcher_lower_ms":       s.DnsResponseMatcherLowerMs,
 		"dns_response_matcher_compile_ms":     s.DnsResponseMatcherCompileMs,
 		"dns_controller_unattributed_ms":      s.DnsControllerUnattributedMs,
+		"daedns_request_matcher_ac_slots":             s.DaednsRequestMatcherAcSlots,
+		"daedns_request_matcher_ac_patterns":          s.DaednsRequestMatcherAcPatterns,
+		"daedns_request_matcher_ac_max_slot_patterns": s.DaednsRequestMatcherAcMaxSlotPatterns,
+		"daedns_request_matcher_ac_cpu_ms":            s.DaednsRequestMatcherAcCpuMs,
+		"daedns_request_matcher_ac_max_slot_ms":       s.DaednsRequestMatcherAcMaxSlotMs,
+		"daedns_request_matcher_trie_slots":           s.DaednsRequestMatcherTrieSlots,
+		"daedns_request_matcher_trie_patterns":        s.DaednsRequestMatcherTriePatterns,
+		"daedns_request_matcher_trie_max_slot_patterns": s.DaednsRequestMatcherTrieMaxSlotPatterns,
+		"daedns_request_matcher_trie_cpu_ms":            s.DaednsRequestMatcherTrieCpuMs,
+		"daedns_request_matcher_trie_max_slot_ms":       s.DaednsRequestMatcherTrieMaxSlotMs,
+		"daedns_request_matcher_regexp_slots":           s.DaednsRequestMatcherRegexpSlots,
+		"daedns_request_matcher_wall_ms":                s.DaednsRequestMatcherWallMs,
+		"main_routing_matcher_ac_slots":                 s.MainRoutingMatcherAcSlots,
+		"main_routing_matcher_ac_patterns":              s.MainRoutingMatcherAcPatterns,
+		"main_routing_matcher_ac_max_slot_patterns":     s.MainRoutingMatcherAcMaxSlotPatterns,
+		"main_routing_matcher_ac_cpu_ms":                s.MainRoutingMatcherAcCpuMs,
+		"main_routing_matcher_ac_max_slot_ms":           s.MainRoutingMatcherAcMaxSlotMs,
+		"main_routing_matcher_trie_slots":               s.MainRoutingMatcherTrieSlots,
+		"main_routing_matcher_trie_patterns":            s.MainRoutingMatcherTriePatterns,
+		"main_routing_matcher_trie_max_slot_patterns":   s.MainRoutingMatcherTrieMaxSlotPatterns,
+		"main_routing_matcher_trie_cpu_ms":              s.MainRoutingMatcherTrieCpuMs,
+		"main_routing_matcher_trie_max_slot_ms":         s.MainRoutingMatcherTrieMaxSlotMs,
+		"main_routing_matcher_regexp_slots":             s.MainRoutingMatcherRegexpSlots,
+		"main_routing_matcher_wall_ms":                  s.MainRoutingMatcherWallMs,
 		"included_files":                s.IncludedFiles,
 		"config_bytes":                  s.ConfigBytes,
 		"parsed_sections":               s.ParsedSections,

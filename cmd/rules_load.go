@@ -6,6 +6,7 @@ import (
 
 	"github.com/daeuniverse/dae/component/daedns"
 	componentdns "github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/sirupsen/logrus"
@@ -68,6 +69,36 @@ type SummaryCollector struct {
 	dnsResponseProgramNormalize time.Duration
 	dnsResponseMatcherLower     time.Duration
 	dnsResponseMatcherCompile   time.Duration
+
+	// daedns_request_matcher_compile_distribution fields — per-slot breakdown
+	// of the heavy AhocorasickSlimtrie.Build inside the daedns router.
+	daednsRequestMatcherAcSlots             int
+	daednsRequestMatcherAcPatterns          int
+	daednsRequestMatcherAcMaxSlotPatterns   int
+	daednsRequestMatcherAcCpuMs             int64
+	daednsRequestMatcherAcMaxSlotMs         int64
+	daednsRequestMatcherTrieSlots           int
+	daednsRequestMatcherTriePatterns        int
+	daednsRequestMatcherTrieMaxSlotPatterns int
+	daednsRequestMatcherTrieCpuMs           int64
+	daednsRequestMatcherTrieMaxSlotMs       int64
+	daednsRequestMatcherRegexpSlots         int
+	daednsRequestMatcherWallMs              int64
+
+	// main_routing_matcher_compile_distribution fields — per-slot breakdown
+	// of the heavy AhocorasickSlimtrie.Build inside the main routing matcher.
+	mainRoutingMatcherAcSlots             int
+	mainRoutingMatcherAcPatterns          int
+	mainRoutingMatcherAcMaxSlotPatterns   int
+	mainRoutingMatcherAcCpuMs             int64
+	mainRoutingMatcherAcMaxSlotMs         int64
+	mainRoutingMatcherTrieSlots           int
+	mainRoutingMatcherTriePatterns        int
+	mainRoutingMatcherTrieMaxSlotPatterns int
+	mainRoutingMatcherTrieCpuMs           int64
+	mainRoutingMatcherTrieMaxSlotMs       int64
+	mainRoutingMatcherRegexpSlots         int
+	mainRoutingMatcherWallMs              int64
 
 	// Config-load counters.
 	includedFiles   int
@@ -247,6 +278,96 @@ func (c *SummaryCollector) EmitDnsControllerStages(stats componentdns.BuildStats
 	emit(rulesload.StageDnsResponseProgramNormalize, stats.ResponseProgramNormalize)
 	emit(rulesload.StageDnsResponseMatcherLower, stats.ResponseMatcherLower)
 	emit(rulesload.StageDnsResponseMatcherCompile, stats.ResponseMatcherCompile)
+}
+
+// EmitDaednsRequestMatcherDistribution records and emits the per-slot
+// breakdown of the heavy AhocorasickSlimtrie.Build inside the daedns router.
+// It both accumulates the distribution into the summary AND publishes one
+// rules_load_stage event with all twelve detail fields on the collector's
+// logger using the collector's lifecycle.
+//
+// MUST be called AFTER the parent StageDaednsRequestMatcherCompile has been
+// emitted so operators see the parent stage before its distribution.
+func (c *SummaryCollector) EmitDaednsRequestMatcherDistribution(stats *domain_matcher.BuildStats) {
+	if stats == nil {
+		return
+	}
+	c.mu.Lock()
+	c.daednsRequestMatcherAcSlots = stats.AcSlots
+	c.daednsRequestMatcherAcPatterns = stats.AcPatterns
+	c.daednsRequestMatcherAcMaxSlotPatterns = stats.AcMaxSlotPatterns
+	c.daednsRequestMatcherAcCpuMs = stats.AcCpuDuration.Milliseconds()
+	c.daednsRequestMatcherAcMaxSlotMs = stats.AcMaxSlotDuration.Milliseconds()
+	c.daednsRequestMatcherTrieSlots = stats.TrieSlots
+	c.daednsRequestMatcherTriePatterns = stats.TriePatterns
+	c.daednsRequestMatcherTrieMaxSlotPatterns = stats.TrieMaxSlotPatterns
+	c.daednsRequestMatcherTrieCpuMs = stats.TrieCpuDuration.Milliseconds()
+	c.daednsRequestMatcherTrieMaxSlotMs = stats.TrieMaxSlotDuration.Milliseconds()
+	c.daednsRequestMatcherRegexpSlots = stats.RegexpSlots
+	c.daednsRequestMatcherWallMs = stats.WallDuration.Milliseconds()
+	log := c.log
+	lifecycle := c.lifecycle
+	c.mu.Unlock()
+
+	rulesload.EmitMatcherDistribution(log, lifecycle, rulesload.StageDaednsRequestMatcherCompileDistribution, rulesload.MatcherDistributionFields{
+		AcSlots:             stats.AcSlots,
+		AcPatterns:          stats.AcPatterns,
+		AcMaxSlotPatterns:   stats.AcMaxSlotPatterns,
+		AcCpuMs:             stats.AcCpuDuration.Milliseconds(),
+		AcMaxSlotMs:         stats.AcMaxSlotDuration.Milliseconds(),
+		TrieSlots:           stats.TrieSlots,
+		TriePatterns:        stats.TriePatterns,
+		TrieMaxSlotPatterns: stats.TrieMaxSlotPatterns,
+		TrieCpuMs:           stats.TrieCpuDuration.Milliseconds(),
+		TrieMaxSlotMs:       stats.TrieMaxSlotDuration.Milliseconds(),
+		RegexpSlots:         stats.RegexpSlots,
+		WallMs:              stats.WallDuration.Milliseconds(),
+	})
+}
+
+// EmitMainRoutingMatcherDistribution records and emits the per-slot breakdown
+// of the heavy AhocorasickSlimtrie.Build inside the main routing matcher. It
+// both accumulates the distribution into the summary AND publishes one
+// rules_load_stage event with all twelve detail fields on the collector's
+// logger using the collector's lifecycle.
+//
+// MUST be called AFTER the parent StageMainRoutingMatcher has been emitted so
+// operators see the parent stage before its distribution.
+func (c *SummaryCollector) EmitMainRoutingMatcherDistribution(stats *domain_matcher.BuildStats) {
+	if stats == nil {
+		return
+	}
+	c.mu.Lock()
+	c.mainRoutingMatcherAcSlots = stats.AcSlots
+	c.mainRoutingMatcherAcPatterns = stats.AcPatterns
+	c.mainRoutingMatcherAcMaxSlotPatterns = stats.AcMaxSlotPatterns
+	c.mainRoutingMatcherAcCpuMs = stats.AcCpuDuration.Milliseconds()
+	c.mainRoutingMatcherAcMaxSlotMs = stats.AcMaxSlotDuration.Milliseconds()
+	c.mainRoutingMatcherTrieSlots = stats.TrieSlots
+	c.mainRoutingMatcherTriePatterns = stats.TriePatterns
+	c.mainRoutingMatcherTrieMaxSlotPatterns = stats.TrieMaxSlotPatterns
+	c.mainRoutingMatcherTrieCpuMs = stats.TrieCpuDuration.Milliseconds()
+	c.mainRoutingMatcherTrieMaxSlotMs = stats.TrieMaxSlotDuration.Milliseconds()
+	c.mainRoutingMatcherRegexpSlots = stats.RegexpSlots
+	c.mainRoutingMatcherWallMs = stats.WallDuration.Milliseconds()
+	log := c.log
+	lifecycle := c.lifecycle
+	c.mu.Unlock()
+
+	rulesload.EmitMatcherDistribution(log, lifecycle, rulesload.StageMainRoutingMatcherCompileDistribution, rulesload.MatcherDistributionFields{
+		AcSlots:             stats.AcSlots,
+		AcPatterns:          stats.AcPatterns,
+		AcMaxSlotPatterns:   stats.AcMaxSlotPatterns,
+		AcCpuMs:             stats.AcCpuDuration.Milliseconds(),
+		AcMaxSlotMs:         stats.AcMaxSlotDuration.Milliseconds(),
+		TrieSlots:           stats.TrieSlots,
+		TriePatterns:        stats.TriePatterns,
+		TrieMaxSlotPatterns: stats.TrieMaxSlotPatterns,
+		TrieCpuMs:           stats.TrieCpuDuration.Milliseconds(),
+		TrieMaxSlotMs:       stats.TrieMaxSlotDuration.Milliseconds(),
+		RegexpSlots:         stats.RegexpSlots,
+		WallMs:              stats.WallDuration.Milliseconds(),
+	})
 }
 
 // RecordStage implements rulesload.Observer by accumulating per-stage durations.
@@ -441,6 +562,32 @@ func (c *SummaryCollector) buildSnapshot() rulesload.Summary {
 		DnsResponseMatcherLowerMs:       dnsRespMatcherLowerMs,
 		DnsResponseMatcherCompileMs:     dnsRespMatcherCompileMs,
 		DnsControllerUnattributedMs:     dnsControllerUnattributedMs,
+		// daedns_request_matcher_compile_distribution fields.
+		DaednsRequestMatcherAcSlots:             c.daednsRequestMatcherAcSlots,
+		DaednsRequestMatcherAcPatterns:          c.daednsRequestMatcherAcPatterns,
+		DaednsRequestMatcherAcMaxSlotPatterns:   c.daednsRequestMatcherAcMaxSlotPatterns,
+		DaednsRequestMatcherAcCpuMs:             c.daednsRequestMatcherAcCpuMs,
+		DaednsRequestMatcherAcMaxSlotMs:         c.daednsRequestMatcherAcMaxSlotMs,
+		DaednsRequestMatcherTrieSlots:           c.daednsRequestMatcherTrieSlots,
+		DaednsRequestMatcherTriePatterns:        c.daednsRequestMatcherTriePatterns,
+		DaednsRequestMatcherTrieMaxSlotPatterns: c.daednsRequestMatcherTrieMaxSlotPatterns,
+		DaednsRequestMatcherTrieCpuMs:           c.daednsRequestMatcherTrieCpuMs,
+		DaednsRequestMatcherTrieMaxSlotMs:       c.daednsRequestMatcherTrieMaxSlotMs,
+		DaednsRequestMatcherRegexpSlots:         c.daednsRequestMatcherRegexpSlots,
+		DaednsRequestMatcherWallMs:              c.daednsRequestMatcherWallMs,
+		// main_routing_matcher_compile_distribution fields.
+		MainRoutingMatcherAcSlots:             c.mainRoutingMatcherAcSlots,
+		MainRoutingMatcherAcPatterns:          c.mainRoutingMatcherAcPatterns,
+		MainRoutingMatcherAcMaxSlotPatterns:   c.mainRoutingMatcherAcMaxSlotPatterns,
+		MainRoutingMatcherAcCpuMs:             c.mainRoutingMatcherAcCpuMs,
+		MainRoutingMatcherAcMaxSlotMs:         c.mainRoutingMatcherAcMaxSlotMs,
+		MainRoutingMatcherTrieSlots:           c.mainRoutingMatcherTrieSlots,
+		MainRoutingMatcherTriePatterns:        c.mainRoutingMatcherTriePatterns,
+		MainRoutingMatcherTrieMaxSlotPatterns: c.mainRoutingMatcherTrieMaxSlotPatterns,
+		MainRoutingMatcherTrieCpuMs:           c.mainRoutingMatcherTrieCpuMs,
+		MainRoutingMatcherTrieMaxSlotMs:       c.mainRoutingMatcherTrieMaxSlotMs,
+		MainRoutingMatcherRegexpSlots:         c.mainRoutingMatcherRegexpSlots,
+		MainRoutingMatcherWallMs:              c.mainRoutingMatcherWallMs,
 		IncludedFiles:                   c.includedFiles,
 		ConfigBytes:                     c.configBytes,
 		ParsedSections:                  c.parsedSections,

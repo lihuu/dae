@@ -18,6 +18,7 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
@@ -84,6 +85,15 @@ type BuildStats struct {
 	// ResponseMatcherCompile covers ResponseMatcherBuilder.Build (AC slimtrie
 	// compile over DNS response rules + IpSet aggregation).
 	ResponseMatcherCompile time.Duration
+	// RequestMatcherDistribution, when non-nil, is populated by the internal
+	// request-matcher Build with per-slot counts and durations. Operators read
+	// this to decide whether the parent daedns_request_matcher_compile_ms cost
+	// is dominated by AC automata, suffix tries, or one giant slot.
+	RequestMatcherDistribution *domain_matcher.BuildStats
+	// ResponseMatcherDistribution, when non-nil, is populated by the internal
+	// response-matcher Build with the same shape as
+	// RequestMatcherDistribution.
+	ResponseMatcherDistribution *domain_matcher.BuildStats
 }
 
 func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
@@ -171,6 +181,13 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
 		}
+		// Allocate the per-slot distribution sink up front so callers see a
+		// populated struct regardless of whether the Build actually ran
+		// (reuse path leaves it nil).
+		if stats != nil {
+			stats.RequestMatcherDistribution = &domain_matcher.BuildStats{}
+			reqMatcherBuilder = reqMatcherBuilder.WithStats(stats.RequestMatcherDistribution)
+		}
 		stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, reqLowerStart)
 		reqCompileStart := time.Now()
 		s.reqMatcher, err = reqMatcherBuilder.Build()
@@ -196,6 +213,10 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	respMatcherBuilder, err := NewResponseMatcherBuilderFromProgram(opt.Logger, responseProgram, upstreamName2Id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
+	}
+	if stats != nil {
+		stats.ResponseMatcherDistribution = &domain_matcher.BuildStats{}
+		respMatcherBuilder = respMatcherBuilder.WithStats(stats.ResponseMatcherDistribution)
 	}
 	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseMatcherLower }, respLowerStart)
 	respCompileStart := time.Now()

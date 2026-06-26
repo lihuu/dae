@@ -55,6 +55,20 @@ type RoutingMatcherBuilder struct {
 	// Key is a hash of sorted prefixes, value stores the LPM trie index and
 	// the original prefixes for collision verification.
 	lpmDedup map[uint64]lpmDedupEntry
+
+	// matcherStats, when non-nil, is populated by BuildUserspace with per-slot
+	// counts and durations from the internal domain matcher compile. Operators
+	// read this to decide whether the parent main_routing_matcher_build_ms
+	// cost is dominated by AC automata, suffix tries, or one giant slot.
+	matcherStats *domain_matcher.BuildStats
+}
+
+// WithStats attaches a domain_matcher.BuildStats sink. When set, the internal
+// AhocorasickSlimtrie populates the struct with per-slot counts and durations
+// during BuildUserspace.
+func (b *RoutingMatcherBuilder) WithStats(stats *domain_matcher.BuildStats) *RoutingMatcherBuilder {
+	b.matcherStats = stats
+	return b
 }
 
 type routingKernspaceSnapshot struct {
@@ -795,7 +809,7 @@ func (s *routingKernspaceSnapshot) BuildKernspace(log *logrus.Logger, bpf *bpfOb
 
 func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err error) {
 	// Build domainMatcher first (it has its own parallelization)
-	domainMatcher := domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	domainMatcher := domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen).WithStats(b.matcherStats)
 	for _, domains := range b.simulatedDomainSet {
 		domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}

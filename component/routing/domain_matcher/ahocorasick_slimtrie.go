@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/pkg/trie"
@@ -19,6 +21,34 @@ import (
 )
 
 var ValidDomainChars = trie.NewValidChars([]byte("0123456789abcdefghijklmnopqrstuvwxyz-.^_"))
+
+// BuildStats, when non-nil, receives a per-slot breakdown of an
+// AhocorasickSlimtrie.Build run. The struct is opt-in via WithStats and zero
+// values are valid (a slot count of zero means the matcher had no patterns of
+// that kind). Durations use time.Duration (nanoseconds internally) so they
+// compose with the existing rules_load timing pipeline.
+//
+// Operators read these to decide where the parent stage's wall-clock went:
+//   - WallDuration ≈ MaxSlotDuration on either side ⇒ that side's tail slot
+//     is the parallel ceiling; algorithmic work (smaller slots, smaller
+//     patterns) is the remaining lever.
+//   - CpuDuration / WallDuration ≈ effective parallelism ⇒ if this is close
+//     to 1 on a multi-core host, the worker cap (or per-side serialization)
+//     is the bottleneck.
+type BuildStats struct {
+	AcSlots             int
+	AcPatterns          int
+	AcMaxSlotPatterns   int
+	AcCpuDuration       time.Duration
+	AcMaxSlotDuration   time.Duration
+	TrieSlots           int
+	TriePatterns        int
+	TrieMaxSlotPatterns int
+	TrieCpuDuration     time.Duration
+	TrieMaxSlotDuration time.Duration
+	RegexpSlots         int
+	WallDuration        time.Duration
+}
 
 type AhocorasickSlimtrie struct {
 	log *logrus.Logger
@@ -33,6 +63,8 @@ type AhocorasickSlimtrie struct {
 	toBuildAc   [][][]byte
 	toBuildTrie [][]string
 	err         error
+
+	stats *BuildStats
 }
 
 func NewAhocorasickSlimtrie(log *logrus.Logger, bitLength int) *AhocorasickSlimtrie {
@@ -44,6 +76,14 @@ func NewAhocorasickSlimtrie(log *logrus.Logger, bitLength int) *AhocorasickSlimt
 		toBuildAc:   make([][][]byte, bitLength),
 		toBuildTrie: make([][]string, bitLength),
 	}
+}
+
+// WithStats wires an external BuildStats sink. Call before Build. Subsequent
+// Build invocations populate the supplied struct with per-slot counts and
+// durations; nil disables the feature (zero overhead beyond a nil-check).
+func (n *AhocorasickSlimtrie) WithStats(stats *BuildStats) *AhocorasickSlimtrie {
+	n.stats = stats
+	return n
 }
 func (n *AhocorasickSlimtrie) AddSet(bitIndex int, patterns []string, typ consts.RoutingDomainKey) {
 	if n.err != nil {
@@ -171,6 +211,64 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 	n.validTrieIndexes = make([]int, 0, len(n.toBuildAc)/8)
 	n.validRegexpIndexes = make([]int, 0, len(n.toBuildAc)/8)
 
+	// Snapshot per-slot pattern counts before parallel work starts, so stats
+	// reflect the input shape independent of build wall-clock noise. Nil-safe.
+	var (
+		buildStart   time.Time
+		acCpuNs      atomic.Int64
+		trieCpuNs    atomic.Int64
+		acMaxNs      atomic.Int64
+		trieMaxNs    atomic.Int64
+		acSlots      int
+		trieSlots    int
+		acPatterns   int
+		triePatterns int
+		acMaxPats    int
+		trieMaxPats  int
+	)
+	if n.stats != nil {
+		buildStart = time.Now()
+		for _, patterns := range n.toBuildAc {
+			if len(patterns) == 0 {
+				continue
+			}
+			acSlots++
+			acPatterns += len(patterns)
+			if len(patterns) > acMaxPats {
+				acMaxPats = len(patterns)
+			}
+		}
+		for _, patterns := range n.toBuildTrie {
+			if len(patterns) == 0 {
+				continue
+			}
+			trieSlots++
+			triePatterns += len(patterns)
+			if len(patterns) > trieMaxPats {
+				trieMaxPats = len(patterns)
+			}
+		}
+	}
+	// recordSlot updates atomic accumulators only when stats is set.
+	recordSlot := func(cpuTotal *atomic.Int64, cpuMax *atomic.Int64, dur time.Duration) {
+		if n.stats == nil {
+			return
+		}
+		ns := dur.Nanoseconds()
+		cpuTotal.Add(ns)
+		// Lock-free max via CAS loop — slot durations are milliseconds, so
+		// contention is negligible and avoids the build-side mutex hot path.
+		for {
+			prev := cpuMax.Load()
+			if ns <= prev {
+				break
+			}
+			if cpuMax.CompareAndSwap(prev, ns) {
+				break
+			}
+		}
+	}
+
 	// Build AC automaton and trie in parallel for better performance.
 	// Use limited concurrency to avoid overwhelming the system.
 	numWorkers := min(
@@ -195,7 +293,9 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 			go func(idx int, patterns [][]byte) {
 				defer func() { <-sem }()
 				defer innerWg.Done()
+				slotStart := time.Now()
 				matcher, err := ahocorasick.NewMatcher(patterns)
+				slotDur := time.Since(slotStart)
 				if err != nil {
 					mu.Lock()
 					if buildErr == nil {
@@ -204,6 +304,7 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 					mu.Unlock()
 					return
 				}
+				recordSlot(&acCpuNs, &acMaxNs, slotDur)
 				mu.Lock()
 				n.ac[idx] = matcher
 				n.validAcIndexes = append(n.validAcIndexes, idx)
@@ -226,8 +327,10 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 			go func(idx int, patterns []string) {
 				defer func() { <-sem }()
 				defer innerWg.Done()
+				slotStart := time.Now()
 				transformed := ToSuffixTrieStrings(patterns)
 				t, err := trie.NewTrie(transformed, ValidDomainChars)
+				slotDur := time.Since(slotStart)
 				if err != nil {
 					mu.Lock()
 					if buildErr == nil {
@@ -236,6 +339,7 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 					mu.Unlock()
 					return
 				}
+				recordSlot(&trieCpuNs, &trieMaxNs, slotDur)
 				mu.Lock()
 				n.trie[idx] = t
 				n.validTrieIndexes = append(n.validTrieIndexes, idx)
@@ -257,6 +361,24 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 			continue
 		}
 		n.validRegexpIndexes = append(n.validRegexpIndexes, i)
+	}
+
+	// Publish stats AFTER both worker pools finished so all atomic counters
+	// have settled. Wall-clock wraps the snapshot+parallel build; the small
+	// AddSet snapshot loop runs in microseconds on real configs.
+	if n.stats != nil {
+		n.stats.AcSlots = acSlots
+		n.stats.AcPatterns = acPatterns
+		n.stats.AcMaxSlotPatterns = acMaxPats
+		n.stats.AcCpuDuration = time.Duration(acCpuNs.Load())
+		n.stats.AcMaxSlotDuration = time.Duration(acMaxNs.Load())
+		n.stats.TrieSlots = trieSlots
+		n.stats.TriePatterns = triePatterns
+		n.stats.TrieMaxSlotPatterns = trieMaxPats
+		n.stats.TrieCpuDuration = time.Duration(trieCpuNs.Load())
+		n.stats.TrieMaxSlotDuration = time.Duration(trieMaxNs.Load())
+		n.stats.RegexpSlots = len(n.validRegexpIndexes)
+		n.stats.WallDuration = time.Since(buildStart)
 	}
 
 	// Release unused data.

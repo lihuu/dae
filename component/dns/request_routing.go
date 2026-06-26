@@ -22,6 +22,16 @@ type RequestMatcherBuilder struct {
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
 	rules              []requestMatchSet
+	matcherStats       *domain_matcher.BuildStats
+}
+
+// WithStats attaches a domain_matcher.BuildStats sink. When set, the
+// internal AhocorasickSlimtrie populates the struct with per-slot counts and
+// durations during Build, exposing where wall-clock inside the parent
+// daedns_request_matcher_compile / dns_request_matcher_compile stage went.
+func (b *RequestMatcherBuilder) WithStats(stats *domain_matcher.BuildStats) *RequestMatcherBuilder {
+	b.matcherStats = stats
+	return b
 }
 
 func NewRequestMatcherBuilder(log *logrus.Logger, rules []*config_parser.RoutingRule, upstreamName2Id map[string]uint8, fallback config.FunctionOrString) (b *RequestMatcherBuilder, err error) {
@@ -148,7 +158,7 @@ func (b *RequestMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	var m RequestMatcher
 	// Build domainMatcher
-	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen).WithStats(b.matcherStats)
 	for _, domains := range b.simulatedDomainSet {
 		m.domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}

@@ -22,6 +22,7 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -107,6 +108,11 @@ type BuildStats struct {
 	// MatchersCompile covers compileSubscriptionMatcher, compileNodeMatcher,
 	// and compileSubNodeMatcher.
 	MatchersCompile time.Duration
+	// RequestMatcherDistribution, when non-nil, is populated by the internal
+	// request-matcher Build with per-slot counts and durations. Operators read
+	// this to decide whether the parent daedns_request_matcher_compile_ms cost
+	// is dominated by AC automata, suffix tries, or one giant slot.
+	RequestMatcherDistribution *domain_matcher.BuildStats
 }
 
 type compiledMatcher[T any] struct {
@@ -207,6 +213,10 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	requestMatcherBuilder, err := componentdns.NewRequestMatcherBuilderFromProgram(log, requestProgram, upstreamName2Id)
 	if err != nil {
 		return nil, err
+	}
+	if stats != nil {
+		stats.RequestMatcherDistribution = &domain_matcher.BuildStats{}
+		requestMatcherBuilder = requestMatcherBuilder.WithStats(stats.RequestMatcherDistribution)
 	}
 	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, requestMatcherStart)
 	requestCompileStart := time.Now()

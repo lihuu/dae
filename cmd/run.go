@@ -1301,6 +1301,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	if collector != nil {
 		collector.EmitStage(rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0, "")
 		collector.EmitDaednsRouterStages(*daeDNSStats)
+		collector.EmitDaednsRequestMatcherDistribution(daeDNSStats.RequestMatcherDistribution)
 	}
 	startTime := time.Now()
 	stageStart := startTime

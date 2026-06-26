@@ -12,6 +12,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/exp/slices"
 )
 
@@ -60,5 +61,48 @@ func TestAhocorasickSlimtrie(t *testing.T) {
 		if !slices.Equal(bitmap, bitmap2) {
 			t.Fatal(i, sample, bitmap, bitmap2)
 		}
+	}
+}
+
+// TestAhocorasickSlimtrie_BuildStats_PopulatesPerSlotShape verifies that
+// WithStats causes Build to populate slot counts, pattern counts, max-slot
+// size, and the time-like fields with sane invariants. The test deliberately
+// supplies one large suffix slot and one keyword slot so AC and trie both
+// have non-zero work; assertions stay on invariants (>= relationships) rather
+// than absolute times, which would be flaky.
+func TestAhocorasickSlimtrie_BuildStats_PopulatesPerSlotShape(t *testing.T) {
+	stats := &BuildStats{}
+	m := NewAhocorasickSlimtrie(logrus.New(), consts.MaxMatchSetLen).WithStats(stats)
+	m.AddSet(0, []string{"google.com", "wikipedia.org", "github.com", "youtube.com"}, consts.RoutingDomainKey_Suffix)
+	m.AddSet(1, []string{"adservice", "tracker", "analytics"}, consts.RoutingDomainKey_Keyword)
+	m.AddSet(2, []string{"www.iana.org"}, consts.RoutingDomainKey_Full)
+	if err := m.Build(); err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	// Suffix patterns expand to ".d$" + "^d$" so slot 0 contributes 8 strings;
+	// slot 2 contributes 1 "^d$". Both land in the trie side.
+	assert.Equal(t, 2, stats.TrieSlots, "two trie slots (suffix + full)")
+	assert.Equal(t, 9, stats.TriePatterns, "suffix expands 2x; one full adds 1")
+	assert.Equal(t, 8, stats.TrieMaxSlotPatterns, "biggest trie slot is suffix slot 0")
+	assert.Equal(t, 1, stats.AcSlots, "one AC slot (keyword)")
+	assert.Equal(t, 3, stats.AcPatterns, "three keywords in slot 1")
+	assert.Equal(t, 3, stats.AcMaxSlotPatterns)
+	assert.Equal(t, 0, stats.RegexpSlots, "no regex slots")
+
+	// Time invariants: max <= cpu (sum), wall >= max for each side individually.
+	assert.GreaterOrEqual(t, stats.TrieCpuDuration, stats.TrieMaxSlotDuration, "cpu >= max slot")
+	assert.GreaterOrEqual(t, stats.AcCpuDuration, stats.AcMaxSlotDuration, "cpu >= max slot")
+	assert.GreaterOrEqual(t, stats.WallDuration, stats.TrieMaxSlotDuration, "wall >= trie max")
+	assert.GreaterOrEqual(t, stats.WallDuration, stats.AcMaxSlotDuration, "wall >= ac max")
+}
+
+// TestAhocorasickSlimtrie_BuildStats_NilStatsIsSafe ensures the default path
+// (no WithStats call) still compiles a usable matcher and adds zero overhead.
+func TestAhocorasickSlimtrie_BuildStats_NilStatsIsSafe(t *testing.T) {
+	m := NewAhocorasickSlimtrie(logrus.New(), consts.MaxMatchSetLen)
+	m.AddSet(0, []string{"google.com"}, consts.RoutingDomainKey_Suffix)
+	if err := m.Build(); err != nil {
+		t.Fatalf("Build() error = %v", err)
 	}
 }

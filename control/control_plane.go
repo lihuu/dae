@@ -37,6 +37,7 @@ import (
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/daeuniverse/dae/pkg/rulesload"
@@ -153,6 +154,12 @@ type controlPlaneBuildOptions struct {
 	// Set by the caller when structured observability is desired. When nil,
 	// no stage events are emitted and the existing coarse log lines remain.
 	rulesLoadObserver rulesload.Observer
+
+	// mainRoutingMatcherDistribution, when non-nil, is populated by the main
+	// routing matcher Build with per-slot counts and durations. Operators read
+	// this to decide whether the parent main_routing_matcher_build_ms cost is
+	// dominated by AC automata, suffix tries, or one giant slot.
+	mainRoutingMatcherDistribution *domain_matcher.BuildStats
 }
 
 const (
@@ -855,10 +862,14 @@ func newControlPlaneWithContextOptions(
 	// Parse rules and build.
 	log.Infoln("Building routing matcher...")
 	routingMatcherStart := time.Now()
+	if buildOpts.mainRoutingMatcherDistribution == nil {
+		buildOpts.mainRoutingMatcherDistribution = &domain_matcher.BuildStats{}
+	}
 	builder, err := NewRoutingMatcherBuilderFromProgram(log, routingProgram, outboundName2Id, core.bpf.Load())
 	if err != nil {
 		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 	}
+	builder = builder.WithStats(buildOpts.mainRoutingMatcherDistribution)
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.delayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
@@ -878,6 +889,7 @@ func newControlPlaneWithContextOptions(
 
 	if obs := buildOpts.rulesLoadObserver; obs != nil {
 		obs.EmitStage(rulesload.StageMainRoutingMatcher, time.Since(routingMatcherStart).Milliseconds(), 0, 0, "")
+		obs.EmitMainRoutingMatcherDistribution(buildOpts.mainRoutingMatcherDistribution)
 	}
 	// Get referenced outbounds to limit health checks.
 	referencedOutbounds := builder.GetReferencedOutbounds()

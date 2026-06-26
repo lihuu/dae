@@ -1,5 +1,7 @@
 package rulesload
 
+import "github.com/daeuniverse/dae/component/routing/domain_matcher"
+
 // Observer receives notifications of routing build stages during control plane
 // construction. Implementations record durations, accumulate summaries, and
 // emit structured log events.
@@ -22,6 +24,16 @@ type Observer interface {
 	// direct access to the *logrus.Logger or current Lifecycle; the observer
 	// supplies both from the surrounding lifecycle scope.
 	EmitStage(stage string, durationMs int64, rulesIn, rulesOut int, errorClass string)
+
+	// EmitDaednsRequestMatcherDistribution records and emits the per-slot
+	// breakdown of the heavy AhocorasickSlimtrie.Build inside the daedns
+	// router. Must be called after StageDaednsRequestMatcherCompile.
+	EmitDaednsRequestMatcherDistribution(stats *domain_matcher.BuildStats)
+
+	// EmitMainRoutingMatcherDistribution records and emits the per-slot
+	// breakdown of the heavy AhocorasickSlimtrie.Build inside the main routing
+	// matcher. Must be called after StageMainRoutingMatcher.
+	EmitMainRoutingMatcherDistribution(stats *domain_matcher.BuildStats)
 }
 
 // NoopObserver is an Observer that does nothing. Use as the zero-value default.
@@ -29,3 +41,5 @@ type NoopObserver struct{}
 
 func (NoopObserver) RecordStage(string, int64, int, int)       {}
 func (NoopObserver) EmitStage(string, int64, int, int, string) {}
+func (NoopObserver) EmitDaednsRequestMatcherDistribution(*domain_matcher.BuildStats)  {}
+func (NoopObserver) EmitMainRoutingMatcherDistribution(*domain_matcher.BuildStats)    {}
