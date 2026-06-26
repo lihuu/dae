@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/dae/component/daedns"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/sirupsen/logrus"
@@ -41,6 +42,15 @@ type SummaryCollector struct {
 	configMerge         time.Duration
 	configDecode        time.Duration
 	configPatch         time.Duration
+
+	// daedns_router_build child stages — fed from component/daedns.BuildStats
+	// via EmitDaednsRouterStages. Their sum is expected to be ≈
+	// daednsRouterBuild; any gap becomes daedns_router_unattributed_ms in the
+	// summary snapshot.
+	daednsRequestProgramNormalize time.Duration
+	daednsUpstreamInit            time.Duration
+	daednsRequestMatcherBuild     time.Duration
+	daednsMatchersCompile         time.Duration
 
 	// Config-load counters.
 	includedFiles   int
@@ -154,6 +164,36 @@ func (c *SummaryCollector) EmitConfigStages(stats config.LoadStats) {
 	emit(rulesload.StageConfigPatch, stats.PatchDuration)
 }
 
+// EmitDaednsRouterStages records and emits the four daedns_router_build child
+// stages. Like EmitConfigStages, it both accumulates the durations into the
+// summary AND publishes one rules_load_stage event per stage on the
+// collector's logger using the collector's lifecycle. Skipped stages (zero
+// duration) emit nothing.
+//
+// MUST be called AFTER the parent StageDaednsRouterBuild has been emitted so
+// operators see the parent stage before its children.
+func (c *SummaryCollector) EmitDaednsRouterStages(stats daedns.BuildStats) {
+	c.mu.Lock()
+	c.daednsRequestProgramNormalize += stats.RequestProgramNormalize
+	c.daednsUpstreamInit += stats.UpstreamInit
+	c.daednsRequestMatcherBuild += stats.RequestMatcherBuild
+	c.daednsMatchersCompile += stats.MatchersCompile
+	log := c.log
+	lifecycle := c.lifecycle
+	c.mu.Unlock()
+
+	emit := func(stage string, dur time.Duration) {
+		if dur == 0 {
+			return
+		}
+		rulesload.EmitStage(log, lifecycle, stage, dur.Milliseconds(), 0, 0, "")
+	}
+	emit(rulesload.StageDaednsRequestProgramNormalize, stats.RequestProgramNormalize)
+	emit(rulesload.StageDaednsUpstreamInit, stats.UpstreamInit)
+	emit(rulesload.StageDaednsRequestMatcherBuild, stats.RequestMatcherBuild)
+	emit(rulesload.StageDaednsMatchersCompile, stats.MatchersCompile)
+}
+
 // RecordStage implements rulesload.Observer by accumulating per-stage durations.
 // This is safe for concurrent calls from inside the control plane constructor.
 func (c *SummaryCollector) RecordStage(stage string, durationMs int64, rulesIn, rulesOut int) {
@@ -203,6 +243,14 @@ func (c *SummaryCollector) recordStageLocked(stage string, durationMs int64, rul
 		c.reloadHandoff = d
 	case rulesload.StageReloadRetire:
 		c.reloadRetire = d
+	case rulesload.StageDaednsRequestProgramNormalize:
+		c.daednsRequestProgramNormalize = d
+	case rulesload.StageDaednsUpstreamInit:
+		c.daednsUpstreamInit = d
+	case rulesload.StageDaednsRequestMatcherBuild:
+		c.daednsRequestMatcherBuild = d
+	case rulesload.StageDaednsMatchersCompile:
+		c.daednsMatchersCompile = d
 	}
 }
 
@@ -256,34 +304,50 @@ func (c *SummaryCollector) buildSnapshot() rulesload.Summary {
 		configUnattributedMs = 0
 	}
 
+	daednsRouterBuildMs := c.daednsRouterBuild.Milliseconds()
+	daednsReqProgMs := c.daednsRequestProgramNormalize.Milliseconds()
+	daednsUpstreamMs := c.daednsUpstreamInit.Milliseconds()
+	daednsReqMatcherMs := c.daednsRequestMatcherBuild.Milliseconds()
+	daednsMatchersMs := c.daednsMatchersCompile.Milliseconds()
+	daednsChildSum := daednsReqProgMs + daednsUpstreamMs + daednsReqMatcherMs + daednsMatchersMs
+	daednsRouterUnattributedMs := daednsRouterBuildMs - daednsChildSum
+	if daednsRouterUnattributedMs < 0 {
+		daednsRouterUnattributedMs = 0
+	}
+
 	return rulesload.Summary{
-		Lifecycle:             c.lifecycle,
-		TotalMs:               total.Milliseconds(),
-		ConfigLoadMs:          configLoadMs,
-		FakeIPAutoExpandMs:    c.fakeipAutoExpand.Milliseconds(),
-		DaednsRouterBuildMs:   c.daednsRouterBuild.Milliseconds(),
-		DnsControllerBuildMs:  c.dnsControllerBuild.Milliseconds(),
-		MainRoutingOptimizeMs: c.mainRoutingOptimize.Milliseconds(),
-		MainRoutingMatcherMs:  c.mainRoutingMatcher.Milliseconds(),
-		ControlPlaneBuildMs:   c.controlPlaneBuild.Milliseconds(),
-		ReloadHandoffMs:       c.reloadHandoff.Milliseconds(),
-		ReloadRetireMs:        c.reloadRetire.Milliseconds(),
-		ConfigReadFilesMs:     configReadFilesMs,
-		ConfigParseMs:         configParseMs,
-		ConfigIncludeExpandMs: configIncludeExpandMs,
-		ConfigMergeMs:         configMergeMs,
-		ConfigDecodeMs:        configDecodeMs,
-		ConfigPatchMs:         configPatchMs,
-		ConfigUnattributedMs:  configUnattributedMs,
-		IncludedFiles:         c.includedFiles,
-		ConfigBytes:           c.configBytes,
-		ParsedSections:        c.parsedSections,
-		RawRoutingRules:       c.rawRoutingRules,
-		MainRoutingRules:      c.mainRoutingRules,
-		DnsRequestRules:       c.dnsRequestRules,
-		DnsResponseRules:      c.dnsResponseRules,
-		FakeIPAutoDerived:     c.fakeipAutoDerived,
-		RulesTotal:            c.mainRoutingRules + c.dnsRequestRules + c.dnsResponseRules + c.fakeipAutoDerived,
-		ErrorClass:            c.errorClass,
+		Lifecycle:                       c.lifecycle,
+		TotalMs:                         total.Milliseconds(),
+		ConfigLoadMs:                    configLoadMs,
+		FakeIPAutoExpandMs:              c.fakeipAutoExpand.Milliseconds(),
+		DaednsRouterBuildMs:             daednsRouterBuildMs,
+		DnsControllerBuildMs:            c.dnsControllerBuild.Milliseconds(),
+		MainRoutingOptimizeMs:           c.mainRoutingOptimize.Milliseconds(),
+		MainRoutingMatcherMs:            c.mainRoutingMatcher.Milliseconds(),
+		ControlPlaneBuildMs:             c.controlPlaneBuild.Milliseconds(),
+		ReloadHandoffMs:                 c.reloadHandoff.Milliseconds(),
+		ReloadRetireMs:                  c.reloadRetire.Milliseconds(),
+		ConfigReadFilesMs:               configReadFilesMs,
+		ConfigParseMs:                   configParseMs,
+		ConfigIncludeExpandMs:           configIncludeExpandMs,
+		ConfigMergeMs:                   configMergeMs,
+		ConfigDecodeMs:                  configDecodeMs,
+		ConfigPatchMs:                   configPatchMs,
+		ConfigUnattributedMs:            configUnattributedMs,
+		DaednsRequestProgramNormalizeMs: daednsReqProgMs,
+		DaednsUpstreamInitMs:            daednsUpstreamMs,
+		DaednsRequestMatcherBuildMs:     daednsReqMatcherMs,
+		DaednsMatchersCompileMs:         daednsMatchersMs,
+		DaednsRouterUnattributedMs:      daednsRouterUnattributedMs,
+		IncludedFiles:                   c.includedFiles,
+		ConfigBytes:                     c.configBytes,
+		ParsedSections:                  c.parsedSections,
+		RawRoutingRules:                 c.rawRoutingRules,
+		MainRoutingRules:                c.mainRoutingRules,
+		DnsRequestRules:                 c.dnsRequestRules,
+		DnsResponseRules:                c.dnsResponseRules,
+		FakeIPAutoDerived:               c.fakeipAutoDerived,
+		RulesTotal:                      c.mainRoutingRules + c.dnsRequestRules + c.dnsResponseRules + c.fakeipAutoDerived,
+		ErrorClass:                      c.errorClass,
 	}
 }

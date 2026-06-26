@@ -160,6 +160,10 @@ func TestEmitStage_AllStageNames(t *testing.T) {
 		StageControlPlaneBuild,
 		StageReloadHandoff,
 		StageReloadRetire,
+		StageDaednsRequestProgramNormalize,
+		StageDaednsUpstreamInit,
+		StageDaednsRequestMatcherBuild,
+		StageDaednsMatchersCompile,
 	}
 	for _, stage := range stages {
 		log := logrus.New()
@@ -332,4 +336,36 @@ func TestEmitSummary_HasConfigBreakdownFields(t *testing.T) {
 	assert.Equal(t, int64(482301), e.Data["config_bytes"])
 	assert.Equal(t, 51, e.Data["parsed_sections"])
 	assert.Equal(t, 2067, e.Data["raw_routing_rules"])
+}
+
+// TestEmitSummary_HasDaednsRouterBreakdownFields verifies the four
+// daedns_router_build substage durations and the unattributed remainder appear
+// in the summary event.
+func TestEmitSummary_HasDaednsRouterBreakdownFields(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitSummary(log, Summary{
+		Lifecycle:                       LifecycleStartup,
+		TotalMs:                         2616,
+		DaednsRouterBuildMs:             763,
+		DaednsRequestProgramNormalizeMs: 612,
+		DaednsUpstreamInitMs:            5,
+		DaednsRequestMatcherBuildMs:     110,
+		DaednsMatchersCompileMs:         25,
+		DaednsRouterUnattributedMs:      11,
+	})
+
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(hook.entries))
+	}
+	e := hook.entries[0]
+	assert.Equal(t, int64(763), e.Data["daedns_router_build_ms"])
+	assert.Equal(t, int64(612), e.Data["daedns_request_program_normalize_ms"])
+	assert.Equal(t, int64(5), e.Data["daedns_upstream_init_ms"])
+	assert.Equal(t, int64(110), e.Data["daedns_request_matcher_build_ms"])
+	assert.Equal(t, int64(25), e.Data["daedns_matchers_compile_ms"])
+	assert.Equal(t, int64(11), e.Data["daedns_router_unattributed_ms"])
 }

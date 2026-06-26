@@ -36,6 +36,15 @@ const (
 	StageConfigMerge         = "config_merge"
 	StageConfigDecode        = "config_decode"
 	StageConfigPatch         = "config_patch"
+
+	// daedns_router_build child stages — decompose the otherwise-opaque
+	// daedns_router_build_ms parent stage into the four substages observed
+	// inside component/daedns.NewWithOption. Emitted by cmd/run.go after
+	// receiving a daedns.BuildStats from NewOption.Stats.
+	StageDaednsRequestProgramNormalize = "daedns_request_program_normalize"
+	StageDaednsUpstreamInit            = "daedns_upstream_init"
+	StageDaednsRequestMatcherBuild     = "daedns_request_matcher_build"
+	StageDaednsMatchersCompile         = "daedns_matchers_compile"
 )
 
 const (
@@ -141,6 +150,13 @@ type Summary struct {
 	ConfigPatchMs         int64
 	ConfigUnattributedMs  int64
 
+	// daedns_router_build child stages.
+	DaednsRequestProgramNormalizeMs int64
+	DaednsUpstreamInitMs            int64
+	DaednsRequestMatcherBuildMs     int64
+	DaednsMatchersCompileMs         int64
+	DaednsRouterUnattributedMs      int64
+
 	// Config-load counters.
 	IncludedFiles   int
 	ConfigBytes     int64
@@ -179,6 +195,11 @@ func EmitSummary(log *logrus.Logger, s Summary) {
 		"config_decode_ms":              s.ConfigDecodeMs,
 		"config_patch_ms":               s.ConfigPatchMs,
 		"config_unattributed_ms":        s.ConfigUnattributedMs,
+		"daedns_request_program_normalize_ms": s.DaednsRequestProgramNormalizeMs,
+		"daedns_upstream_init_ms":             s.DaednsUpstreamInitMs,
+		"daedns_request_matcher_build_ms":     s.DaednsRequestMatcherBuildMs,
+		"daedns_matchers_compile_ms":          s.DaednsMatchersCompileMs,
+		"daedns_router_unattributed_ms":       s.DaednsRouterUnattributedMs,
 		"included_files":                s.IncludedFiles,
 		"config_bytes":                  s.ConfigBytes,
 		"parsed_sections":               s.ParsedSections,

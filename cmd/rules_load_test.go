@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/component/daedns"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/rulesload"
@@ -656,4 +657,111 @@ dns {
 	// Avoid unused-variable warning from config_parser import in case the
 	// test is the only consumer.
 	_ = config_parser.Section{}
+}
+
+// TestSummaryCollector_EmitDaednsRouterStages_EmitsOnePerNonZeroStage
+// verifies that the four daedns_router_build child stages each produce a
+// rules_load_stage event when their BuildStats duration is non-zero, and
+// that the same four durations accumulate into the rules_load_summary.
+func TestSummaryCollector_EmitDaednsRouterStages_EmitsOnePerNonZeroStage(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	// EmitStage(daedns_router_build) is what cmd/run.go does today; we
+	// invoke it here so the parent duration lands in the summary alongside
+	// the child stages.
+	c.EmitStage(rulesload.StageDaednsRouterBuild, 763, 0, 0, "")
+	c.EmitDaednsRouterStages(daedns.BuildStats{
+		RequestProgramNormalize: 612 * time.Millisecond,
+		UpstreamInit:            5 * time.Millisecond,
+		RequestMatcherBuild:     110 * time.Millisecond,
+		MatchersCompile:         25 * time.Millisecond,
+	})
+	c.Emit()
+
+	wantStages := map[string]int64{
+		rulesload.StageDaednsRequestProgramNormalize: 612,
+		rulesload.StageDaednsUpstreamInit:            5,
+		rulesload.StageDaednsRequestMatcherBuild:     110,
+		rulesload.StageDaednsMatchersCompile:         25,
+	}
+	seen := map[string]*logrus.Entry{}
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; !ok || v != rulesload.EventStage {
+			continue
+		}
+		stage, _ := e.Data["stage"].(string)
+		seen[stage] = e
+	}
+	for stage, dur := range wantStages {
+		got, ok := seen[stage]
+		if !ok {
+			t.Fatalf("expected a stage event for %q", stage)
+		}
+		assert.Equal(t, dur, got.Data["duration_ms"], "stage %s duration", stage)
+		assert.Equal(t, "ok", got.Data["result"], "stage %s result", stage)
+		assert.Equal(t, rulesload.Lifecycle("startup"), got.Data["lifecycle"], "stage %s lifecycle", stage)
+	}
+
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(763), summary.Data["daedns_router_build_ms"])
+	assert.Equal(t, int64(612), summary.Data["daedns_request_program_normalize_ms"])
+	assert.Equal(t, int64(5), summary.Data["daedns_upstream_init_ms"])
+	assert.Equal(t, int64(110), summary.Data["daedns_request_matcher_build_ms"])
+	assert.Equal(t, int64(25), summary.Data["daedns_matchers_compile_ms"])
+	// 763 - (612 + 5 + 110 + 25) = 11
+	assert.Equal(t, int64(11), summary.Data["daedns_router_unattributed_ms"])
+}
+
+// TestSummaryCollector_EmitDaednsRouterStages_ZeroDurationsSkipped verifies
+// that substages with zero duration produce no rules_load_stage events.
+func TestSummaryCollector_EmitDaednsRouterStages_ZeroDurationsSkipped(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleReload)
+
+	c.EmitStage(rulesload.StageDaednsRouterBuild, 10, 0, 0, "")
+	c.EmitDaednsRouterStages(daedns.BuildStats{
+		RequestProgramNormalize: 7 * time.Millisecond,
+		// other three intentionally zero
+	})
+
+	stageEvents := 0
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; !ok || v != rulesload.EventStage {
+			continue
+		}
+		stage, _ := e.Data["stage"].(string)
+		switch stage {
+		case rulesload.StageDaednsRequestProgramNormalize,
+			rulesload.StageDaednsUpstreamInit,
+			rulesload.StageDaednsRequestMatcherBuild,
+			rulesload.StageDaednsMatchersCompile:
+			stageEvents++
+		}
+	}
+	assert.Equal(t, 1, stageEvents,
+		"only the one non-zero daedns child stage should emit an event")
+}
+
+// TestSummaryCollector_DaednsRouterUnattributedMs_NeverNegative verifies
+// the snapshot clamps unattributed at 0 if children sum higher than the
+// parent (clock skew / overlapping accumulation).
+func TestSummaryCollector_DaednsRouterUnattributedMs_NeverNegative(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	c.EmitStage(rulesload.StageDaednsRouterBuild, 50, 0, 0, "")
+	c.EmitDaednsRouterStages(daedns.BuildStats{
+		RequestProgramNormalize: 100 * time.Millisecond, // larger than parent
+	})
+	c.Emit()
+
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(0), summary.Data["daedns_router_unattributed_ms"])
 }

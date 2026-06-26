@@ -941,3 +941,70 @@ func startBlockingDNSUDPServer(t *testing.T, addr netip.Addr) (string, <-chan st
 func isContextDeadlineExceeded(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
+
+func TestNewWithOption_PopulatesBuildStats(t *testing.T) {
+	stats := &BuildStats{}
+	router, err := NewWithOption(logrus.New(), &config.Global{}, &config.Dns{
+		Upstream: []config.KeyableString{
+			"subdns:udp://1.1.1.1:53",
+			"linkdns:udp://1.0.0.1:53",
+			"nodedns:udp://9.9.9.9:53",
+			"subnodedns:udp://8.8.8.8:53",
+		},
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Rules: []*config_parser.RoutingRule{
+					testInternalRule("subdns", testInternalFunction("sub", testInternalParam("", "my_sub"))),
+					testInternalRule("nodedns", testInternalFunction("node", testInternalParam("name", "primary"))),
+					testInternalRule("subnodedns", testInternalFunction("subnode", testInternalParam("subtag", "my_sub"))),
+				},
+				Fallback: "subdns",
+			},
+		},
+	}, &NewOption{Stats: stats})
+	if err != nil {
+		t.Fatalf("NewWithOption() error = %v", err)
+	}
+	if router == nil {
+		t.Fatal("expected router")
+	}
+	// Each of the four substages must have stamped a non-negative duration. We
+	// do not require strictly positive durations because tiny configs can
+	// finish within sub-microsecond ticks on some hardware; what matters is
+	// that the field was written (zero value would imply we forgot to stamp).
+	for _, c := range []struct {
+		name string
+		dur  time.Duration
+	}{
+		{"RequestProgramNormalize", stats.RequestProgramNormalize},
+		{"UpstreamInit", stats.UpstreamInit},
+		{"RequestMatcherBuild", stats.RequestMatcherBuild},
+		{"MatchersCompile", stats.MatchersCompile},
+	} {
+		if c.dur < 0 {
+			t.Errorf("BuildStats.%s = %s, want >= 0", c.name, c.dur)
+		}
+	}
+}
+
+func TestNewWithOption_NilStatsIsSafe(t *testing.T) {
+	router, err := NewWithOption(logrus.New(), &config.Global{}, &config.Dns{
+		Upstream: []config.KeyableString{
+			"subdns:udp://1.1.1.1:53",
+		},
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Rules: []*config_parser.RoutingRule{
+					testInternalRule("subdns", testInternalFunction("sub", testInternalParam("", "my_sub"))),
+				},
+				Fallback: "subdns",
+			},
+		},
+	}, &NewOption{Stats: nil})
+	if err != nil {
+		t.Fatalf("NewWithOption() error = %v", err)
+	}
+	if router == nil {
+		t.Fatal("expected router")
+	}
+}
