@@ -71,7 +71,8 @@ type lookupCall struct {
 }
 
 type NewOption struct {
-	LocationFinder *assets.LocationFinder
+	LocationFinder     *assets.LocationFinder
+	DatReaderOptimizer *routing.DatReaderOptimizer
 }
 
 type compiledMatcher[T any] struct {
@@ -115,8 +116,9 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if opt != nil && opt.LocationFinder != nil {
 		locationFinder = opt.LocationFinder
 	}
+	datReaderOptimizer := datReaderOptimizerForRouter(log, locationFinder, opt)
 	requestProgram, err := componentdns.NewNormalizedRequestRoutingProgram(dnsCfg.Routing.Request.Rules, dnsCfg.Routing.Request.Fallback,
-		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
@@ -174,6 +176,13 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		return nil, err
 	}
 	return router, nil
+}
+
+func datReaderOptimizerForRouter(log *logrus.Logger, locationFinder *assets.LocationFinder, opt *NewOption) *routing.DatReaderOptimizer {
+	if opt != nil && opt.DatReaderOptimizer != nil {
+		return opt.DatReaderOptimizer
+	}
+	return &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
 }
 
 func (r *Router) initUpstreams(rawUpstreams []config.KeyableString) error {

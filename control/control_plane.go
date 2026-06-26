@@ -145,6 +145,10 @@ type controlPlaneBuildOptions struct {
 	// routing matcher again inside the control plane constructor.
 	prebuiltDaeDNS *daedns.Router
 
+	// datReaderOptimizer is shared across routing normalization steps in one
+	// startup/reload generation so geosite/geoip data is read and expanded once.
+	datReaderOptimizer *routing.DatReaderOptimizer
+
 	// rulesLoadObserver receives routing build stage timing notifications.
 	// Set by the caller when structured observability is desired. When nil,
 	// no stage events are emitted and the existing coarse log lines remain.
@@ -343,6 +347,7 @@ func NewControlPlaneWithContext(
 		dnsConfig,
 		externGeoDataDirs,
 		nil,
+		nil,
 		reuseFakeIPStore,
 		obs,
 	)
@@ -360,6 +365,7 @@ func NewControlPlaneWithContextAndDaeDNS(
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
 	prebuiltDaeDNS *daedns.Router,
+	datReaderOptimizer *routing.DatReaderOptimizer,
 	reuseFakeIPStore *FakeIPStore,
 	obs rulesload.Observer,
 ) (plane *ControlPlane, err error) {
@@ -375,9 +381,10 @@ func NewControlPlaneWithContextAndDaeDNS(
 		dnsConfig,
 		externGeoDataDirs,
 		controlPlaneBuildOptions{
-			reuseFakeIPStore:  reuseFakeIPStore,
-			prebuiltDaeDNS:    prebuiltDaeDNS,
-			rulesLoadObserver: obs,
+			reuseFakeIPStore:   reuseFakeIPStore,
+			prebuiltDaeDNS:     prebuiltDaeDNS,
+			datReaderOptimizer: datReaderOptimizer,
+			rulesLoadObserver:  obs,
 		},
 	)
 }
@@ -410,6 +417,7 @@ func NewPreparedControlPlaneWithContext(
 		dnsConfig,
 		externGeoDataDirs,
 		nil,
+		nil,
 		reuseFakeIPStore,
 		obs,
 	)
@@ -429,6 +437,7 @@ func NewPreparedControlPlaneWithContextAndDaeDNS(
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
 	prebuiltDaeDNS *daedns.Router,
+	datReaderOptimizer *routing.DatReaderOptimizer,
 	reuseFakeIPStore *FakeIPStore,
 	obs rulesload.Observer,
 ) (plane *ControlPlane, err error) {
@@ -448,6 +457,7 @@ func NewPreparedControlPlaneWithContextAndDaeDNS(
 			delayDNSListenerStart: true,
 			reuseFakeIPStore:      reuseFakeIPStore,
 			prebuiltDaeDNS:        prebuiltDaeDNS,
+			datReaderOptimizer:    datReaderOptimizer,
 			rulesLoadObserver:     obs,
 		},
 	)
@@ -464,7 +474,10 @@ func buildDaeDNSRouterForControlPlane(
 		return buildOpts.prebuiltDaeDNS, 0, true, nil
 	}
 	start := time.Now()
-	router, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
+	router, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
+		LocationFinder:     locationFinder,
+		DatReaderOptimizer: buildOpts.datReaderOptimizer,
+	})
 	return router, time.Since(start), false, err
 }
 
@@ -815,9 +828,13 @@ func newControlPlaneWithContextOptions(
 	// Apply rules optimizers.
 	log.Infoln("Optimizing and loading routing rules (this may take a while for large rule sets)...")
 	routingOptimizeStart := time.Now()
+	datReaderOptimizer := buildOpts.datReaderOptimizer
+	if datReaderOptimizer == nil {
+		datReaderOptimizer = &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
+	}
 	routingProgram, err := routing.NewNormalizedProgram(routingA.Rules, routingA.Fallback,
 		&routing.AliasOptimizer{},
-		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
@@ -948,6 +965,7 @@ func newControlPlaneWithContextOptions(
 	dnsUpstream, err := dns.New(dnsConfig, &dns.NewOption{
 		Logger:                  log,
 		LocationFinder:          locationFinder,
+		DatReaderOptimizer:      buildOpts.datReaderOptimizer,
 		UpstreamReadyCallback:   plane.dnsUpstreamReadyCallback,
 		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp),
 		UpstreamHostResolver:    upstreamHostResolver,

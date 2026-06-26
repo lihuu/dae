@@ -36,6 +36,7 @@ import (
 	"github.com/daeuniverse/dae/common/subscription"
 	"github.com/daeuniverse/dae/component/daedns"
 	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -1286,8 +1287,12 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	direct.InitDirectDialers(conf.Global.FallbackResolver)
 	netutils.FallbackDns = netip.MustParseAddrPort(conf.Global.FallbackResolver)
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
+	datReaderOptimizer := &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
 	daeDNSStart := time.Now()
-	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{LocationFinder: locationFinder})
+	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
+		LocationFinder:     locationFinder,
+		DatReaderOptimizer: datReaderOptimizer,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1462,6 +1467,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Dns,
 			externGeoDataDirs,
 			daeDNSRouter,
+			datReaderOptimizer,
 			reuseFakeIPStore,
 			collector,
 		)
@@ -1478,6 +1484,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Dns,
 			externGeoDataDirs,
 			daeDNSRouter,
+			datReaderOptimizer,
 			reuseFakeIPStore,
 			collector,
 		)

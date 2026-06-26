@@ -37,6 +37,7 @@ type Dns struct {
 type NewOption struct {
 	Logger                  *logrus.Logger
 	LocationFinder          *assets.LocationFinder
+	DatReaderOptimizer      *routing.DatReaderOptimizer
 	UpstreamReadyCallback   func(dnsUpstream *Upstream) (err error)
 	UpstreamResolverNetwork string
 	UpstreamHostResolver    func(ctx context.Context, host string, network string) (*netutils.Ip46, error, error)
@@ -85,8 +86,9 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		s.upstream = append(s.upstream, r)
 	}
 	s.nameToIndex = upstreamName2Id
+	datReaderOptimizer := datReaderOptimizerForDNS(opt)
 	requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
-		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
@@ -95,7 +97,7 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	}
 
 	responseProgram, err := routing.NewNormalizedProgram(dns.Routing.Response.Rules, dns.Routing.Response.Fallback,
-		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
@@ -125,6 +127,13 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		go func() { _ = opt.UpstreamReadyCallback(nil) }()
 	}
 	return s, nil
+}
+
+func datReaderOptimizerForDNS(opt *NewOption) *routing.DatReaderOptimizer {
+	if opt != nil && opt.DatReaderOptimizer != nil {
+		return opt.DatReaderOptimizer
+	}
+	return &routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder}
 }
 
 func (s *Dns) CheckUpstreamsFormat() error {
