@@ -6,6 +6,7 @@
 package cmd
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -39,6 +40,12 @@ func findEvent(entries []*logrus.Entry, eventName string) *logrus.Entry {
 		}
 	}
 	return nil
+}
+
+// writeConfigForTest writes content to path with mode 0600 so the config
+// merger's permission check accepts it.
+func writeConfigForTest(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0600)
 }
 
 // TestSummaryCollector_EmitStartupLifecycle verifies that a startup-lifecycle
@@ -417,4 +424,236 @@ func TestSummaryCollector_SetDnsRouting(t *testing.T) {
 	assert.Equal(t, 8, e.Data["dns_request_rules"])
 	assert.Equal(t, 12, e.Data["dns_response_rules"])
 	assert.Equal(t, 200+8+12+6, e.Data["rules_total"])
+}
+
+// TestSummaryCollector_RecordConfigStats_AggregatesChildDurations verifies
+// that config child-stage durations and the four count fields produced by
+// stats-aware config loading flow into the rules_load_summary event.
+//
+// Spec AC-08: every lifecycle summary must contain all six duration fields,
+// config_unattributed_ms, and all four count fields.
+func TestSummaryCollector_RecordConfigStats_AggregatesChildDurations(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleReload)
+
+	stats := config.LoadStats{
+		ReadFilesDuration:     12 * time.Millisecond,
+		ParseDuration:         12840 * time.Millisecond,
+		IncludeExpandDuration: 18 * time.Millisecond,
+		MergeDuration:         45 * time.Millisecond,
+		DecodeDuration:        190 * time.Millisecond,
+		PatchDuration:         75 * time.Millisecond,
+		IncludedFiles:         14,
+		ConfigBytes:           482301,
+		ParsedSections:        51,
+		RawRoutingRules:       2067,
+	}
+	c.RecordConfigStats(stats)
+	c.RecordConfigLoad(13215 * time.Millisecond)
+	c.Emit()
+
+	e := findEvent(hook.entries, rulesload.EventSummary)
+	if e == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(12), e.Data["config_read_files_ms"])
+	assert.Equal(t, int64(12840), e.Data["config_parse_ms"])
+	assert.Equal(t, int64(18), e.Data["config_include_expand_ms"])
+	assert.Equal(t, int64(45), e.Data["config_merge_ms"])
+	assert.Equal(t, int64(190), e.Data["config_decode_ms"])
+	assert.Equal(t, int64(75), e.Data["config_patch_ms"])
+	// Spec AC-09: config_unattributed_ms = max(0, config_load_ms - sum).
+	// config_load_ms = 13215, sum = 12 + 12840 + 18 + 45 + 190 + 75 = 13180.
+	// Expected: 13215 - 13180 = 35.
+	assert.Equal(t, int64(35), e.Data["config_unattributed_ms"])
+	assert.Equal(t, 14, e.Data["included_files"])
+	assert.Equal(t, int64(482301), e.Data["config_bytes"])
+	assert.Equal(t, 51, e.Data["parsed_sections"])
+	assert.Equal(t, 2067, e.Data["raw_routing_rules"])
+}
+
+// TestSummaryCollector_ConfigUnattributedMs_NeverNegative verifies AC-09's
+// clamping behaviour: if the child stages happen to sum higher than the
+// outer config_load_ms (clock skew, rounding), the unattributed field stays
+// at 0 rather than going negative.
+func TestSummaryCollector_ConfigUnattributedMs_NeverNegative(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	c.RecordConfigStats(config.LoadStats{
+		ParseDuration: 1000 * time.Millisecond,
+	})
+	c.RecordConfigLoad(500 * time.Millisecond) // smaller than child sum
+	c.Emit()
+
+	e := findEvent(hook.entries, rulesload.EventSummary)
+	if e == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(0), e.Data["config_unattributed_ms"])
+}
+
+// TestSummaryCollector_EmitConfigStages_EmitsOnePerCompletedStage verifies
+// that a successful config load produces exactly one rules_load_stage event
+// per completed child stage, each carrying the four config count fields.
+//
+// Spec AC-05: successful startup/reload must emit one event per completed
+// child stage.
+func TestSummaryCollector_EmitConfigStages_EmitsOnePerCompletedStage(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	stats := config.LoadStats{
+		ReadFilesDuration:     12 * time.Millisecond,
+		ParseDuration:         12840 * time.Millisecond,
+		IncludeExpandDuration: 18 * time.Millisecond,
+		MergeDuration:         45 * time.Millisecond,
+		DecodeDuration:        190 * time.Millisecond,
+		PatchDuration:         75 * time.Millisecond,
+		IncludedFiles:         14,
+		ConfigBytes:           482301,
+		ParsedSections:        51,
+		RawRoutingRules:       2067,
+	}
+	c.RecordConfigStats(stats)
+	c.EmitConfigStages(stats)
+
+	wantStages := map[string]int64{
+		rulesload.StageConfigReadFiles:     12,
+		rulesload.StageConfigParse:         12840,
+		rulesload.StageConfigIncludeExpand: 18,
+		rulesload.StageConfigMerge:         45,
+		rulesload.StageConfigDecode:        190,
+		rulesload.StageConfigPatch:         75,
+	}
+	seen := map[string]*logrus.Entry{}
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; !ok || v != rulesload.EventStage {
+			continue
+		}
+		stage, _ := e.Data["stage"].(string)
+		seen[stage] = e
+	}
+	for stage, dur := range wantStages {
+		got, ok := seen[stage]
+		if !ok {
+			t.Fatalf("expected a stage event for %q", stage)
+		}
+		assert.Equal(t, dur, got.Data["duration_ms"], "stage %s duration", stage)
+		assert.Equal(t, "ok", got.Data["result"], "stage %s result", stage)
+		assert.Equal(t, rulesload.Lifecycle("startup"), got.Data["lifecycle"], "stage %s lifecycle", stage)
+		// Spec: count fields appear on every event.
+		assert.Equal(t, 14, got.Data["included_files"], "stage %s included_files", stage)
+		assert.Equal(t, int64(482301), got.Data["config_bytes"], "stage %s config_bytes", stage)
+		assert.Equal(t, 51, got.Data["parsed_sections"], "stage %s parsed_sections", stage)
+		assert.Equal(t, 2067, got.Data["raw_routing_rules"], "stage %s raw_routing_rules", stage)
+	}
+}
+
+// TestSummaryCollector_EmitConfigStages_FailureAttribution verifies AC-07:
+// a failed config load produces a result=error event for the failing child
+// stage (with error_class) and never emits the stages that didn't run.
+func TestSummaryCollector_EmitConfigStages_FailureAttribution(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleReload)
+
+	stats := config.LoadStats{
+		ReadFilesDuration: 8 * time.Millisecond,
+		ParseDuration:     3 * time.Millisecond,
+		FailedStage:       config.StageConfigParse,
+		IncludedFiles:     1,
+		ConfigBytes:       128,
+	}
+	c.RecordConfigStats(stats)
+	c.EmitConfigStages(stats)
+
+	events := map[string]*logrus.Entry{}
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; !ok || v != rulesload.EventStage {
+			continue
+		}
+		stage, _ := e.Data["stage"].(string)
+		events[stage] = e
+	}
+
+	// config_read_files completed normally with a non-zero duration.
+	read, ok := events[rulesload.StageConfigReadFiles]
+	if !ok {
+		t.Fatalf("expected stage event for %q", rulesload.StageConfigReadFiles)
+	}
+	assert.Equal(t, "ok", read.Data["result"])
+
+	// config_parse is the failing stage; result=error, error_class is set.
+	parse, ok := events[rulesload.StageConfigParse]
+	if !ok {
+		t.Fatalf("expected failing stage event for %q", rulesload.StageConfigParse)
+	}
+	assert.Equal(t, "error", parse.Data["result"])
+	assert.Equal(t, "config_parse_error", parse.Data["error_class"])
+
+	// Later stages with zero duration must not produce events.
+	for _, stage := range []string{
+		rulesload.StageConfigIncludeExpand,
+		rulesload.StageConfigMerge,
+		rulesload.StageConfigDecode,
+		rulesload.StageConfigPatch,
+	} {
+		_, present := events[stage]
+		assert.False(t, present, "expected no event for skipped stage %q", stage)
+	}
+}
+
+// TestReadConfigWithStats_EndToEnd exercises the full
+// readConfigWithStats() path against a real on-disk config file and
+// verifies that the combined LoadStats has reasonable values for the
+// stages that actually ran.
+//
+// This is the end-to-end glue between MergeWithStats / NewWithStats and the
+// cmd-layer collector.
+func TestReadConfigWithStats_EndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	entry := dir + "/config.dae"
+	body := `global {}
+routing {
+  fallback: direct
+  ip(8.8.8.8) -> direct
+}
+dns {
+  upstream {
+    cn: "udp://223.5.5.5:53"
+  }
+  routing {
+    request {
+      fallback: cn
+    }
+    response {
+      fallback: accept
+    }
+  }
+}
+`
+	if err := writeConfigForTest(entry, body); err != nil {
+		t.Fatal(err)
+	}
+
+	conf, includes, stats, err := readConfigWithStats(entry)
+	if err != nil {
+		t.Fatalf("readConfigWithStats: %v", err)
+	}
+	assert.NotNil(t, conf)
+	assert.Equal(t, []string{entry}, includes)
+	assert.Equal(t, 1, stats.IncludedFiles)
+	assert.Equal(t, int64(len(body)), stats.ConfigBytes)
+	assert.GreaterOrEqual(t, stats.ParsedSections, 3)
+	// fallback + the explicit ip(...) rule.
+	assert.GreaterOrEqual(t, stats.RawRoutingRules, 1)
+	assert.GreaterOrEqual(t, int64(stats.ReadFilesDuration), int64(0))
+	assert.GreaterOrEqual(t, int64(stats.ParseDuration), int64(0))
+	assert.GreaterOrEqual(t, int64(stats.DecodeDuration), int64(0))
+	assert.GreaterOrEqual(t, int64(stats.PatchDuration), int64(0))
+	assert.Empty(t, stats.FailedStage)
+
+	// Avoid unused-variable warning from config_parser import in case the
+	// test is the only consumer.
+	_ = config_parser.Section{}
 }

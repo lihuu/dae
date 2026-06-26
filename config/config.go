@@ -216,6 +216,23 @@ func sectionHasParam(section *config_parser.Section, key string) bool {
 
 // New params from sections. This func assumes merging (section "include") and deduplication for section names has been executed.
 func New(sections []*config_parser.Section) (conf *Config, err error) {
+	conf, _, err = NewWithStats(sections)
+	return conf, err
+}
+
+// NewWithStats is the stats-aware variant of New. The returned LoadStats
+// reports config_decode and config_patch durations, plus raw_routing_rules
+// from the final merged routing section. ReadFilesDuration / ParseDuration /
+// IncludeExpandDuration / MergeDuration / IncludedFiles / ConfigBytes /
+// ParsedSections all stay zero — they belong to MergeWithStats and must be
+// combined by the caller via LoadStats.Add when assembling a full config-load
+// timeline.
+//
+// On failure LoadStats is still returned with the partially-accumulated
+// durations and the failing stage in FailedStage; the original error
+// preserves the existing wrapping behaviour.
+func NewWithStats(sections []*config_parser.Section) (conf *Config, stats LoadStats, err error) {
+	decodeStart := time.Now()
 	// Set up name to section for further use.
 	type Section struct {
 		Val    *config_parser.Section
@@ -230,7 +247,9 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 	for _, spec := range configSectionSpecs {
 		if spec.required {
 			if _, ok := nameToSection[spec.name]; !ok {
-				return nil, fmt.Errorf("section %v is required but not provided", spec.name)
+				stats.DecodeDuration = time.Since(decodeStart)
+				stats.FailedStage = StageConfigDecode
+				return nil, stats, fmt.Errorf("section %v is required but not provided", spec.name)
 			}
 		}
 	}
@@ -241,7 +260,9 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 			continue
 		}
 		if err := decodeConfigSection(conf, spec.name, section.Val); err != nil {
-			return nil, fmt.Errorf("failed to parse \"%v\": %w", spec.name, err)
+			stats.DecodeDuration = time.Since(decodeStart)
+			stats.FailedStage = StageConfigDecode
+			return nil, stats, fmt.Errorf("failed to parse \"%v\": %w", spec.name, err)
 		}
 		section.Parsed = true
 	}
@@ -252,15 +273,23 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 			continue
 		}
 		if !section.Parsed {
-			return nil, fmt.Errorf("unknown section: %v", name)
+			stats.DecodeDuration = time.Since(decodeStart)
+			stats.FailedStage = StageConfigDecode
+			return nil, stats, fmt.Errorf("unknown section: %v", name)
 		}
 	}
+	stats.DecodeDuration = time.Since(decodeStart)
 
 	// Apply config patches.
+	patchStart := time.Now()
 	for _, patch := range patches {
 		if err = patch(conf); err != nil {
-			return nil, err
+			stats.PatchDuration = time.Since(patchStart)
+			stats.FailedStage = StageConfigPatch
+			return nil, stats, err
 		}
 	}
-	return conf, nil
+	stats.PatchDuration = time.Since(patchStart)
+	stats.RawRoutingRules = len(conf.Routing.Rules)
+	return conf, stats, nil
 }

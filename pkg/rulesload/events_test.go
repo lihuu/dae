@@ -119,9 +119,9 @@ func TestEmitSummary_WithError(t *testing.T) {
 	log.AddHook(hook)
 
 	EmitSummary(log, Summary{
-		Lifecycle:   LifecycleValidate,
-		ErrorClass:  "config_parse_error",
-		TotalMs:     500,
+		Lifecycle:    LifecycleValidate,
+		ErrorClass:   "config_parse_error",
+		TotalMs:      500,
 		ConfigLoadMs: 500,
 	})
 
@@ -186,4 +186,150 @@ func TestEmitStage_DurationGranularity(t *testing.T) {
 
 	EmitStage(log, LifecycleStartup, StageReadConfig, 123456789, 0, 0, "")
 	assert.Equal(t, int64(123456789), hook.entries[1].Data["duration_ms"])
+}
+
+// TestEmitConfigStage_HasConfigCountFields verifies that a config-load child
+// stage event carries all four count fields independent of duration, and
+// that result=ok is set when errorClass is empty.
+//
+// Spec: each config child-stage event must be independently useful, so the
+// count fields appear on every event (never omitted) and missing values are
+// reported as 0.
+func TestEmitConfigStage_HasConfigCountFields(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitConfigStage(log, LifecycleStartup, StageConfigParse, 12840, ConfigLoadFields{
+		IncludedFiles:   14,
+		ConfigBytes:     482301,
+		ParsedSections:  51,
+		RawRoutingRules: 2067,
+	}, "")
+
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(hook.entries))
+	}
+	e := hook.entries[0]
+	assert.Equal(t, "rules_load_stage", e.Data["event"])
+	assert.Equal(t, "config_parse", e.Data["stage"])
+	assert.Equal(t, int64(12840), e.Data["duration_ms"])
+	assert.Equal(t, "ok", e.Data["result"])
+	assert.Equal(t, 14, e.Data["included_files"])
+	assert.Equal(t, int64(482301), e.Data["config_bytes"])
+	assert.Equal(t, 51, e.Data["parsed_sections"])
+	assert.Equal(t, 2067, e.Data["raw_routing_rules"])
+}
+
+// TestEmitConfigStage_ZeroCountsStillEmitted enforces the spec rule that
+// unknown counts are reported as 0, not omitted.
+func TestEmitConfigStage_ZeroCountsStillEmitted(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitConfigStage(log, LifecycleReload, StageConfigIncludeExpand, 18, ConfigLoadFields{}, "")
+
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(hook.entries))
+	}
+	e := hook.entries[0]
+	assert.Equal(t, 0, e.Data["included_files"])
+	assert.Equal(t, int64(0), e.Data["config_bytes"])
+	assert.Equal(t, 0, e.Data["parsed_sections"])
+	assert.Equal(t, 0, e.Data["raw_routing_rules"])
+}
+
+// TestEmitConfigStage_ErrorClassMarksResultError verifies that the error
+// path lands result=error and the error_class token, alongside the count
+// context for the stage that failed.
+func TestEmitConfigStage_ErrorClassMarksResultError(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitConfigStage(log, LifecycleValidate, StageConfigParse, 8, ConfigLoadFields{
+		IncludedFiles: 1,
+		ConfigBytes:   42,
+	}, "config_parse_error")
+
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(hook.entries))
+	}
+	e := hook.entries[0]
+	assert.Equal(t, "error", e.Data["result"])
+	assert.Equal(t, "config_parse_error", e.Data["error_class"])
+	assert.Equal(t, 1, e.Data["included_files"])
+}
+
+// TestEmitConfigStage_AllConfigChildStageNames sanity-checks that every
+// config-load stage constant produces a parseable event.
+func TestEmitConfigStage_AllConfigChildStageNames(t *testing.T) {
+	stages := []string{
+		StageConfigReadFiles,
+		StageConfigParse,
+		StageConfigIncludeExpand,
+		StageConfigMerge,
+		StageConfigDecode,
+		StageConfigPatch,
+	}
+	for _, stage := range stages {
+		log := logrus.New()
+		log.SetLevel(logrus.InfoLevel)
+		hook := &captureLogHook{}
+		log.AddHook(hook)
+
+		EmitConfigStage(log, LifecycleStartup, stage, 1, ConfigLoadFields{}, "")
+		if len(hook.entries) != 1 {
+			t.Fatalf("expected 1 entry for stage %q", stage)
+		}
+		assert.Equal(t, stage, hook.entries[0].Data["stage"])
+	}
+}
+
+// TestEmitSummary_HasConfigBreakdownFields verifies that every config child
+// stage duration, the unattributed total, and the four config counts appear
+// in the summary event.
+func TestEmitSummary_HasConfigBreakdownFields(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitSummary(log, Summary{
+		Lifecycle:             LifecycleReload,
+		TotalMs:               16714,
+		ConfigLoadMs:          13215,
+		ConfigReadFilesMs:     12,
+		ConfigParseMs:         12840,
+		ConfigIncludeExpandMs: 18,
+		ConfigMergeMs:         45,
+		ConfigDecodeMs:        190,
+		ConfigPatchMs:         75,
+		ConfigUnattributedMs:  35,
+		IncludedFiles:         14,
+		ConfigBytes:           482301,
+		ParsedSections:        51,
+		RawRoutingRules:       2067,
+	})
+
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(hook.entries))
+	}
+	e := hook.entries[0]
+	assert.Equal(t, int64(13215), e.Data["config_load_ms"])
+	assert.Equal(t, int64(12), e.Data["config_read_files_ms"])
+	assert.Equal(t, int64(12840), e.Data["config_parse_ms"])
+	assert.Equal(t, int64(18), e.Data["config_include_expand_ms"])
+	assert.Equal(t, int64(45), e.Data["config_merge_ms"])
+	assert.Equal(t, int64(190), e.Data["config_decode_ms"])
+	assert.Equal(t, int64(75), e.Data["config_patch_ms"])
+	assert.Equal(t, int64(35), e.Data["config_unattributed_ms"])
+	assert.Equal(t, 14, e.Data["included_files"])
+	assert.Equal(t, int64(482301), e.Data["config_bytes"])
+	assert.Equal(t, 51, e.Data["parsed_sections"])
+	assert.Equal(t, 2067, e.Data["raw_routing_rules"])
 }

@@ -52,10 +52,12 @@ var (
 
 			// Read config from --config cfgFile.
 			configLoadStart := time.Now()
-			conf, _, err := readConfig(cfgFile)
+			conf, _, loadStats, err := readConfigWithStats(cfgFile)
 			if err != nil {
 				if collector != nil {
 					collector.SetError("config_parse_error")
+					collector.RecordConfigStats(loadStats)
+					collector.EmitConfigStages(loadStats)
 					rulesload.EmitStage(stageLog, rulesload.LifecycleValidate, rulesload.StageReadConfig,
 						time.Since(configLoadStart).Milliseconds(), 0, 0, "config_parse_error")
 					collector.Emit()
@@ -65,8 +67,10 @@ var (
 			}
 			if collector != nil {
 				collector.RecordConfigLoad(time.Since(configLoadStart))
+				collector.RecordConfigStats(loadStats)
 				rulesload.EmitStage(stageLog, rulesload.LifecycleValidate, rulesload.StageReadConfig,
 					time.Since(configLoadStart).Milliseconds(), 0, 0, "")
+				collector.EmitConfigStages(loadStats)
 			}
 			// Run the same FakeIP `routing_outbound(...)` expansion that
 			// start/reload runs. Without this, misspelled outbound names,
