@@ -1291,10 +1291,8 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	if err != nil {
 		return nil, err
 	}
-	if lc := collectorLifecycle(collector); lc != "" {
-
-		rulesload.EmitStage(log, lc, rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0, "")
-		// Start timing the startup process
+	if collector != nil {
+		collector.EmitStage(rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0, "")
 	}
 	startTime := time.Now()
 	stageStart := startTime
@@ -1452,7 +1450,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	stageStart = time.Now()
 	controlPlaneBuildStart := time.Now()
 	if prepareOnly {
-		c, err = control.NewPreparedControlPlaneWithContext(
+		c, err = control.NewPreparedControlPlaneWithContextAndDaeDNS(
 			ctx,
 			log,
 			bpf,
@@ -1463,11 +1461,12 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Global,
 			&conf.Dns,
 			externGeoDataDirs,
+			daeDNSRouter,
 			reuseFakeIPStore,
 			collector,
 		)
 	} else {
-		c, err = control.NewControlPlaneWithContext(
+		c, err = control.NewControlPlaneWithContextAndDaeDNS(
 			ctx,
 			log,
 			bpf,
@@ -1478,6 +1477,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Global,
 			&conf.Dns,
 			externGeoDataDirs,
+			daeDNSRouter,
 			reuseFakeIPStore,
 			collector,
 		)

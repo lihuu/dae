@@ -140,6 +140,11 @@ type controlPlaneBuildOptions struct {
 	// file locking). When nil, the constructor opens a fresh store.
 	reuseFakeIPStore *FakeIPStore
 
+	// prebuiltDaeDNS is the daemon DNS router already built by cmd/run.go for
+	// subscription resolution. Reusing it avoids rebuilding the same DNS
+	// routing matcher again inside the control plane constructor.
+	prebuiltDaeDNS *daedns.Router
+
 	// rulesLoadObserver receives routing build stage timing notifications.
 	// Set by the caller when structured observability is desired. When nil,
 	// no stage events are emitted and the existing coarse log lines remain.
@@ -326,6 +331,38 @@ func NewControlPlaneWithContext(
 	reuseFakeIPStore *FakeIPStore,
 	obs rulesload.Observer,
 ) (plane *ControlPlane, err error) {
+	return NewControlPlaneWithContextAndDaeDNS(
+		ctx,
+		log,
+		_bpf,
+		dnsCache,
+		tagToNodeList,
+		groups,
+		routingA,
+		global,
+		dnsConfig,
+		externGeoDataDirs,
+		nil,
+		reuseFakeIPStore,
+		obs,
+	)
+}
+
+func NewControlPlaneWithContextAndDaeDNS(
+	ctx context.Context,
+	log *logrus.Logger,
+	_bpf any,
+	dnsCache map[string]*DnsCache,
+	tagToNodeList map[string][]string,
+	groups []config.Group,
+	routingA *config.Routing,
+	global *config.Global,
+	dnsConfig *config.Dns,
+	externGeoDataDirs []string,
+	prebuiltDaeDNS *daedns.Router,
+	reuseFakeIPStore *FakeIPStore,
+	obs rulesload.Observer,
+) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
 		log,
@@ -339,6 +376,7 @@ func NewControlPlaneWithContext(
 		externGeoDataDirs,
 		controlPlaneBuildOptions{
 			reuseFakeIPStore:  reuseFakeIPStore,
+			prebuiltDaeDNS:    prebuiltDaeDNS,
 			rulesLoadObserver: obs,
 		},
 	)
@@ -360,6 +398,40 @@ func NewPreparedControlPlaneWithContext(
 	reuseFakeIPStore *FakeIPStore,
 	obs rulesload.Observer,
 ) (plane *ControlPlane, err error) {
+	return NewPreparedControlPlaneWithContextAndDaeDNS(
+		ctx,
+		log,
+		_bpf,
+		dnsCache,
+		tagToNodeList,
+		groups,
+		routingA,
+		global,
+		dnsConfig,
+		externGeoDataDirs,
+		nil,
+		reuseFakeIPStore,
+		obs,
+	)
+}
+
+// NewPreparedControlPlaneWithContextAndDaeDNS is the prepared-control-plane
+// variant that reuses the daemon DNS router already built by the caller.
+func NewPreparedControlPlaneWithContextAndDaeDNS(
+	ctx context.Context,
+	log *logrus.Logger,
+	_bpf any,
+	dnsCache map[string]*DnsCache,
+	tagToNodeList map[string][]string,
+	groups []config.Group,
+	routingA *config.Routing,
+	global *config.Global,
+	dnsConfig *config.Dns,
+	externGeoDataDirs []string,
+	prebuiltDaeDNS *daedns.Router,
+	reuseFakeIPStore *FakeIPStore,
+	obs rulesload.Observer,
+) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
 		log,
@@ -375,9 +447,25 @@ func NewPreparedControlPlaneWithContext(
 			delayDatapathCommit:   true,
 			delayDNSListenerStart: true,
 			reuseFakeIPStore:      reuseFakeIPStore,
+			prebuiltDaeDNS:        prebuiltDaeDNS,
 			rulesLoadObserver:     obs,
 		},
 	)
+}
+
+func buildDaeDNSRouterForControlPlane(
+	log *logrus.Logger,
+	global *config.Global,
+	dnsConfig *config.Dns,
+	locationFinder *assets.LocationFinder,
+	buildOpts controlPlaneBuildOptions,
+) (router *daedns.Router, elapsed time.Duration, reused bool, err error) {
+	if buildOpts.prebuiltDaeDNS != nil {
+		return buildOpts.prebuiltDaeDNS, 0, true, nil
+	}
+	start := time.Now()
+	router, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
+	return router, time.Since(start), false, err
 }
 
 func newControlPlaneWithContextOptions(
@@ -598,13 +686,14 @@ func newControlPlaneWithContextOptions(
 	}
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
-	daeDNSStart := time.Now()
-	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
+	var daeDNSBuildElapsed time.Duration
+	var reusedPrebuiltDaeDNS bool
+	option.DaeDNS, daeDNSBuildElapsed, reusedPrebuiltDaeDNS, err = buildDaeDNSRouterForControlPlane(log, global, dnsConfig, locationFinder, buildOpts)
 	if err != nil {
 		return nil, err
 	}
-	if obs := buildOpts.rulesLoadObserver; obs != nil {
-		obs.EmitStage(rulesload.StageDaednsRouterBuild, time.Since(daeDNSStart).Milliseconds(), 0, 0, "")
+	if obs := buildOpts.rulesLoadObserver; obs != nil && !reusedPrebuiltDaeDNS {
+		obs.EmitStage(rulesload.StageDaednsRouterBuild, daeDNSBuildElapsed.Milliseconds(), 0, 0, "")
 	}
 
 	// Dial mode.
