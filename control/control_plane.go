@@ -962,6 +962,7 @@ func newControlPlaneWithContextOptions(
 
 	/// DNS upstream.
 	dnsControllerStart := time.Now()
+	dnsBuildStats := &dns.BuildStats{}
 	dnsUpstream, err := dns.New(dnsConfig, &dns.NewOption{
 		Logger:                  log,
 		LocationFinder:          locationFinder,
@@ -969,6 +970,7 @@ func newControlPlaneWithContextOptions(
 		UpstreamReadyCallback:   plane.dnsUpstreamReadyCallback,
 		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp),
 		UpstreamHostResolver:    upstreamHostResolver,
+		Stats:                   dnsBuildStats,
 	})
 	if err != nil {
 		return nil, err
@@ -980,6 +982,7 @@ func newControlPlaneWithContextOptions(
 	}
 	if obs := buildOpts.rulesLoadObserver; obs != nil {
 		obs.EmitStage(rulesload.StageDnsControllerBuild, time.Since(dnsControllerStart).Milliseconds(), 0, 0, "")
+		emitDnsControllerChildStages(obs, dnsBuildStats)
 	}
 	plane.dnsRouting = dnsUpstream
 	plane.dnsFixedDomainTtl = fixedDomainTtl
@@ -4177,4 +4180,29 @@ func (c *ControlPlane) StartPreparedDNSListener() error {
 		return nil
 	}
 	return c.startPreparedDNSListener(c.ctx, c.log, &c.deferFuncs, c.stopOwnedDNSListener)
+}
+
+// emitDnsControllerChildStages publishes one rules_load_stage event per
+// non-zero substage of dns_controller_build using the supplied observer. The
+// SummaryCollector behind the observer accumulates the durations into its
+// snapshot via the same recordStageLocked path used by the parent
+// dns_controller_build stage. Zero-duration substages are skipped so a future
+// optimization that elides a substage doesn't fabricate a misleading event.
+func emitDnsControllerChildStages(obs rulesload.Observer, stats *dns.BuildStats) {
+	if stats == nil {
+		return
+	}
+	emit := func(stage string, dur time.Duration) {
+		if dur == 0 {
+			return
+		}
+		obs.EmitStage(stage, dur.Milliseconds(), 0, 0, "")
+	}
+	emit(rulesload.StageDnsUpstreamInit, stats.UpstreamInit)
+	emit(rulesload.StageDnsRequestProgramNormalize, stats.RequestProgramNormalize)
+	emit(rulesload.StageDnsRequestMatcherLower, stats.RequestMatcherLower)
+	emit(rulesload.StageDnsRequestMatcherCompile, stats.RequestMatcherCompile)
+	emit(rulesload.StageDnsResponseProgramNormalize, stats.ResponseProgramNormalize)
+	emit(rulesload.StageDnsResponseMatcherLower, stats.ResponseMatcherLower)
+	emit(rulesload.StageDnsResponseMatcherCompile, stats.ResponseMatcherCompile)
 }

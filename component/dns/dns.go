@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
@@ -41,12 +42,55 @@ type NewOption struct {
 	UpstreamReadyCallback   func(dnsUpstream *Upstream) (err error)
 	UpstreamResolverNetwork string
 	UpstreamHostResolver    func(ctx context.Context, host string, network string) (*netutils.Ip46, error, error)
+	// Stats, when non-nil, receives per-substage construction durations from
+	// New. The seven fields decompose dns_controller_build into the substages
+	// observed inside dns.New so an operator can attribute startup time inside
+	// the otherwise-opaque dns_controller_build stage.
+	Stats *BuildStats
+}
+
+// BuildStats captures per-substage durations from New. The sum of the seven
+// fields is expected to be ≈ the parent dns_controller_build_ms; any gap
+// surfaces as dns_controller_unattributed_ms in the rules_load summary.
+type BuildStats struct {
+	// UpstreamInit covers the upstream URL-parse loop at the top of New.
+	UpstreamInit time.Duration
+	// RequestProgramNormalize covers NewNormalizedRequestRoutingProgram (the
+	// DatReaderOptimizer geosite/geoip expansion for DNS request rules).
+	RequestProgramNormalize time.Duration
+	// RequestMatcherLower covers NewRequestMatcherBuilderFromProgram (program
+	// → simulatedDomainSet + rule list; cheap glue).
+	RequestMatcherLower time.Duration
+	// RequestMatcherCompile covers RequestMatcherBuilder.Build (the heavy AC
+	// slimtrie compile over DNS request rules).
+	RequestMatcherCompile time.Duration
+	// ResponseProgramNormalize covers routing.NewNormalizedProgram for the
+	// response routing program.
+	ResponseProgramNormalize time.Duration
+	// ResponseMatcherLower covers NewResponseMatcherBuilderFromProgram.
+	ResponseMatcherLower time.Duration
+	// ResponseMatcherCompile covers ResponseMatcherBuilder.Build (AC slimtrie
+	// compile over DNS response rules + IpSet aggregation).
+	ResponseMatcherCompile time.Duration
 }
 
 func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	s = &Dns{
 		log: opt.Logger,
 	}
+
+	var stats *BuildStats
+	if opt != nil {
+		stats = opt.Stats
+	}
+	stamp := func(field func(*BuildStats) *time.Duration, start time.Time) {
+		if stats == nil {
+			return
+		}
+		*field(stats) = time.Since(start)
+	}
+
+	upstreamStart := time.Now()
 	s.upstream2Index.Store((*Upstream)(nil), int(consts.DnsRequestOutboundIndex_AsIs))
 	// Parse upstream.
 	upstreamName2Id := map[string]uint8{}
@@ -86,7 +130,10 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		s.upstream = append(s.upstream, r)
 	}
 	s.nameToIndex = upstreamName2Id
+	stamp(func(s *BuildStats) *time.Duration { return &s.UpstreamInit }, upstreamStart)
+
 	datReaderOptimizer := datReaderOptimizerForDNS(opt)
+	reqProgStart := time.Now()
 	requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
 		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
@@ -95,7 +142,9 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestProgramNormalize }, reqProgStart)
 
+	respProgStart := time.Now()
 	responseProgram, err := routing.NewNormalizedProgram(dns.Routing.Response.Rules, dns.Routing.Response.Fallback,
 		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
@@ -104,24 +153,36 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseProgramNormalize }, respProgStart)
+
 	// Parse request routing.
+	reqLowerStart := time.Now()
 	reqMatcherBuilder, err := NewRequestMatcherBuilderFromProgram(opt.Logger, requestProgram, upstreamName2Id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, reqLowerStart)
+	reqCompileStart := time.Now()
 	s.reqMatcher, err = reqMatcherBuilder.Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherCompile }, reqCompileStart)
+
 	// Parse response routing.
+	respLowerStart := time.Now()
 	respMatcherBuilder, err := NewResponseMatcherBuilderFromProgram(opt.Logger, responseProgram, upstreamName2Id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseMatcherLower }, respLowerStart)
+	respCompileStart := time.Now()
 	s.respMatcher, err = respMatcherBuilder.Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseMatcherCompile }, respCompileStart)
+
 	if len(dns.Upstream) == 0 {
 		// Immediately ready.
 		go func() { _ = opt.UpstreamReadyCallback(nil) }()

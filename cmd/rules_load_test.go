@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/daedns"
+	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/rulesload"
@@ -764,4 +765,135 @@ func TestSummaryCollector_DaednsRouterUnattributedMs_NeverNegative(t *testing.T)
 		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
 	}
 	assert.Equal(t, int64(0), summary.Data["daedns_router_unattributed_ms"])
+}
+
+// TestSummaryCollector_EmitDaednsRouterStages_EmitsRequestMatcherSubFields
+// verifies the two daedns_request_matcher_build sub-substages emit their own
+// rules_load_stage events and land in the summary alongside the parent.
+func TestSummaryCollector_EmitDaednsRouterStages_EmitsRequestMatcherSubFields(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	c.EmitStage(rulesload.StageDaednsRouterBuild, 540, 0, 0, "")
+	c.EmitDaednsRouterStages(daedns.BuildStats{
+		RequestProgramNormalize: 0,
+		UpstreamInit:            0,
+		RequestMatcherBuild:     534 * time.Millisecond,
+		RequestMatcherLower:     6 * time.Millisecond,
+		RequestMatcherCompile:   528 * time.Millisecond,
+		MatchersCompile:         0,
+	})
+	c.Emit()
+
+	wantStages := map[string]int64{
+		rulesload.StageDaednsRequestMatcherBuild:   534,
+		rulesload.StageDaednsRequestMatcherLower:   6,
+		rulesload.StageDaednsRequestMatcherCompile: 528,
+	}
+	seen := map[string]*logrus.Entry{}
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; !ok || v != rulesload.EventStage {
+			continue
+		}
+		stage, _ := e.Data["stage"].(string)
+		seen[stage] = e
+	}
+	for stage, dur := range wantStages {
+		got, ok := seen[stage]
+		if !ok {
+			t.Fatalf("expected a stage event for %q", stage)
+		}
+		assert.Equal(t, dur, got.Data["duration_ms"], "stage %s duration", stage)
+	}
+
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(534), summary.Data["daedns_request_matcher_build_ms"])
+	assert.Equal(t, int64(6), summary.Data["daedns_request_matcher_lower_ms"])
+	assert.Equal(t, int64(528), summary.Data["daedns_request_matcher_compile_ms"])
+}
+
+// TestSummaryCollector_EmitDnsControllerStages_EmitsOnePerNonZeroStage
+// verifies the seven dns_controller_build child stages each produce a
+// rules_load_stage event when their BuildStats duration is non-zero, and
+// that the same seven durations accumulate into the rules_load_summary,
+// including dns_controller_unattributed_ms.
+func TestSummaryCollector_EmitDnsControllerStages_EmitsOnePerNonZeroStage(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	c.EmitStage(rulesload.StageDnsControllerBuild, 563, 0, 0, "")
+	c.EmitDnsControllerStages(componentdns.BuildStats{
+		UpstreamInit:             3 * time.Millisecond,
+		RequestProgramNormalize:  10 * time.Millisecond,
+		RequestMatcherLower:      6 * time.Millisecond,
+		RequestMatcherCompile:    520 * time.Millisecond,
+		ResponseProgramNormalize: 8 * time.Millisecond,
+		ResponseMatcherLower:     4 * time.Millisecond,
+		ResponseMatcherCompile:   10 * time.Millisecond,
+	})
+	c.Emit()
+
+	wantStages := map[string]int64{
+		rulesload.StageDnsUpstreamInit:             3,
+		rulesload.StageDnsRequestProgramNormalize:  10,
+		rulesload.StageDnsRequestMatcherLower:      6,
+		rulesload.StageDnsRequestMatcherCompile:    520,
+		rulesload.StageDnsResponseProgramNormalize: 8,
+		rulesload.StageDnsResponseMatcherLower:     4,
+		rulesload.StageDnsResponseMatcherCompile:   10,
+	}
+	seen := map[string]*logrus.Entry{}
+	for _, e := range hook.entries {
+		if v, ok := e.Data["event"]; !ok || v != rulesload.EventStage {
+			continue
+		}
+		stage, _ := e.Data["stage"].(string)
+		seen[stage] = e
+	}
+	for stage, dur := range wantStages {
+		got, ok := seen[stage]
+		if !ok {
+			t.Fatalf("expected a stage event for %q", stage)
+		}
+		assert.Equal(t, dur, got.Data["duration_ms"], "stage %s duration", stage)
+		assert.Equal(t, "ok", got.Data["result"], "stage %s result", stage)
+	}
+
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(563), summary.Data["dns_controller_build_ms"])
+	assert.Equal(t, int64(3), summary.Data["dns_upstream_init_ms"])
+	assert.Equal(t, int64(10), summary.Data["dns_request_program_normalize_ms"])
+	assert.Equal(t, int64(6), summary.Data["dns_request_matcher_lower_ms"])
+	assert.Equal(t, int64(520), summary.Data["dns_request_matcher_compile_ms"])
+	assert.Equal(t, int64(8), summary.Data["dns_response_program_normalize_ms"])
+	assert.Equal(t, int64(4), summary.Data["dns_response_matcher_lower_ms"])
+	assert.Equal(t, int64(10), summary.Data["dns_response_matcher_compile_ms"])
+	// 563 - (3 + 10 + 6 + 520 + 8 + 4 + 10) = 2
+	assert.Equal(t, int64(2), summary.Data["dns_controller_unattributed_ms"])
+}
+
+// TestSummaryCollector_DnsControllerUnattributedMs_NeverNegative verifies
+// the snapshot clamps dns_controller_unattributed_ms at 0 if children sum
+// higher than the parent.
+func TestSummaryCollector_DnsControllerUnattributedMs_NeverNegative(t *testing.T) {
+	log, hook := newCapturingLogger()
+	c := newSummaryCollector(log, rulesload.LifecycleStartup)
+
+	c.EmitStage(rulesload.StageDnsControllerBuild, 10, 0, 0, "")
+	c.EmitDnsControllerStages(componentdns.BuildStats{
+		RequestMatcherCompile: 100 * time.Millisecond, // larger than parent
+	})
+	c.Emit()
+
+	summary := findEvent(hook.entries, rulesload.EventSummary)
+	if summary == nil {
+		t.Fatalf("expected a %q log entry", rulesload.EventSummary)
+	}
+	assert.Equal(t, int64(0), summary.Data["dns_controller_unattributed_ms"])
 }

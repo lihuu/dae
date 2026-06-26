@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/daedns"
+	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/sirupsen/logrus"
@@ -51,6 +52,22 @@ type SummaryCollector struct {
 	daednsUpstreamInit            time.Duration
 	daednsRequestMatcherBuild     time.Duration
 	daednsMatchersCompile         time.Duration
+
+	// daedns_request_matcher_build sub-substages.
+	daednsRequestMatcherLower   time.Duration
+	daednsRequestMatcherCompile time.Duration
+
+	// dns_controller_build child stages — fed from component/dns.BuildStats
+	// via EmitDnsControllerStages. Their sum is expected to be ≈
+	// dnsControllerBuild; any gap becomes dns_controller_unattributed_ms in
+	// the summary snapshot.
+	dnsUpstreamInit             time.Duration
+	dnsRequestProgramNormalize  time.Duration
+	dnsRequestMatcherLower      time.Duration
+	dnsRequestMatcherCompile    time.Duration
+	dnsResponseProgramNormalize time.Duration
+	dnsResponseMatcherLower     time.Duration
+	dnsResponseMatcherCompile   time.Duration
 
 	// Config-load counters.
 	includedFiles   int
@@ -165,10 +182,10 @@ func (c *SummaryCollector) EmitConfigStages(stats config.LoadStats) {
 }
 
 // EmitDaednsRouterStages records and emits the four daedns_router_build child
-// stages. Like EmitConfigStages, it both accumulates the durations into the
-// summary AND publishes one rules_load_stage event per stage on the
-// collector's logger using the collector's lifecycle. Skipped stages (zero
-// duration) emit nothing.
+// stages plus the two daedns_request_matcher_build sub-substages. Like
+// EmitConfigStages, it both accumulates the durations into the summary AND
+// publishes one rules_load_stage event per non-zero stage on the collector's
+// logger using the collector's lifecycle.
 //
 // MUST be called AFTER the parent StageDaednsRouterBuild has been emitted so
 // operators see the parent stage before its children.
@@ -178,6 +195,8 @@ func (c *SummaryCollector) EmitDaednsRouterStages(stats daedns.BuildStats) {
 	c.daednsUpstreamInit += stats.UpstreamInit
 	c.daednsRequestMatcherBuild += stats.RequestMatcherBuild
 	c.daednsMatchersCompile += stats.MatchersCompile
+	c.daednsRequestMatcherLower += stats.RequestMatcherLower
+	c.daednsRequestMatcherCompile += stats.RequestMatcherCompile
 	log := c.log
 	lifecycle := c.lifecycle
 	c.mu.Unlock()
@@ -191,7 +210,43 @@ func (c *SummaryCollector) EmitDaednsRouterStages(stats daedns.BuildStats) {
 	emit(rulesload.StageDaednsRequestProgramNormalize, stats.RequestProgramNormalize)
 	emit(rulesload.StageDaednsUpstreamInit, stats.UpstreamInit)
 	emit(rulesload.StageDaednsRequestMatcherBuild, stats.RequestMatcherBuild)
+	emit(rulesload.StageDaednsRequestMatcherLower, stats.RequestMatcherLower)
+	emit(rulesload.StageDaednsRequestMatcherCompile, stats.RequestMatcherCompile)
 	emit(rulesload.StageDaednsMatchersCompile, stats.MatchersCompile)
+}
+
+// EmitDnsControllerStages records and emits the seven dns_controller_build
+// child stages. It both accumulates the durations into the summary AND
+// publishes one rules_load_stage event per non-zero stage on the collector's
+// logger using the collector's lifecycle.
+//
+// MUST be called AFTER the parent StageDnsControllerBuild has been emitted.
+func (c *SummaryCollector) EmitDnsControllerStages(stats componentdns.BuildStats) {
+	c.mu.Lock()
+	c.dnsUpstreamInit += stats.UpstreamInit
+	c.dnsRequestProgramNormalize += stats.RequestProgramNormalize
+	c.dnsRequestMatcherLower += stats.RequestMatcherLower
+	c.dnsRequestMatcherCompile += stats.RequestMatcherCompile
+	c.dnsResponseProgramNormalize += stats.ResponseProgramNormalize
+	c.dnsResponseMatcherLower += stats.ResponseMatcherLower
+	c.dnsResponseMatcherCompile += stats.ResponseMatcherCompile
+	log := c.log
+	lifecycle := c.lifecycle
+	c.mu.Unlock()
+
+	emit := func(stage string, dur time.Duration) {
+		if dur == 0 {
+			return
+		}
+		rulesload.EmitStage(log, lifecycle, stage, dur.Milliseconds(), 0, 0, "")
+	}
+	emit(rulesload.StageDnsUpstreamInit, stats.UpstreamInit)
+	emit(rulesload.StageDnsRequestProgramNormalize, stats.RequestProgramNormalize)
+	emit(rulesload.StageDnsRequestMatcherLower, stats.RequestMatcherLower)
+	emit(rulesload.StageDnsRequestMatcherCompile, stats.RequestMatcherCompile)
+	emit(rulesload.StageDnsResponseProgramNormalize, stats.ResponseProgramNormalize)
+	emit(rulesload.StageDnsResponseMatcherLower, stats.ResponseMatcherLower)
+	emit(rulesload.StageDnsResponseMatcherCompile, stats.ResponseMatcherCompile)
 }
 
 // RecordStage implements rulesload.Observer by accumulating per-stage durations.
@@ -251,6 +306,24 @@ func (c *SummaryCollector) recordStageLocked(stage string, durationMs int64, rul
 		c.daednsRequestMatcherBuild = d
 	case rulesload.StageDaednsMatchersCompile:
 		c.daednsMatchersCompile = d
+	case rulesload.StageDaednsRequestMatcherLower:
+		c.daednsRequestMatcherLower = d
+	case rulesload.StageDaednsRequestMatcherCompile:
+		c.daednsRequestMatcherCompile = d
+	case rulesload.StageDnsUpstreamInit:
+		c.dnsUpstreamInit = d
+	case rulesload.StageDnsRequestProgramNormalize:
+		c.dnsRequestProgramNormalize = d
+	case rulesload.StageDnsRequestMatcherLower:
+		c.dnsRequestMatcherLower = d
+	case rulesload.StageDnsRequestMatcherCompile:
+		c.dnsRequestMatcherCompile = d
+	case rulesload.StageDnsResponseProgramNormalize:
+		c.dnsResponseProgramNormalize = d
+	case rulesload.StageDnsResponseMatcherLower:
+		c.dnsResponseMatcherLower = d
+	case rulesload.StageDnsResponseMatcherCompile:
+		c.dnsResponseMatcherCompile = d
 	}
 }
 
@@ -315,13 +388,32 @@ func (c *SummaryCollector) buildSnapshot() rulesload.Summary {
 		daednsRouterUnattributedMs = 0
 	}
 
+	daednsReqMatcherLowerMs := c.daednsRequestMatcherLower.Milliseconds()
+	daednsReqMatcherCompileMs := c.daednsRequestMatcherCompile.Milliseconds()
+
+	dnsControllerBuildMs := c.dnsControllerBuild.Milliseconds()
+	dnsUpstreamInitMs := c.dnsUpstreamInit.Milliseconds()
+	dnsReqProgMs := c.dnsRequestProgramNormalize.Milliseconds()
+	dnsReqMatcherLowerMs := c.dnsRequestMatcherLower.Milliseconds()
+	dnsReqMatcherCompileMs := c.dnsRequestMatcherCompile.Milliseconds()
+	dnsRespProgMs := c.dnsResponseProgramNormalize.Milliseconds()
+	dnsRespMatcherLowerMs := c.dnsResponseMatcherLower.Milliseconds()
+	dnsRespMatcherCompileMs := c.dnsResponseMatcherCompile.Milliseconds()
+	dnsChildSum := dnsUpstreamInitMs + dnsReqProgMs + dnsReqMatcherLowerMs +
+		dnsReqMatcherCompileMs + dnsRespProgMs + dnsRespMatcherLowerMs +
+		dnsRespMatcherCompileMs
+	dnsControllerUnattributedMs := dnsControllerBuildMs - dnsChildSum
+	if dnsControllerUnattributedMs < 0 {
+		dnsControllerUnattributedMs = 0
+	}
+
 	return rulesload.Summary{
 		Lifecycle:                       c.lifecycle,
 		TotalMs:                         total.Milliseconds(),
 		ConfigLoadMs:                    configLoadMs,
 		FakeIPAutoExpandMs:              c.fakeipAutoExpand.Milliseconds(),
 		DaednsRouterBuildMs:             daednsRouterBuildMs,
-		DnsControllerBuildMs:            c.dnsControllerBuild.Milliseconds(),
+		DnsControllerBuildMs:            dnsControllerBuildMs,
 		MainRoutingOptimizeMs:           c.mainRoutingOptimize.Milliseconds(),
 		MainRoutingMatcherMs:            c.mainRoutingMatcher.Milliseconds(),
 		ControlPlaneBuildMs:             c.controlPlaneBuild.Milliseconds(),
@@ -339,6 +431,16 @@ func (c *SummaryCollector) buildSnapshot() rulesload.Summary {
 		DaednsRequestMatcherBuildMs:     daednsReqMatcherMs,
 		DaednsMatchersCompileMs:         daednsMatchersMs,
 		DaednsRouterUnattributedMs:      daednsRouterUnattributedMs,
+		DaednsRequestMatcherLowerMs:     daednsReqMatcherLowerMs,
+		DaednsRequestMatcherCompileMs:   daednsReqMatcherCompileMs,
+		DnsUpstreamInitMs:               dnsUpstreamInitMs,
+		DnsRequestProgramNormalizeMs:    dnsReqProgMs,
+		DnsRequestMatcherLowerMs:        dnsReqMatcherLowerMs,
+		DnsRequestMatcherCompileMs:      dnsReqMatcherCompileMs,
+		DnsResponseProgramNormalizeMs:   dnsRespProgMs,
+		DnsResponseMatcherLowerMs:       dnsRespMatcherLowerMs,
+		DnsResponseMatcherCompileMs:     dnsRespMatcherCompileMs,
+		DnsControllerUnattributedMs:     dnsControllerUnattributedMs,
 		IncludedFiles:                   c.includedFiles,
 		ConfigBytes:                     c.configBytes,
 		ParsedSections:                  c.parsedSections,

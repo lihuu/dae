@@ -45,6 +45,23 @@ const (
 	StageDaednsUpstreamInit            = "daedns_upstream_init"
 	StageDaednsRequestMatcherBuild     = "daedns_request_matcher_build"
 	StageDaednsMatchersCompile         = "daedns_matchers_compile"
+
+	// daedns_request_matcher_build sub-substages — split the AC slimtrie
+	// compile inside Build from the cheap lower step that precedes it.
+	StageDaednsRequestMatcherLower   = "daedns_request_matcher_lower"
+	StageDaednsRequestMatcherCompile = "daedns_request_matcher_compile"
+
+	// dns_controller_build child stages — decompose the dns_controller_build
+	// parent stage (component/dns.New called from control_plane.go) into the
+	// seven substages observed inside dns.New. Emitted by the control plane
+	// after dns.New returns a populated dns.BuildStats.
+	StageDnsUpstreamInit             = "dns_upstream_init"
+	StageDnsRequestProgramNormalize  = "dns_request_program_normalize"
+	StageDnsRequestMatcherLower      = "dns_request_matcher_lower"
+	StageDnsRequestMatcherCompile    = "dns_request_matcher_compile"
+	StageDnsResponseProgramNormalize = "dns_response_program_normalize"
+	StageDnsResponseMatcherLower     = "dns_response_matcher_lower"
+	StageDnsResponseMatcherCompile   = "dns_response_matcher_compile"
 )
 
 const (
@@ -157,6 +174,20 @@ type Summary struct {
 	DaednsMatchersCompileMs         int64
 	DaednsRouterUnattributedMs      int64
 
+	// daedns_request_matcher_build sub-substages.
+	DaednsRequestMatcherLowerMs   int64
+	DaednsRequestMatcherCompileMs int64
+
+	// dns_controller_build child stages.
+	DnsUpstreamInitMs             int64
+	DnsRequestProgramNormalizeMs  int64
+	DnsRequestMatcherLowerMs      int64
+	DnsRequestMatcherCompileMs    int64
+	DnsResponseProgramNormalizeMs int64
+	DnsResponseMatcherLowerMs     int64
+	DnsResponseMatcherCompileMs   int64
+	DnsControllerUnattributedMs   int64
+
 	// Config-load counters.
 	IncludedFiles   int
 	ConfigBytes     int64
@@ -200,6 +231,16 @@ func EmitSummary(log *logrus.Logger, s Summary) {
 		"daedns_request_matcher_build_ms":     s.DaednsRequestMatcherBuildMs,
 		"daedns_matchers_compile_ms":          s.DaednsMatchersCompileMs,
 		"daedns_router_unattributed_ms":       s.DaednsRouterUnattributedMs,
+		"daedns_request_matcher_lower_ms":     s.DaednsRequestMatcherLowerMs,
+		"daedns_request_matcher_compile_ms":   s.DaednsRequestMatcherCompileMs,
+		"dns_upstream_init_ms":                s.DnsUpstreamInitMs,
+		"dns_request_program_normalize_ms":    s.DnsRequestProgramNormalizeMs,
+		"dns_request_matcher_lower_ms":        s.DnsRequestMatcherLowerMs,
+		"dns_request_matcher_compile_ms":      s.DnsRequestMatcherCompileMs,
+		"dns_response_program_normalize_ms":   s.DnsResponseProgramNormalizeMs,
+		"dns_response_matcher_lower_ms":       s.DnsResponseMatcherLowerMs,
+		"dns_response_matcher_compile_ms":     s.DnsResponseMatcherCompileMs,
+		"dns_controller_unattributed_ms":      s.DnsControllerUnattributedMs,
 		"included_files":                s.IncludedFiles,
 		"config_bytes":                  s.ConfigBytes,
 		"parsed_sections":               s.ParsedSections,

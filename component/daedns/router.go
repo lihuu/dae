@@ -92,8 +92,18 @@ type BuildStats struct {
 	// UpstreamInit covers config.BootstrapResolvers and initUpstreams.
 	UpstreamInit time.Duration
 	// RequestMatcherBuild covers NewRequestMatcherBuilderFromProgram and the
-	// subsequent Build call that compiles the DNS request matcher.
+	// subsequent Build call that compiles the DNS request matcher. Its two
+	// substages are reported as RequestMatcherLower (the lower step) and
+	// RequestMatcherCompile (the AC slimtrie compile inside Build).
 	RequestMatcherBuild time.Duration
+	// RequestMatcherLower covers NewRequestMatcherBuilderFromProgram only —
+	// the cheap "lower" step that walks the normalized program into the
+	// builder's simulated domain set + rule list.
+	RequestMatcherLower time.Duration
+	// RequestMatcherCompile covers requestMatcherBuilder.Build only — the
+	// heavy AhocorasickSlimtrie Build that compiles AC automata and slim tries
+	// for full / suffix / keyword / regex domain matching.
+	RequestMatcherCompile time.Duration
 	// MatchersCompile covers compileSubscriptionMatcher, compileNodeMatcher,
 	// and compileSubNodeMatcher.
 	MatchersCompile time.Duration
@@ -198,10 +208,13 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, requestMatcherStart)
+	requestCompileStart := time.Now()
 	router.requestMatcher, err = requestMatcherBuilder.Build()
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherCompile }, requestCompileStart)
 	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherBuild }, requestMatcherStart)
 
 	matchersStart := time.Now()

@@ -164,6 +164,15 @@ func TestEmitStage_AllStageNames(t *testing.T) {
 		StageDaednsUpstreamInit,
 		StageDaednsRequestMatcherBuild,
 		StageDaednsMatchersCompile,
+		StageDaednsRequestMatcherLower,
+		StageDaednsRequestMatcherCompile,
+		StageDnsUpstreamInit,
+		StageDnsRequestProgramNormalize,
+		StageDnsRequestMatcherLower,
+		StageDnsRequestMatcherCompile,
+		StageDnsResponseProgramNormalize,
+		StageDnsResponseMatcherLower,
+		StageDnsResponseMatcherCompile,
 	}
 	for _, stage := range stages {
 		log := logrus.New()
@@ -368,4 +377,63 @@ func TestEmitSummary_HasDaednsRouterBreakdownFields(t *testing.T) {
 	assert.Equal(t, int64(110), e.Data["daedns_request_matcher_build_ms"])
 	assert.Equal(t, int64(25), e.Data["daedns_matchers_compile_ms"])
 	assert.Equal(t, int64(11), e.Data["daedns_router_unattributed_ms"])
+}
+
+// TestEmitSummary_HasDnsControllerBreakdownFields verifies the seven
+// dns_controller_build substage durations plus the unattributed remainder
+// appear in the summary event.
+func TestEmitSummary_HasDnsControllerBreakdownFields(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitSummary(log, Summary{
+		Lifecycle:                     LifecycleStartup,
+		TotalMs:                       2616,
+		DnsControllerBuildMs:          563,
+		DnsUpstreamInitMs:             3,
+		DnsRequestProgramNormalizeMs:  10,
+		DnsRequestMatcherLowerMs:      6,
+		DnsRequestMatcherCompileMs:    520,
+		DnsResponseProgramNormalizeMs: 8,
+		DnsResponseMatcherLowerMs:     4,
+		DnsResponseMatcherCompileMs:   10,
+		DnsControllerUnattributedMs:   2,
+	})
+
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(hook.entries))
+	}
+	e := hook.entries[0]
+	assert.Equal(t, int64(563), e.Data["dns_controller_build_ms"])
+	assert.Equal(t, int64(3), e.Data["dns_upstream_init_ms"])
+	assert.Equal(t, int64(10), e.Data["dns_request_program_normalize_ms"])
+	assert.Equal(t, int64(6), e.Data["dns_request_matcher_lower_ms"])
+	assert.Equal(t, int64(520), e.Data["dns_request_matcher_compile_ms"])
+	assert.Equal(t, int64(8), e.Data["dns_response_program_normalize_ms"])
+	assert.Equal(t, int64(4), e.Data["dns_response_matcher_lower_ms"])
+	assert.Equal(t, int64(10), e.Data["dns_response_matcher_compile_ms"])
+	assert.Equal(t, int64(2), e.Data["dns_controller_unattributed_ms"])
+}
+
+// TestEmitSummary_HasDaednsRequestMatcherSubFields verifies the two
+// daedns_request_matcher_build sub-substages appear in the summary.
+func TestEmitSummary_HasDaednsRequestMatcherSubFields(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	hook := &captureLogHook{}
+	log.AddHook(hook)
+
+	EmitSummary(log, Summary{
+		Lifecycle:                     LifecycleStartup,
+		DaednsRequestMatcherBuildMs:   534,
+		DaednsRequestMatcherLowerMs:   6,
+		DaednsRequestMatcherCompileMs: 528,
+	})
+
+	e := hook.entries[0]
+	assert.Equal(t, int64(534), e.Data["daedns_request_matcher_build_ms"])
+	assert.Equal(t, int64(6), e.Data["daedns_request_matcher_lower_ms"])
+	assert.Equal(t, int64(528), e.Data["daedns_request_matcher_compile_ms"])
 }
