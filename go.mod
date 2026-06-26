@@ -121,3 +121,5 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260428
 
 // Use the pushed perf/complete-optimizations fork head with QUIC window tuning + upstream cherry-picks.
 replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260518034804-52c26f8e759e
+
+replace github.com/daeuniverse/dae-config-dist/go/dae_config => ./third_party/dae_config
