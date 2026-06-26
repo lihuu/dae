@@ -8,6 +8,7 @@ package routing
 import (
 	"fmt"
 	"net/netip"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -168,6 +169,33 @@ type DatReaderOptimizer struct {
 	geoIpCache   map[string][]*config_parser.Param
 }
 
+type datReaderGlobalCacheKey struct {
+	kind        string
+	filePath    string
+	size        int64
+	modTimeNano int64
+	code        string
+}
+
+var (
+	globalDatReaderCacheMu sync.Mutex
+	globalDatReaderCache   = make(map[datReaderGlobalCacheKey][]*config_parser.Param)
+
+	datReaderGetLocationAsset = func(o *DatReaderOptimizer, filename string) (string, error) {
+		locationFinder := assets.NewLocationFinder(nil)
+		if o != nil && o.LocationFinder != nil {
+			locationFinder = o.LocationFinder
+		}
+		var log *logrus.Logger
+		if o != nil {
+			log = o.Logger
+		}
+		return locationFinder.GetLocationAsset(log, filename)
+	}
+	datReaderUnmarshalGeoSite = geodata.UnmarshalGeoSite
+	datReaderUnmarshalGeoIp   = geodata.UnmarshalGeoIp
+)
+
 func cloneParams(params []*config_parser.Param) []*config_parser.Param {
 	if len(params) == 0 {
 		return nil
@@ -175,6 +203,42 @@ func cloneParams(params []*config_parser.Param) []*config_parser.Param {
 	out := make([]*config_parser.Param, len(params))
 	copy(out, params)
 	return out
+}
+
+func datReaderFileCacheKey(kind string, filePath string, code string) (datReaderGlobalCacheKey, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return datReaderGlobalCacheKey{}, err
+	}
+	return datReaderGlobalCacheKey{
+		kind:        kind,
+		filePath:    filePath,
+		size:        info.Size(),
+		modTimeNano: info.ModTime().UnixNano(),
+		code:        strings.ToLower(code),
+	}, nil
+}
+
+func getGlobalDatReaderCache(key datReaderGlobalCacheKey) ([]*config_parser.Param, bool) {
+	globalDatReaderCacheMu.Lock()
+	defer globalDatReaderCacheMu.Unlock()
+	params, ok := globalDatReaderCache[key]
+	if !ok {
+		return nil, false
+	}
+	return cloneParams(params), true
+}
+
+func putGlobalDatReaderCache(key datReaderGlobalCacheKey, params []*config_parser.Param) {
+	globalDatReaderCacheMu.Lock()
+	globalDatReaderCache[key] = cloneParams(params)
+	globalDatReaderCacheMu.Unlock()
+}
+
+func resetGlobalDatReaderCacheForTest() {
+	globalDatReaderCacheMu.Lock()
+	globalDatReaderCache = make(map[datReaderGlobalCacheKey][]*config_parser.Param)
+	globalDatReaderCacheMu.Unlock()
 }
 
 func (o *DatReaderOptimizer) initCacheLocked() {
@@ -200,14 +264,26 @@ func (o *DatReaderOptimizer) loadGeoSite(filename string, code string) (params [
 	}
 	o.mu.Unlock()
 
-	filePath, err := o.LocationFinder.GetLocationAsset(o.Logger, filename)
+	filePath, err := datReaderGetLocationAsset(o, filename)
 	if err != nil {
 		o.Logger.Debugf("Failed to read geosite \"%v:%v\": %v", filename, code, err)
 		return nil, err
 	}
+	globalCacheKey, err := datReaderFileCacheKey("geosite", filePath, code)
+	if err != nil {
+		return nil, err
+	}
+	if cached, ok := getGlobalDatReaderCache(globalCacheKey); ok {
+		o.Logger.Debugf("Use cached geosite \"%v:%v\" from %v", filename, code, filePath)
+		o.mu.Lock()
+		o.initCacheLocked()
+		o.geoSiteCache[cacheKey] = cloneParams(cached)
+		o.mu.Unlock()
+		return cached, nil
+	}
 	o.Logger.Debugf("Read geosite \"%v:%v\" from %v", filename, code, filePath)
 	code, attr, _ := strings.Cut(code, "@")
-	geoSite, err := geodata.UnmarshalGeoSite(o.Logger, filePath, code)
+	geoSite, err := datReaderUnmarshalGeoSite(o.Logger, filePath, code)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +334,7 @@ func (o *DatReaderOptimizer) loadGeoSite(filename string, code string) (params [
 	o.initCacheLocked()
 	o.geoSiteCache[cacheKey] = cloneParams(params)
 	o.mu.Unlock()
+	putGlobalDatReaderCache(globalCacheKey, params)
 
 	return params, nil
 }
@@ -276,13 +353,25 @@ func (o *DatReaderOptimizer) loadGeoIp(filename string, code string) (params []*
 	}
 	o.mu.Unlock()
 
-	filePath, err := o.LocationFinder.GetLocationAsset(o.Logger, filename)
+	filePath, err := datReaderGetLocationAsset(o, filename)
 	if err != nil {
 		o.Logger.Debugf("Failed to read geoip \"%v:%v\": %v", filename, code, err)
 		return nil, err
 	}
+	globalCacheKey, err := datReaderFileCacheKey("geoip", filePath, code)
+	if err != nil {
+		return nil, err
+	}
+	if cached, ok := getGlobalDatReaderCache(globalCacheKey); ok {
+		o.Logger.Debugf("Use cached geoip \"%v:%v\" from %v", filename, code, filePath)
+		o.mu.Lock()
+		o.initCacheLocked()
+		o.geoIpCache[cacheKey] = cloneParams(cached)
+		o.mu.Unlock()
+		return cached, nil
+	}
 	o.Logger.Debugf("Read geoip \"%v:%v\" from %v", filename, code, filePath)
-	geoIp, err := geodata.UnmarshalGeoIp(o.Logger, filePath, code)
+	geoIp, err := datReaderUnmarshalGeoIp(o.Logger, filePath, code)
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +393,7 @@ func (o *DatReaderOptimizer) loadGeoIp(filename string, code string) (params []*
 	o.initCacheLocked()
 	o.geoIpCache[cacheKey] = cloneParams(params)
 	o.mu.Unlock()
+	putGlobalDatReaderCache(globalCacheKey, params)
 
 	return params, nil
 }

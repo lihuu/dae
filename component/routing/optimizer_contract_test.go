@@ -6,10 +6,16 @@
 package routing
 
 import (
+	"net"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/daeuniverse/dae/pkg/geodata"
+	"github.com/sirupsen/logrus"
 )
 
 func TestCloneParamsCopiesSliceButSharesParamObjects(t *testing.T) {
@@ -76,5 +82,112 @@ func TestPostDatReaderOptimizersDoNotMutateCachedParams(t *testing.T) {
 
 	if cached[0].Key != originKey || cached[0].Val != originVal {
 		t.Fatalf("cached param mutated: got %q:%q", cached[0].Key, cached[0].Val)
+	}
+}
+
+func TestDatReaderOptimizerGlobalGeoSiteCacheAcrossInstances(t *testing.T) {
+	resetGlobalDatReaderCacheForTest()
+
+	filePath := filepath.Join(t.TempDir(), "geosite.dat")
+	if err := os.WriteFile(filePath, []byte("fake geosite"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLocationAsset := datReaderGetLocationAsset
+	oldUnmarshalGeoSite := datReaderUnmarshalGeoSite
+	t.Cleanup(func() {
+		datReaderGetLocationAsset = oldLocationAsset
+		datReaderUnmarshalGeoSite = oldUnmarshalGeoSite
+		resetGlobalDatReaderCacheForTest()
+	})
+
+	loads := 0
+	datReaderGetLocationAsset = func(_ *DatReaderOptimizer, _ string) (string, error) {
+		return filePath, nil
+	}
+	datReaderUnmarshalGeoSite = func(_ *logrus.Logger, _ string, code string) (*geodata.GeoSite, error) {
+		loads++
+		if code != "cn" {
+			t.Fatalf("unexpected code %q", code)
+		}
+		return &geodata.GeoSite{
+			Domain: []*geodata.Domain{
+				{Type: geodata.Domain_RootDomain, Value: "example.cn"},
+			},
+		}, nil
+	}
+
+	first := &DatReaderOptimizer{Logger: logrus.New()}
+	firstParams, err := first.loadGeoSite("geosite", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &DatReaderOptimizer{Logger: logrus.New()}
+	secondParams, err := second.loadGeoSite("geosite", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if loads != 1 {
+		t.Fatalf("geosite loads = %d, want 1", loads)
+	}
+	if len(firstParams) != 1 || len(secondParams) != 1 || firstParams[0].Val != secondParams[0].Val {
+		t.Fatalf("unexpected params: first=%v second=%v", firstParams, secondParams)
+	}
+	if len(firstParams) > 0 && len(secondParams) > 0 && &firstParams[0] == &secondParams[0] {
+		t.Fatalf("expected independent slice containers")
+	}
+}
+
+func TestDatReaderOptimizerGlobalGeoIpCacheAcrossInstances(t *testing.T) {
+	resetGlobalDatReaderCacheForTest()
+
+	filePath := filepath.Join(t.TempDir(), "geoip.dat")
+	if err := os.WriteFile(filePath, []byte("fake geoip"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLocationAsset := datReaderGetLocationAsset
+	oldUnmarshalGeoIp := datReaderUnmarshalGeoIp
+	t.Cleanup(func() {
+		datReaderGetLocationAsset = oldLocationAsset
+		datReaderUnmarshalGeoIp = oldUnmarshalGeoIp
+		resetGlobalDatReaderCacheForTest()
+	})
+
+	loads := 0
+	datReaderGetLocationAsset = func(_ *DatReaderOptimizer, _ string) (string, error) {
+		return filePath, nil
+	}
+	datReaderUnmarshalGeoIp = func(_ *logrus.Logger, _ string, code string) (*geodata.GeoIP, error) {
+		loads++
+		if code != "cn" {
+			t.Fatalf("unexpected code %q", code)
+		}
+		ip := net.ParseIP("203.0.113.0").To4()
+		return &geodata.GeoIP{
+			Cidr: []*geodata.CIDR{
+				{Ip: ip, Prefix: 24},
+			},
+		}, nil
+	}
+
+	first := &DatReaderOptimizer{Logger: logrus.New()}
+	firstParams, err := first.loadGeoIp("geoip", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &DatReaderOptimizer{Logger: logrus.New()}
+	secondParams, err := second.loadGeoIp("geoip", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := netip.MustParsePrefix("203.0.113.0/24").String()
+	if loads != 1 {
+		t.Fatalf("geoip loads = %d, want 1", loads)
+	}
+	if len(firstParams) != 1 || len(secondParams) != 1 || firstParams[0].Val != want || secondParams[0].Val != want {
+		t.Fatalf("unexpected params: first=%v second=%v want=%s", firstParams, secondParams, want)
 	}
 }
