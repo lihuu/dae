@@ -23,6 +23,8 @@ type RequestMatcherBuilder struct {
 	simulatedDomainSet []routing.DomainSet
 	rules              []requestMatchSet
 	matcherStats       *domain_matcher.BuildStats
+	trieCache          *domain_matcher.TrieCache
+	sourceHash         []byte
 }
 
 // WithStats attaches a domain_matcher.BuildStats sink. When set, the
@@ -31,6 +33,15 @@ type RequestMatcherBuilder struct {
 // daedns_request_matcher_compile / dns_request_matcher_compile stage went.
 func (b *RequestMatcherBuilder) WithStats(stats *domain_matcher.BuildStats) *RequestMatcherBuilder {
 	b.matcherStats = stats
+	return b
+}
+
+// WithCache attaches a trie cache and source hash. When set, the internal
+// AhocorasickSlimtrie attempts to load from cache first, and saves to cache
+// on cache miss. The sourceHash is typically the hash of geosite.dat.
+func (b *RequestMatcherBuilder) WithCache(cache *domain_matcher.TrieCache, sourceHash []byte) *RequestMatcherBuilder {
+	b.trieCache = cache
+	b.sourceHash = sourceHash
 	return b
 }
 
@@ -162,8 +173,23 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	for _, domains := range b.simulatedDomainSet {
 		m.domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
-	if err = m.domainMatcher.Build(); err != nil {
-		return nil, err
+	// Use cache if available, otherwise build from scratch
+	if b.trieCache != nil {
+		// Type assert to access BuildWithCache
+		if slimtrie, ok := m.domainMatcher.(*domain_matcher.AhocorasickSlimtrie); ok {
+			if err = slimtrie.BuildWithCache(b.trieCache, b.sourceHash); err != nil {
+				return nil, err
+			}
+		} else {
+			// Fallback to regular build if type assertion fails
+			if err = m.domainMatcher.Build(); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		if err = m.domainMatcher.Build(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Write routings.

@@ -60,6 +60,10 @@ type NewOption struct {
 	// Reusing it eliminates the second AhocorasickSlimtrie.Build pass that
 	// otherwise dominates dns_controller_build_ms.
 	PrebuiltRequestMatcher *RequestMatcher
+	// TrieCache, when non-nil, enables persistent caching of compiled trie
+	// structures. SourceHash is the hash of geosite.dat used as the cache key.
+	TrieCache  *domain_matcher.TrieCache
+	SourceHash []byte
 }
 
 // BuildStats captures per-substage durations from New. The sum of the seven
@@ -187,6 +191,10 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		if stats != nil {
 			stats.RequestMatcherDistribution = &domain_matcher.BuildStats{}
 			reqMatcherBuilder = reqMatcherBuilder.WithStats(stats.RequestMatcherDistribution)
+		}
+		// Pass cache if available
+		if opt != nil && opt.TrieCache != nil {
+			reqMatcherBuilder = reqMatcherBuilder.WithCache(opt.TrieCache, opt.SourceHash)
 		}
 		stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, reqLowerStart)
 		reqCompileStart := time.Now()

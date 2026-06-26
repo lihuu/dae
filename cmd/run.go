@@ -37,6 +37,7 @@ import (
 	"github.com/daeuniverse/dae/component/daedns"
 	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -1288,12 +1289,29 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	netutils.FallbackDns = netip.MustParseAddrPort(conf.Global.FallbackResolver)
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	datReaderOptimizer := &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
+
+	// Create trie cache if enabled
+	var trieCache *domain_matcher.TrieCache
+	var geositeHash []byte
+	if conf.Global.TrieCacheEnabled {
+		trieCache = domain_matcher.NewTrieCache(log, conf.Global.TrieCachePath, true)
+		// Compute geosite.dat hash for cache key
+		geositePath, err := locationFinder.GetLocationAsset(log, "geosite.dat")
+		if err == nil {
+			if data, err := os.ReadFile(geositePath); err == nil {
+				geositeHash = domain_matcher.ComputeHash(data)
+			}
+		}
+	}
+
 	daeDNSStart := time.Now()
 	daeDNSStats := &daedns.BuildStats{}
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
 		LocationFinder:     locationFinder,
 		DatReaderOptimizer: datReaderOptimizer,
 		Stats:              daeDNSStats,
+		TrieCache:          trieCache,
+		SourceHash:         geositeHash,
 	})
 	if err != nil {
 		return nil, err

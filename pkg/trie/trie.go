@@ -9,7 +9,10 @@
 package trie
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"math/bits"
 	"net/netip"
 	"sort"
@@ -319,4 +322,169 @@ func selectIthOne(bm []uint64, ranks, selects *bitlist.CompactBitList, i int) in
 		}
 	}
 	panic("no more ones")
+}
+
+// Serialize encodes the Trie into a binary format for caching.
+// Returns the serialized bytes or an error if serialization fails.
+func (ss *Trie) Serialize() ([]byte, error) {
+	if ss == nil {
+		return nil, fmt.Errorf("cannot serialize nil trie")
+	}
+
+	var buf bytes.Buffer
+
+	// Write ValidChars
+	if ss.chars == nil {
+		return nil, fmt.Errorf("trie chars is nil")
+	}
+	if err := ss.chars.Serialize(&buf); err != nil {
+		return nil, fmt.Errorf("serialize chars: %w", err)
+	}
+
+	// Write leaves
+	if err := writeUint64Slice(&buf, ss.leaves); err != nil {
+		return nil, fmt.Errorf("serialize leaves: %w", err)
+	}
+
+	// Write labelBitmap
+	if err := writeUint64Slice(&buf, ss.labelBitmap); err != nil {
+		return nil, fmt.Errorf("serialize labelBitmap: %w", err)
+	}
+
+	// Write labels
+	if err := ss.labels.Serialize(&buf); err != nil {
+		return nil, fmt.Errorf("serialize labels: %w", err)
+	}
+
+	// Write ranksBL
+	if err := ss.ranksBL.Serialize(&buf); err != nil {
+		return nil, fmt.Errorf("serialize ranksBL: %w", err)
+	}
+
+	// Write selectsBL
+	if err := ss.selectsBL.Serialize(&buf); err != nil {
+		return nil, fmt.Errorf("serialize selectsBL: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// Deserialize reconstructs a Trie from binary data.
+// Returns the reconstructed Trie or an error if deserialization fails.
+func Deserialize(data []byte) (*Trie, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("cannot deserialize empty data")
+	}
+
+	r := bytes.NewReader(data)
+	ss := &Trie{}
+
+	// Read ValidChars
+	var err error
+	ss.chars, err = DeserializeValidChars(r)
+	if err != nil {
+		return nil, fmt.Errorf("deserialize chars: %w", err)
+	}
+
+	// Read leaves
+	if ss.leaves, err = readUint64Slice(r); err != nil {
+		return nil, fmt.Errorf("deserialize leaves: %w", err)
+	}
+
+	// Read labelBitmap
+	if ss.labelBitmap, err = readUint64Slice(r); err != nil {
+		return nil, fmt.Errorf("deserialize labelBitmap: %w", err)
+	}
+
+	// Read labels
+	if ss.labels, err = bitlist.DeserializeCompactBitList(r); err != nil {
+		return nil, fmt.Errorf("deserialize labels: %w", err)
+	}
+
+	// Read ranksBL
+	if ss.ranksBL, err = bitlist.DeserializeCompactBitList(r); err != nil {
+		return nil, fmt.Errorf("deserialize ranksBL: %w", err)
+	}
+
+	// Read selectsBL
+	if ss.selectsBL, err = bitlist.DeserializeCompactBitList(r); err != nil {
+		return nil, fmt.Errorf("deserialize selectsBL: %w", err)
+	}
+
+	return ss, nil
+}
+
+// ValidChars serialization
+
+// Serialize encodes ValidChars into the writer.
+func (v *ValidChars) Serialize(w io.Writer) error {
+	if v == nil {
+		return fmt.Errorf("cannot serialize nil ValidChars")
+	}
+	// Write table[256]byte
+	if _, err := w.Write(v.table[:]); err != nil {
+		return fmt.Errorf("write table: %w", err)
+	}
+	// Write n uint16
+	if err := binary.Write(w, binary.LittleEndian, v.n); err != nil {
+		return fmt.Errorf("write n: %w", err)
+	}
+	// Write zeroChar byte
+	if _, err := w.Write([]byte{v.zeroChar}); err != nil {
+		return fmt.Errorf("write zeroChar: %w", err)
+	}
+	return nil
+}
+
+// DeserializeValidChars reconstructs ValidChars from the reader.
+func DeserializeValidChars(r io.Reader) (*ValidChars, error) {
+	v := &ValidChars{}
+	// Read table[256]byte
+	if _, err := io.ReadFull(r, v.table[:]); err != nil {
+		return nil, fmt.Errorf("read table: %w", err)
+	}
+	// Read n uint16
+	if err := binary.Read(r, binary.LittleEndian, &v.n); err != nil {
+		return nil, fmt.Errorf("read n: %w", err)
+	}
+	// Read zeroChar byte
+	var zeroCharBuf [1]byte
+	if _, err := io.ReadFull(r, zeroCharBuf[:]); err != nil {
+		return nil, fmt.Errorf("read zeroChar: %w", err)
+	}
+	v.zeroChar = zeroCharBuf[0]
+	return v, nil
+}
+
+// Helper functions for []uint64 serialization
+
+func writeUint64Slice(w io.Writer, data []uint64) error {
+	// Write length
+	if err := binary.Write(w, binary.LittleEndian, int32(len(data))); err != nil {
+		return fmt.Errorf("write length: %w", err)
+	}
+	// Write data
+	if len(data) > 0 {
+		if err := binary.Write(w, binary.LittleEndian, data); err != nil {
+			return fmt.Errorf("write data: %w", err)
+		}
+	}
+	return nil
+}
+
+func readUint64Slice(r io.Reader) ([]uint64, error) {
+	// Read length
+	var length int32
+	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
+		return nil, fmt.Errorf("read length: %w", err)
+	}
+	// Read data
+	if length > 0 {
+		data := make([]uint64, length)
+		if err := binary.Read(r, binary.LittleEndian, data); err != nil {
+			return nil, fmt.Errorf("read data: %w", err)
+		}
+		return data, nil
+	}
+	return nil, nil
 }

@@ -80,6 +80,10 @@ type NewOption struct {
 	// substages observed at cmd/run.go so an operator can attribute startup
 	// time inside the otherwise-opaque daedns_router_build stage.
 	Stats *BuildStats
+	// TrieCache, when non-nil, enables persistent caching of compiled trie
+	// structures. SourceHash is the hash of geosite.dat used as the cache key.
+	TrieCache  *domain_matcher.TrieCache
+	SourceHash []byte
 }
 
 // BuildStats captures per-substage durations from NewWithOption. The sum of
@@ -217,6 +221,10 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if stats != nil {
 		stats.RequestMatcherDistribution = &domain_matcher.BuildStats{}
 		requestMatcherBuilder = requestMatcherBuilder.WithStats(stats.RequestMatcherDistribution)
+	}
+	// Pass cache if available
+	if opt != nil && opt.TrieCache != nil {
+		requestMatcherBuilder = requestMatcherBuilder.WithCache(opt.TrieCache, opt.SourceHash)
 	}
 	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, requestMatcherStart)
 	requestCompileStart := time.Now()

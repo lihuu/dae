@@ -54,6 +54,8 @@ type Global struct {
 	BandwidthMaxRx         string        `mapstructure:"bandwidth_max_rx" default:"0"`
 	UDPHopInterval         time.Duration `mapstructure:"udphop_interval" default:"30s"`
 	BpfConnStateMapSize    uint32        `mapstructure:"bpf_conn_state_map_size" default:"262144"`
+	TrieCacheEnabled       bool          `mapstructure:"trie_cache_enabled" default:"true"`
+	TrieCachePath          string        `mapstructure:"trie_cache_path" default:"/var/cache/dae/trie-cache.bin"`
 }
 
 type Utls struct {

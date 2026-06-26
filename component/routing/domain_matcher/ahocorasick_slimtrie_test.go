@@ -7,6 +7,7 @@ package domain_matcher
 
 import (
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -104,5 +105,40 @@ func TestAhocorasickSlimtrie_BuildStats_NilStatsIsSafe(t *testing.T) {
 	m.AddSet(0, []string{"google.com"}, consts.RoutingDomainKey_Suffix)
 	if err := m.Build(); err != nil {
 		t.Fatalf("Build() error = %v", err)
+	}
+}
+
+func TestAhocorasickSlimtrie_BuildWithCacheHitPreservesKeywordAndRegex(t *testing.T) {
+	cache := NewTrieCache(logrus.New(), filepath.Join(t.TempDir(), "trie-cache.bin"), true)
+	sourceHash := []byte("0123456789abcdef0123456789abcdef")
+
+	build := func() *AhocorasickSlimtrie {
+		m := NewAhocorasickSlimtrie(logrus.New(), consts.MaxMatchSetLen)
+		m.AddSet(0, []string{"example.com"}, consts.RoutingDomainKey_Suffix)
+		m.AddSet(1, []string{"tracker"}, consts.RoutingDomainKey_Keyword)
+		m.AddSet(2, []string{`^api[0-9]+\.example\.org$`}, consts.RoutingDomainKey_Regex)
+		return m
+	}
+
+	first := build()
+	if err := first.BuildWithCache(cache, sourceHash); err != nil {
+		t.Fatalf("first BuildWithCache() error = %v", err)
+	}
+	if tries, err := cache.Load(sourceHash); err != nil || tries == nil {
+		t.Fatalf("cache.Load() after initial build = (%v, %v), want cache hit", tries, err)
+	}
+	second := build()
+	if err := second.BuildWithCache(cache, sourceHash); err != nil {
+		t.Fatalf("second BuildWithCache() error = %v", err)
+	}
+
+	for _, domain := range []string{
+		"www.example.com",
+		"metrics.tracker.net",
+		"api42.example.org",
+	} {
+		if got, want := second.MatchDomainBitmap(domain), first.MatchDomainBitmap(domain); !slices.Equal(got, want) {
+			t.Fatalf("cache-hit matcher mismatch for %q: got %v, want %v", domain, got, want)
+		}
 	}
 }

@@ -6,7 +6,9 @@
 package bitlist
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
 	"math/bits"
 
 	"github.com/daeuniverse/dae/pkg/anybuffer"
@@ -135,4 +137,72 @@ func (m *CompactBitList) Tighten() {
 	a := make([]uint16, m.b.Len())
 	copy(a, m.b.Slice())
 	m.b = anybuffer.NewBufferFrom(a)
+}
+
+// Serialize encodes CompactBitList into the writer.
+func (m *CompactBitList) Serialize(w io.Writer) error {
+	if m == nil {
+		return fmt.Errorf("cannot serialize nil CompactBitList")
+	}
+	// Write unitBitSize int32
+	if err := binary.Write(w, binary.LittleEndian, int32(m.unitBitSize)); err != nil {
+		return fmt.Errorf("write unitBitSize: %w", err)
+	}
+	// Write size int32
+	if err := binary.Write(w, binary.LittleEndian, int32(m.size)); err != nil {
+		return fmt.Errorf("write size: %w", err)
+	}
+	// Write data: length (int32) + []uint16
+	data := m.b.Slice()
+	if err := binary.Write(w, binary.LittleEndian, int32(len(data))); err != nil {
+		return fmt.Errorf("write data length: %w", err)
+	}
+	if len(data) > 0 {
+		if err := binary.Write(w, binary.LittleEndian, data); err != nil {
+			return fmt.Errorf("write data: %w", err)
+		}
+	}
+	// Write unitNum int32
+	if err := binary.Write(w, binary.LittleEndian, int32(m.unitNum)); err != nil {
+		return fmt.Errorf("write unitNum: %w", err)
+	}
+	return nil
+}
+
+// DeserializeCompactBitList reconstructs CompactBitList from the reader.
+func DeserializeCompactBitList(r io.Reader) (*CompactBitList, error) {
+	m := &CompactBitList{}
+	// Read unitBitSize int32
+	var unitBitSize int32
+	if err := binary.Read(r, binary.LittleEndian, &unitBitSize); err != nil {
+		return nil, fmt.Errorf("read unitBitSize: %w", err)
+	}
+	m.unitBitSize = int(unitBitSize)
+	// Read size int32
+	var size int32
+	if err := binary.Read(r, binary.LittleEndian, &size); err != nil {
+		return nil, fmt.Errorf("read size: %w", err)
+	}
+	m.size = int(size)
+	// Read data: length (int32) + []uint16
+	var dataLen int32
+	if err := binary.Read(r, binary.LittleEndian, &dataLen); err != nil {
+		return nil, fmt.Errorf("read data length: %w", err)
+	}
+	if dataLen > 0 {
+		data := make([]uint16, dataLen)
+		if err := binary.Read(r, binary.LittleEndian, data); err != nil {
+			return nil, fmt.Errorf("read data: %w", err)
+		}
+		m.b = anybuffer.NewBufferFrom(data)
+	} else {
+		m.b = anybuffer.NewBuffer[uint16](8)
+	}
+	// Read unitNum int32
+	var unitNum int32
+	if err := binary.Read(r, binary.LittleEndian, &unitNum); err != nil {
+		return nil, fmt.Errorf("read unitNum: %w", err)
+	}
+	m.unitNum = int(unitNum)
+	return m, nil
 }
