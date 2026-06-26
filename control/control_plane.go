@@ -971,6 +971,14 @@ func newControlPlaneWithContextOptions(
 		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp),
 		UpstreamHostResolver:    upstreamHostResolver,
 		Stats:                   dnsBuildStats,
+		// Reuse the request matcher already built into the daedns.Router that
+		// option.DaeDNS owns. Both matchers are built from dnsConfig.Routing.
+		// Request.Rules and dnsConfig.Upstream in the same order, so the
+		// outbound-index encoding aligns; see daedns.Router.RequestMatcher and
+		// the index-correctness audit in the matching deployment notes. Saves
+		// the second AhocorasickSlimtrie.Build pass that dominated
+		// dns_controller_build_ms in production.
+		PrebuiltRequestMatcher: option.DaeDNS.RequestMatcher(),
 	})
 	if err != nil {
 		return nil, err

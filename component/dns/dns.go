@@ -47,6 +47,18 @@ type NewOption struct {
 	// observed inside dns.New so an operator can attribute startup time inside
 	// the otherwise-opaque dns_controller_build stage.
 	Stats *BuildStats
+	// PrebuiltRequestMatcher, when non-nil, skips the entire request-side
+	// build inside New: program normalize, builder construction, and
+	// AhocorasickSlimtrie compile. The caller is responsible for ensuring the
+	// supplied matcher was built from the same dnsCfg.Routing.Request.Rules
+	// and the same dnsCfg.Upstream slice (in the same order) so the matcher's
+	// outbound-index encoding aligns with Dns.upstream populated here.
+	//
+	// When the caller already built a daedns.Router for dialer-side DNS
+	// resolution, daedns.Router.RequestMatcher() returns exactly this matcher.
+	// Reusing it eliminates the second AhocorasickSlimtrie.Build pass that
+	// otherwise dominates dns_controller_build_ms.
+	PrebuiltRequestMatcher *RequestMatcher
 }
 
 // BuildStats captures per-substage durations from New. The sum of the seven
@@ -133,16 +145,40 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	stamp(func(s *BuildStats) *time.Duration { return &s.UpstreamInit }, upstreamStart)
 
 	datReaderOptimizer := datReaderOptimizerForDNS(opt)
-	reqProgStart := time.Now()
-	requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
-		datReaderOptimizer,
-		&routing.MergeAndSortRulesOptimizer{},
-		&routing.DeduplicateParamsOptimizer{},
-	)
-	if err != nil {
-		return nil, err
+	if opt != nil && opt.PrebuiltRequestMatcher != nil {
+		// Reuse path: caller already built the request matcher (e.g. the
+		// daedns.Router built upstream of the control plane). Skip request
+		// program normalize + builder construction + AC slimtrie compile. The
+		// three request-side BuildStats fields remain zero — that zero is the
+		// signal an operator wants: "this work didn't happen because we
+		// reused".
+		s.reqMatcher = opt.PrebuiltRequestMatcher
+	} else {
+		reqProgStart := time.Now()
+		requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
+			datReaderOptimizer,
+			&routing.MergeAndSortRulesOptimizer{},
+			&routing.DeduplicateParamsOptimizer{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		stamp(func(s *BuildStats) *time.Duration { return &s.RequestProgramNormalize }, reqProgStart)
+
+		// Parse request routing.
+		reqLowerStart := time.Now()
+		reqMatcherBuilder, err := NewRequestMatcherBuilderFromProgram(opt.Logger, requestProgram, upstreamName2Id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
+		}
+		stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, reqLowerStart)
+		reqCompileStart := time.Now()
+		s.reqMatcher, err = reqMatcherBuilder.Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
+		}
+		stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherCompile }, reqCompileStart)
 	}
-	stamp(func(s *BuildStats) *time.Duration { return &s.RequestProgramNormalize }, reqProgStart)
 
 	respProgStart := time.Now()
 	responseProgram, err := routing.NewNormalizedProgram(dns.Routing.Response.Rules, dns.Routing.Response.Fallback,
@@ -154,20 +190,6 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		return nil, err
 	}
 	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseProgramNormalize }, respProgStart)
-
-	// Parse request routing.
-	reqLowerStart := time.Now()
-	reqMatcherBuilder, err := NewRequestMatcherBuilderFromProgram(opt.Logger, requestProgram, upstreamName2Id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
-	}
-	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, reqLowerStart)
-	reqCompileStart := time.Now()
-	s.reqMatcher, err = reqMatcherBuilder.Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
-	}
-	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherCompile }, reqCompileStart)
 
 	// Parse response routing.
 	respLowerStart := time.Now()

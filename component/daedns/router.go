@@ -234,6 +234,20 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	return router, nil
 }
 
+// RequestMatcher returns the prebuilt DNS request matcher associated with this
+// router, or nil if the router has no DNS routing program (in which case there
+// is nothing to reuse downstream). The returned matcher's outbound-index
+// encoding follows dnsCfg.Upstream order, which is identical to the encoding
+// component/dns.New derives from the same dnsCfg.Upstream slice — so a control
+// plane that supplies this matcher via dns.NewOption.PrebuiltRequestMatcher
+// will get the same Match results as if dns.New built its own matcher.
+func (r *Router) RequestMatcher() *componentdns.RequestMatcher {
+	if r == nil {
+		return nil
+	}
+	return r.requestMatcher
+}
+
 func datReaderOptimizerForRouter(log *logrus.Logger, locationFinder *assets.LocationFinder, opt *NewOption) *routing.DatReaderOptimizer {
 	if opt != nil && opt.DatReaderOptimizer != nil {
 		return opt.DatReaderOptimizer
