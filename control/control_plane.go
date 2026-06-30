@@ -730,6 +730,8 @@ func newControlPlaneWithContextOptions(
 	direct := dialer.NewDialerContext(context.Background(), _direct, option, dialer.InstanceOption{DisableCheck: true}, directProperty)
 	_block, blockProperty := dialer.NewBlockDialer(option, func() { /*Dialer Outbound*/ })
 	block := dialer.NewDialerContext(context.Background(), _block, option, dialer.InstanceOption{DisableCheck: true}, blockProperty)
+	_reject, rejectProperty := dialer.NewRejectDialer(option, func() { /*Dialer Outbound*/ })
+	reject := dialer.NewDialerContext(context.Background(), _reject, option, dialer.InstanceOption{DisableCheck: true}, rejectProperty)
 	outbounds := []*outbound.DialerGroup{
 		outbound.NewDialerGroup(option, consts.OutboundDirect.String(),
 			[]*dialer.Dialer{direct}, []*dialer.Annotation{{}},
@@ -743,6 +745,12 @@ func newControlPlaneWithContextOptions(
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
 			}, core.outboundAliveChangeCallback(1, disableKernelAliveCallback), nil),
+		outbound.NewDialerGroup(option, consts.OutboundReject.String(),
+			[]*dialer.Dialer{reject}, []*dialer.Annotation{{}},
+			outbound.DialerSelectionPolicy{
+				Policy:     consts.DialerSelectionPolicy_Fixed,
+				FixedIndex: 0,
+			}, core.outboundAliveChangeCallback(uint8(consts.OutboundReject), disableKernelAliveCallback), nil),
 	}
 
 	// Filter out groups.
