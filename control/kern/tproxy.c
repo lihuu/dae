@@ -476,6 +476,11 @@ struct dae_event {
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);  // 256KB ring buffer
+	// Annotate the record type so bpf2go can collect `struct dae_event`
+	// (ringbuf records are dae_event). The kernel ignores value_size for
+	// ringbuf maps; this annotation exists solely to keep the type in BTF
+	// so -type dae_event resolves at generation time.
+	__type(value, struct dae_event);
 } event_ringbuf SEC(".maps");
 
 // TCP connection state constants.

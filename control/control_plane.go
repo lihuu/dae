@@ -3318,6 +3318,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 		return err
 	}
 
+	go c.consumeDaeEvents()
+
 	c.markReady()
 	sentReady = true
 	select {
