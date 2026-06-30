@@ -14,7 +14,9 @@ var SectionSummaryDesc = Desc{
 	"group":        "Node group. Groups defined here can be used as outbounds in section \"routing\".",
 	"routing": `Traffic follows this routing. See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.
 Notice: domain traffic split will fail if DNS traffic is not taken over by dae.
-Built-in outbound: direct, must_direct, block.
+Built-in outbound: direct, must_direct, block, reject.
+	reject actively refuses LAN ingress TCP with a reset (fast client failure); non-TCP/non-LAN traffic routing to reject is dropped like block.
+	DNS request reject (dns.routing.request) is a separate DNS-layer feature and is unchanged.
 Available functions: domain, sip, dip, sport, dport, ipversion, l4proto, pname, mac.
 Available keys in domain function: suffix, keyword, regex, full. No key indicates suffix.
 domain: Match domain.
