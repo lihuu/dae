@@ -9,8 +9,6 @@
 #define IPV4_MF_FLAG 0x2000
 #define FAST_PATH_PACKET_SIZE 160
 
-#define OUTBOUND_USER_DEFINED_MIN 2
-
 #define IPV4(a, b, c, d) (((a) << 24) | ((b) << 16) | ((c) << 8) | (d))
 
 static const __u32 three_key = 3;
