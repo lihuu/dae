@@ -818,6 +818,184 @@ check_routing_ipv4_tcp_state(struct __sk_buff *skb,
 	return TC_ACT_OK;
 }
 
+// check_ipv4_tcp_rst_shape verifies that a LAN-ingress skb was rewritten in
+// place into a TCP RST by rewrite_lan_ingress_tcp_reset. It asserts:
+//  - status_code == expected_status_code (TC_ACT_REDIRECT when bpf_redirect
+//    succeeds; the helper returns TC_ACT_SHOT on any internal failure).
+//  - the packet is NOT a control-plane redirect: a reject RST and a proxy
+//    redirect both return TC_ACT_REDIRECT, but only the proxy redirect sets
+//    skb->cb[0] = TPROXY_MARK (see redirect_lan_packet_to_control_plane). So
+//    when the action is REDIRECT, cb[0] must NOT be TPROXY_MARK.
+//  - L2 eth header present with h_proto == ETH_P_IP.
+//  - ip: version 4, ihl 5, protocol TCP, tot_len == 40, and saddr/daddr swapped
+//    relative to the generator input (expected_saddr/daddr are POST-rewrite).
+//  - tcp: source/dest swapped (expected_sport/dport are POST-rewrite), rst set,
+//    syn/fin cleared, doff == 5.
+//  - IP and TCP checksums are correct. These are recomputed INDEPENDENTLY with a
+//    plain __u16-word ones-complement accumulation (NOT the production
+//    csum_fold_region helper), so a bug in the production helper is caught. The
+//    verification relies on the all-ones property: summing every 16-bit word of
+//    a correctly-checksummed region (including the checksum field itself, plus
+//    the TCP pseudo-header) folds to 0xffff, independent of host byte order.
+//
+// Return codes: 0 (TC_ACT_OK) = all checks pass; TC_ACT_SHOT (-1) = structural
+// failure; 8 = IP checksum mismatch; 9 = TCP checksum mismatch. The Go test
+// expects 0; any non-zero return fails it.
+static __always_inline int
+check_ipv4_tcp_rst_shape(struct __sk_buff *skb,
+			 __u32 expected_status_code,
+			 __u32 expected_saddr, __u32 expected_daddr,
+			 __u16 expected_sport, __u16 expected_dport)
+{
+	__u32 *status_code;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	if (data + sizeof(*status_code) > data_end) {
+		bpf_printk("rst: data + sizeof(*status_code) > data_end\n");
+		return TC_ACT_SHOT;
+	}
+	status_code = data;
+	if (*status_code != expected_status_code) {
+		bpf_printk("rst: status_code(%d) != %d\n", *status_code,
+			   expected_status_code);
+		return TC_ACT_SHOT;
+	}
+
+	// A reject RST redirect must NOT carry the control-plane redirect marker.
+	if (expected_status_code == TC_ACT_REDIRECT) {
+		if (skb->cb[0] == TPROXY_MARK) {
+			bpf_printk("rst: skb->cb[0] == TPROXY_MARK (control-plane redirect)\n");
+			return TC_ACT_SHOT;
+		}
+	}
+
+	struct ethhdr *eth = data + sizeof(*status_code);
+	if ((void *)(eth + 1) > data_end) {
+		bpf_printk("rst: data + sizeof(*eth) > data_end\n");
+		return TC_ACT_SHOT;
+	}
+	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+		bpf_printk("rst: eth->h_proto != ETH_P_IP\n");
+		return TC_ACT_SHOT;
+	}
+
+	struct iphdr *ip = (void *)eth + ETH_HLEN;
+	if ((void *)(ip + 1) > data_end) {
+		bpf_printk("rst: data + sizeof(*ip) > data_end\n");
+		return TC_ACT_SHOT;
+	}
+	if (ip->version != 4) {
+		bpf_printk("rst: ip->version != 4\n");
+		return TC_ACT_SHOT;
+	}
+	if (ip->ihl != 5) {
+		bpf_printk("rst: ip->ihl(%d) != 5\n", ip->ihl);
+		return TC_ACT_SHOT;
+	}
+	if (ip->protocol != IPPROTO_TCP) {
+		bpf_printk("rst: ip->protocol != IPPROTO_TCP\n");
+		return TC_ACT_SHOT;
+	}
+	if (ip->tot_len != bpf_htons(sizeof(struct iphdr) +
+				     sizeof(struct tcphdr))) {
+		bpf_printk("rst: ip->tot_len(%d) != 40\n",
+			   bpf_ntohs(ip->tot_len));
+		return TC_ACT_SHOT;
+	}
+	if (ip->saddr != bpf_htonl(expected_saddr)) {
+		bpf_printk("rst: ip->saddr mismatch (post-rewrite expected)\n");
+		return TC_ACT_SHOT;
+	}
+	if (ip->daddr != bpf_htonl(expected_daddr)) {
+		bpf_printk("rst: ip->daddr mismatch (post-rewrite expected)\n");
+		return TC_ACT_SHOT;
+	}
+
+	struct tcphdr *tcp = (void *)ip + IP4_HLEN;
+	if ((void *)(tcp + 1) > data_end) {
+		bpf_printk("rst: data + sizeof(*tcp) > data_end\n");
+		return TC_ACT_SHOT;
+	}
+	if (tcp->source != bpf_htons(expected_sport)) {
+		bpf_printk("rst: tcp->source mismatch (post-rewrite expected)\n");
+		return TC_ACT_SHOT;
+	}
+	if (tcp->dest != bpf_htons(expected_dport)) {
+		bpf_printk("rst: tcp->dest mismatch (post-rewrite expected)\n");
+		return TC_ACT_SHOT;
+	}
+	if (!tcp->rst) {
+		bpf_printk("rst: tcp->rst != 1\n");
+		return TC_ACT_SHOT;
+	}
+	if (tcp->syn) {
+		bpf_printk("rst: tcp->syn != 0\n");
+		return TC_ACT_SHOT;
+	}
+	if (tcp->fin) {
+		bpf_printk("rst: tcp->fin != 0\n");
+		return TC_ACT_SHOT;
+	}
+	if (tcp->doff != 5) {
+		bpf_printk("rst: tcp->doff(%d) != 5\n", tcp->doff);
+		return TC_ACT_SHOT;
+	}
+
+	// Independent IP checksum verification. Sum all 10 16-bit words of the
+	// 20-byte IP header (including ip->check); a correct checksum folds to
+	// 0xffff. This is computed with a plain accumulation loop, deliberately
+	// NOT the production csum_fold_region helper, so a helper bug is caught.
+	{
+		const __u16 *p = (const __u16 *)ip;
+		__u32 sum = 0;
+
+#pragma unroll
+		for (int i = 0; i < 10; i++)
+			sum += p[i];
+		sum = (sum & 0xffff) + (sum >> 16);
+		sum = (sum & 0xffff) + (sum >> 16);
+		if (sum != 0xffff) {
+			bpf_printk("rst: ip checksum mismatch\n");
+			return 8;
+		}
+	}
+
+	// Independent TCP checksum verification. Build the 12-byte pseudo-header
+	// (saddr, daddr, 0x00, IPPROTO_TCP, tcp-length-be) in network order, then
+	// sum its 6 words together with the 10 words of the 20-byte TCP header
+	// (including tcp->check). A correct checksum folds to 0xffff.
+	{
+		__u32 pseudo[3] = {0};
+		__u16 tcp_len_be = bpf_htons((__u16)sizeof(struct tcphdr));
+		const __u16 *pp;
+		const __u16 *tp;
+		__u32 sum = 0;
+
+		pseudo[0] = ip->saddr;
+		pseudo[1] = ip->daddr;
+		pseudo[2] = bpf_htons((__u16)IPPROTO_TCP) | ((__u32)tcp_len_be << 16);
+
+		pp = (const __u16 *)&pseudo[0];
+#pragma unroll
+		for (int i = 0; i < 6; i++)
+			sum += pp[i];
+		tp = (const __u16 *)tcp;
+#pragma unroll
+		for (int i = 0; i < 10; i++)
+			sum += tp[i];
+		sum = (sum & 0xffff) + (sum >> 16);
+		sum = (sum & 0xffff) + (sum >> 16);
+		if (sum != 0xffff) {
+			bpf_printk("rst: tcp checksum mismatch\n");
+			return 9;
+		}
+	}
+
+	return TC_ACT_OK;
+}
+
 static __always_inline int
 check_udp_conn_state_ipv4_udp_dscp(struct __sk_buff *skb,
 				   __u32 expected_status_code,

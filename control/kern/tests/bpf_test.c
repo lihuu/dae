@@ -1872,6 +1872,83 @@ int testcheck_fakeip_tcp_block(struct __sk_buff *skb)
 					    OUTBOUND_BLOCK, 0, true);
 }
 
+/* LAN ingress TCP SYN + routing REJECT → RST toward client.
+ * Mirrors fakeip_tcp_block except routing falls back to OUTBOUND_REJECT.
+ * The reject path must run before liveness checks and control-plane redirect,
+ * emit DAE_EVENT_REJECTED, delete the SYN's conn-state, and return the RST via
+ * bpf_redirect (TC_ACT_REDIRECT) — NOT a control-plane (dae0) redirect. */
+SEC("tc/pktgen/lan_ingress_tcp_reject")
+int testpktgen_lan_ingress_tcp_reject(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/lan_ingress_tcp_reject")
+int testsetup_lan_ingress_tcp_reject(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+
+	/* fallback: reject */
+	set_routing_fallback(OUTBOUND_REJECT, false);
+
+	/* Reject interception happens at LAN ingress. */
+	bpf_tail_call(skb, &entry_call_map, 1);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/lan_ingress_tcp_reject")
+int testcheck_lan_ingress_tcp_reject(struct __sk_buff *skb)
+{
+	/* rewrite_lan_ingress_tcp_reset reverses addressing: the RST is addressed
+	 * back at the client, so saddr/daddr and sport/dport are swapped relative
+	 * to the generator input (192.168.0.1:19233 -> 198.18.5.6:80). */
+	return check_ipv4_tcp_rst_shape(skb,
+					TC_ACT_REDIRECT,
+					IPV4(198,18,5,6), IPV4(192,168,0,1),
+					80, 19233);
+}
+
+/* Conn-state leak guard: a rejected SYN must not leave a persistent conn-state
+ * entry. The Go test sends the same reject-matching SYN repeatedly, then this
+ * check asserts conn_state_map has no entry for the forward tuple. */
+SEC("tc/pktgen/reject_no_conn_state_leak")
+int testpktgen_reject_no_conn_state_leak(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,18,5,6), 19233, 80);
+}
+
+SEC("tc/setup/reject_no_conn_state_leak")
+int testsetup_reject_no_conn_state_leak(struct __sk_buff *skb)
+{
+	enable_fakeip_198_18();
+	set_routing_fallback(OUTBOUND_REJECT, false);
+	bpf_tail_call(skb, &entry_call_map, 1);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/reject_no_conn_state_leak")
+int testcheck_reject_no_conn_state_leak(struct __sk_buff *skb)
+{
+	/* Forward tuple matching the generator's SYN (client -> server). */
+	struct tuples_key key = {};
+
+	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,0,1));
+	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(198,18,5,6));
+	key.sport = bpf_htons(19233);
+	key.dport = bpf_htons(80);
+	key.l4proto = IPPROTO_TCP;
+
+	struct conn_state *state =
+		bpf_map_lookup_elem(&conn_state_map, &key);
+	if (state) {
+		bpf_printk("leak: conn_state present for rejected SYN tuple\n");
+		return TC_ACT_SHOT;
+	}
+	return TC_ACT_OK;
+}
+
 /* Non-FakeIP + routing DIRECT → pass through (TC_ACT_OK) */
 SEC("tc/pktgen/non_fakeip_direct")
 int testpktgen_non_fakeip_direct(struct __sk_buff *skb)

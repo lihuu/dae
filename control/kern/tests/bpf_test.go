@@ -629,3 +629,114 @@ func TestFakeipParamInterception(t *testing.T) {
 		consumeBpfDebugLog(t)
 	}
 }
+
+// tcActRedirect is TC_ACT_REDIRECT from linux/pkt_cls.h; bpf_redirect returns
+// it on success. Used only for diagnostics in the reject tests.
+const tcActRedirect = 7
+
+// TestLanIngressTcpReject verifies that a LAN-ingress TCP SYN whose routing
+// result is OUTBOUND_REJECT is rewritten into a TCP RST aimed back at the
+// client (bpf_redirect → TC_ACT_REDIRECT), is NOT a control-plane (dae0)
+// redirect, and has the correct RST shape (swapped 5-tuple, rst set, syn/fin
+// cleared, doff 5, tot_len 40).
+func TestLanIngressTcpReject(t *testing.T) {
+	runProgramSetByID(t, "LanIngressTcpReject")
+}
+
+// TestLanIngressTcpBlockUnchanged re-runs the existing block test as a
+// regression guard: block must still silently drop (TC_ACT_SHOT) and must NOT
+// be affected by the new reject wiring.
+func TestLanIngressTcpBlockUnchanged(t *testing.T) {
+	runProgramSetByID(t, "FakeipTcpBlock")
+}
+
+// TestRejectNoConnStateLeak enforces the spec requirement that rejected SYNs
+// do not leave persistent conn-state. It sends the same reject-matching SYN
+// repeatedly (same five-tuple), then asserts conn_state_map has no entry for
+// that tuple. Each run's OUTBOUND_REJECT branch deletes the entry that
+// mark_tcp_seen created for the SYN; if the delete were missing, the entry
+// would persist and this test would fail.
+func TestRejectNoConnStateLeak(t *testing.T) {
+	obj, progsets, err := collectPrograms(t)
+	if err != nil {
+		t.Fatalf("error while collecting programs: %s", err)
+	}
+	defer obj.Close()
+
+	markAllOutboundsAlive(t, obj)
+
+	key := uint32(0)
+	activeRulesLen := uint32(testMaxMatchSetLen)
+	if err = obj.RoutingMetaMap.Update(key, activeRulesLen, ebpf.UpdateAny); err != nil {
+		t.Fatalf("failed to initialize routing_meta_map: %v", err)
+	}
+	zeroEntry := make([]byte, obj.RoutingMap.ValueSize())
+	for i := uint32(0); i < testMaxMatchSetLen; i++ {
+		if err = obj.RoutingMap.Update(i, zeroEntry, ebpf.UpdateAny); err != nil {
+			t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
+		}
+	}
+
+	var target *programSet
+	for i := range progsets {
+		if progsets[i].id == "RejectNoConnStateLeak" {
+			target = &progsets[i]
+			break
+		}
+	}
+	if target == nil {
+		t.Fatalf("program set RejectNoConnStateLeak not found")
+	}
+
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		data := make([]byte, 4096-256-320)
+		ctx := make([]byte, 256)
+
+		statusCode, data, ctx, err := runBpfProgram(target.pktgen, data, ctx)
+		if err != nil {
+			t.Fatalf("iter %d: pktgen error: %s", i, err)
+		}
+		if statusCode != 0 {
+			printBpfDebugLog(t)
+			t.Fatalf("iter %d: pktgen unexpected status: %d", i, statusCode)
+		}
+
+		// setup tail-calls do_tproxy_lan_ingress, which on OUTBOUND_REJECT
+		// returns bpf_redirect (TC_ACT_REDIRECT) for the RST, or TC_ACT_SHOT
+		// if the helper failed (documented fail-closed fallback). Either way
+		// it must be non-zero: TC_ACT_OK (0) here would mean the tail call did
+		// not fire and the ingress reject path never ran.
+		statusCode, _, _, err = runBpfProgram(target.setup, data, ctx)
+		if err != nil {
+			printBpfDebugLog(t)
+			t.Fatalf("iter %d: setup error: %s", i, err)
+		}
+		if statusCode == 0 {
+			printBpfDebugLog(t)
+			t.Fatalf("iter %d: setup returned TC_ACT_OK — tail call did not fire", i)
+		}
+		if statusCode != tcActRedirect {
+			t.Logf("iter %d: setup status=%d (reject helper returned non-redirect; conn-state still deleted)", i, statusCode)
+		}
+	}
+
+	// Run the check program: it looks up conn_state_map for the SYN's forward
+	// tuple and returns TC_ACT_OK if absent, TC_ACT_SHOT if present (leak).
+	data := make([]byte, 4096-256-320)
+	ctx := make([]byte, 256)
+	status := make([]byte, 4)
+	nl.NativeEndian().PutUint32(status, 0)
+	data = append(status, data...)
+
+	statusCode, _, _, err := runBpfProgram(target.check, data, ctx)
+	if err != nil {
+		t.Fatalf("check error: %+v", err)
+	}
+	if statusCode != 0 {
+		printBpfDebugLog(t)
+		t.Fatalf("conn-state leak detected: rejected SYN left a persistent entry after %d iterations (status=%d)",
+			iterations, statusCode)
+	}
+	consumeBpfDebugLog(t)
+}

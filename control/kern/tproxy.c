@@ -2228,11 +2228,8 @@ static __always_inline void set_tcp_reset_seqack(struct tcphdr *tcp)
 // version: IPv4 only; IPv6 falls back to drop. `link_h_len` is 14 for L2
 // ingress and 0 for L3 ingress.
 //
-// This helper is defined ahead of its first call site (wiring lands in a later
-// task). Suppress -Wunused-function until then; the pragma is a no-op once the
-// function is referenced by do_tproxy_lan_ingress.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-function"
+// This helper is referenced by do_tproxy_lan_ingress at the OUTBOUND_REJECT
+// sites (cached fast path, map-full fallback, and new-connection routing).
 static __always_inline int
 rewrite_lan_ingress_tcp_reset(struct __sk_buff *skb, __u32 link_h_len)
 {
@@ -2320,8 +2317,6 @@ rewrite_lan_ingress_tcp_reset(struct __sk_buff *skb, __u32 link_h_len)
 	return bpf_redirect(skb->ifindex, 0);
 }
 
-#pragma clang diagnostic pop
-
 static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
 {
 	// Per-CPU scratch to stay under 512-byte stack limit.
@@ -2400,6 +2395,19 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		}
 		if (unlikely(outbound == OUTBOUND_BLOCK))
 			return TC_ACT_SHOT;
+		// Defense-in-depth: a cached REJECT entry is normally deleted by the
+		// new-connection routing path (site 3) before any non-SYN packet can
+		// read it. This branch handles the defensive case where cached REJECT
+		// state still exists (e.g. state races) and resets the flow. This path
+		// is TCP-only (guarded by the enclosing l4proto == IPPROTO_TCP check),
+		// so no l4proto guard is needed here.
+		if (unlikely(outbound == OUTBOUND_REJECT)) {
+			send_dae_event(DAE_EVENT_REJECTED, 0, NULL, outbound,
+				       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+				       pkt->tuples.five.dip.u6_addr32,
+				       pkt->tuples.five.sport, pkt->tuples.five.dport);
+			return rewrite_lan_ingress_tcp_reset(skb, link_h_len);
+		}
 		if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto,
 					   pkt->tuples.five.dport))
 			return TC_ACT_SHOT;
@@ -2442,6 +2450,13 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 					skb->mark = mark;
 					goto direct;
 				} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
+					goto block;
+				} else if (unlikely(outbound == OUTBOUND_REJECT)) {
+					send_dae_event(DAE_EVENT_REJECTED, 0, NULL, outbound,
+						       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+						       pkt->tuples.five.dip.u6_addr32,
+						       pkt->tuples.five.sport,
+						       pkt->tuples.five.dport);
 					goto block;
 				}
 
@@ -2583,6 +2598,13 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		else
 			bpf_printk("tcp(lan): SHOT - MAP FULL, PROXY CONNECTION DROPPED");
 #endif
+		if (unlikely(outbound == OUTBOUND_REJECT)) {
+			send_dae_event(DAE_EVENT_REJECTED, 0, NULL, outbound,
+				       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+				       pkt->tuples.five.dip.u6_addr32,
+				       pkt->tuples.five.sport, pkt->tuples.five.dport);
+			return rewrite_lan_ingress_tcp_reset(skb, link_h_len);
+		}
 		goto block;
 	}
 
@@ -2618,6 +2640,20 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
 			       pkt->tuples.five.dip.u6_addr32,
 			       pkt->tuples.five.sport, pkt->tuples.five.dport);
+		goto block;
+	} else if (unlikely(outbound == OUTBOUND_REJECT)) {
+		send_dae_event(DAE_EVENT_REJECTED, 0, NULL, outbound,
+			       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+			       pkt->tuples.five.dip.u6_addr32,
+			       pkt->tuples.five.sport, pkt->tuples.five.dport);
+		if (pkt->l4proto == IPPROTO_TCP) {
+			// Remove the conn-state entry that mark_tcp_seen created for
+			// this SYN so rejected connections do not leave persistent state.
+			if (tcp_state)
+				bpf_map_delete_elem(&conn_state_map,
+						    &pkt->tuples.five);
+			return rewrite_lan_ingress_tcp_reset(skb, link_h_len);
+		}
 		goto block;
 	}
 
