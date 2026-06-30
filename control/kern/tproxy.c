@@ -454,8 +454,9 @@ enum bpf_stats_key {
 // Events delivered to userspace via ring buffer.
 enum dae_event_type {
 	DAE_EVENT_BLOCKED = 0,       // Connection blocked (OUTBOUND_BLOCK)
-	DAE_EVENT_UDP_CONN_OVERFLOW = 1, // UDP conn state map overflow
-	DAE_EVENT_TCP_CONN_OVERFLOW = 2, // TCP conn state map overflow
+	DAE_EVENT_REJECTED = 1,      // Connection rejected (OUTBOUND_REJECT, LAN ingress TCP reset)
+	DAE_EVENT_UDP_CONN_OVERFLOW = 2, // UDP conn state map overflow
+	DAE_EVENT_TCP_CONN_OVERFLOW = 3, // TCP conn state map overflow
 };
 
 struct dae_event {
@@ -2117,6 +2118,209 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 			    &handoff, BPF_ANY);
 	return redirect_to_control_plane_ingress();
 }
+
+// ---------------------------------------------------------------------------
+// LAN ingress TCP RST rewrite helpers.
+//
+// These rewrite a parsed LAN ingress TCP skb in place into a TCP RST directed
+// back at the LAN client, then redirect it back out the ingress interface.
+// They are intentionally small and bounded (fully unrolled loops, bounds-
+// checked pointer access) to stay verifier-friendly. Any failure degrades to
+// TC_ACT_SHOT so an active reject never leaks a packet. First version: IPv4
+// only; IPv6 falls back to drop. These helpers are defined here but not yet
+// wired into the datapath.
+// ---------------------------------------------------------------------------
+
+// Swap 6-byte Ethernet source/destination addresses in place.
+static __always_inline void swap_eth_addrs(struct ethhdr *eth)
+{
+	__u8 tmp[6];
+
+	__builtin_memcpy(tmp, eth->h_source, 6);
+	__builtin_memcpy(eth->h_source, eth->h_dest, 6);
+	__builtin_memcpy(eth->h_dest, tmp, 6);
+}
+
+// Swap IPv4 source/destination addresses in place.
+static __always_inline void swap_ipv4_addrs(struct iphdr *ip)
+{
+	__be32 tmp = ip->saddr;
+
+	ip->saddr = ip->daddr;
+	ip->daddr = tmp;
+}
+
+// Swap TCP source/destination ports in place.
+static __always_inline void swap_tcp_ports(struct tcphdr *tcp)
+{
+	__be16 tmp = tcp->source;
+
+	tcp->source = tcp->dest;
+	tcp->dest = tmp;
+}
+
+// csum_fold_region computes the ones-complement sum of a bounded, even-length
+// region via a fully unrolled loop, then folds it to 16 bits. It returns the
+// RAW folded sum (NOT negated); callers combine partial sums through `seed` and
+// negate (~) once at the end to obtain the final Internet checksum value. The
+// unroll bound of 20 covers the largest region used here (TCP header 10 words +
+// 12-byte pseudo-header 6 words = 16 words); with `len` constant-folded at the
+// call site, the per-iteration length check prunes dead iterations so the
+// verifier only sees in-bounds accesses against the caller's data_end bound.
+static __always_inline __u16 csum_fold_region(const void *data, __u32 len,
+					      __u32 seed)
+{
+	__u32 sum = seed;
+	const __u16 *p = data;
+	__u32 i;
+
+#pragma unroll
+	for (i = 0; i < 20; i++) {
+		if (i * 2 + 1 >= len)
+			break;
+		sum += p[i];
+	}
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return (__u16)sum;
+}
+
+// set_tcp_reset_seqack fills the outgoing seq/ack per RFC 9293 for a TCP RST:
+//  - incoming SYN without ACK: ack = incoming seq + 1 (SYN consumes one seq
+//    number), seq = 0, set ACK.
+//  - otherwise (ACK set): seq = incoming ack (the RFC 9293 rule for ACK-bearing
+//    segments is simply SEQ := SEG.ACK with no length adjustment), ack_seq left
+//    as-is, ACK bit retained.
+// RST is always set; SYN/FIN/PSH/URG are cleared. Because bpf_skb_change_tail
+// truncated the skb to a 20-byte TCP header, doff MUST be reset to 5 (and the
+// reserved nibble cleared): an incoming SYN usually carries options so doff is
+// typically 8-10, and leaving it set would make the receiver compute the TCP
+// header end past the truncated packet and drop the RST as malformed. We
+// operate on a header-only view, so the no-ACK path assumes a pure SYN (+1); a
+// data-less SYN is the only no-ACK segment seen in practice on LAN ingress.
+static __always_inline void set_tcp_reset_seqack(struct tcphdr *tcp)
+{
+	__be32 in_seq = tcp->seq;
+	__be32 in_ack = tcp->ack_seq;
+
+	if (!tcp->ack) {
+		tcp->ack_seq = bpf_htonl(bpf_ntohl(in_seq) + 1);
+		tcp->seq = 0;
+		tcp->ack = 1;
+	} else {
+		tcp->seq = in_ack;
+	}
+	tcp->rst = 1;
+	tcp->syn = 0;
+	tcp->fin = 0;
+	tcp->psh = 0;
+	tcp->urg = 0;
+	// Reset data offset to 5 (20-byte header, no options) and clear the
+	// reserved nibble to match the truncated, option-less TCP header.
+	tcp->doff = 5;
+	tcp->res1 = 0;
+}
+
+// rewrite_lan_ingress_tcp_reset rewrites the current LAN ingress TCP skb in
+// place into a TCP RST aimed back at the LAN client, then redirects it back out
+// the ingress interface via bpf_redirect (egress of skb->ifindex). Returns
+// TC_ACT_SHOT on any failure so reject degrades to drop, never to leak. First
+// version: IPv4 only; IPv6 falls back to drop. `link_h_len` is 14 for L2
+// ingress and 0 for L3 ingress.
+//
+// This helper is defined ahead of its first call site (wiring lands in a later
+// task). Suppress -Wunused-function until then; the pragma is a no-op once the
+// function is referenced by do_tproxy_lan_ingress.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+static __always_inline int
+rewrite_lan_ingress_tcp_reset(struct __sk_buff *skb, __u32 link_h_len)
+{
+	__u32 hdr_len = link_h_len + sizeof(struct iphdr) +
+			sizeof(struct tcphdr);
+
+	if (link_h_len == 0)
+		hdr_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
+
+	// Truncate the skb to exactly the L2 (optional) + IP + TCP header, then
+	// refresh the linear data pointers so direct access is valid.
+	if (bpf_skb_change_tail(skb, hdr_len, 0))
+		return TC_ACT_SHOT;
+	if (bpf_skb_pull_data(skb, hdr_len))
+		return TC_ACT_SHOT;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = NULL;
+	void *l3 = data;
+
+	if (link_h_len) {
+		eth = data;
+		if ((void *)(eth + 1) > data_end)
+			return TC_ACT_SHOT;
+		l3 = (void *)(eth + 1);
+	}
+
+	struct iphdr *ip = l3;
+
+	if ((void *)(ip + 1) > data_end)
+		return TC_ACT_SHOT;
+	if (ip->version != 4)
+		return TC_ACT_SHOT; // first version: IPv4 only
+	// Drop IP options: tcp = (void *)(ip + 1) assumes a 20-byte IP header, so
+	// an ihl != 5 packet would point into the options rather than the TCP
+	// header and corrupt it. First version rejects these cleanly.
+	if (ip->ihl != 5)
+		return TC_ACT_SHOT;
+
+	struct tcphdr *tcp = (void *)(ip + 1);
+
+	if ((void *)(tcp + 1) > data_end)
+		return TC_ACT_SHOT;
+
+	// Reverse addressing so the RST is addressed back to the LAN client.
+	if (eth)
+		swap_eth_addrs(eth);
+	swap_ipv4_addrs(ip);
+	swap_tcp_ports(tcp);
+	set_tcp_reset_seqack(tcp);
+
+	// Recompute the IP header checksum over the (now zeroed) check field.
+	// csum_fold_region returns the raw folded sum; ~ negates it into the
+	// final Internet checksum value, whose bytes land in network order.
+	// The datagram is now exactly 20-byte IP + 20-byte TCP; update tot_len so
+	// the client sizes the TCP segment correctly (the original larger value
+	// would make it drop the RST).
+	ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+	ip->check = 0;
+	__u16 ip_csum = csum_fold_region(ip, sizeof(struct iphdr), 0);
+
+	ip->check = (__be16)~ip_csum;
+
+	// Recompute the TCP checksum over the 12-byte pseudo-header + 20-byte TCP
+	// header (check field zeroed). Sum the pseudo-header first, seed the TCP
+	// header sum with that partial sum, then negate once. The pseudo-header is
+	// built in network order (saddr/daddr are already __be32; the last word is
+	// 0x00 | IPPROTO_TCP | tcp-length-be == bytes 00 06 00 14).
+	__u32 pseudo[3] = {0};
+	__u16 tcp_len_be = bpf_htons((__u16)sizeof(struct tcphdr));
+
+	pseudo[0] = ip->saddr;
+	pseudo[1] = ip->daddr;
+	pseudo[2] = bpf_htons((__u16)IPPROTO_TCP) | ((__u32)tcp_len_be << 16);
+	tcp->check = 0;
+	__u16 pseudo_sum = csum_fold_region(&pseudo[0], sizeof(pseudo), 0);
+	__u16 tcp_sum = csum_fold_region(tcp, sizeof(struct tcphdr),
+					 pseudo_sum);
+
+	tcp->check = (__be16)~tcp_sum;
+
+	// Send the rewritten RST back out the ingress interface toward the LAN
+	// client. flags=0 selects egress redirect at the TC ingress hook.
+	return bpf_redirect(skb->ifindex, 0);
+}
+
+#pragma clang diagnostic pop
 
 static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
 {
