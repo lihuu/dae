@@ -61,7 +61,8 @@ type NewOption struct {
 	// otherwise dominates dns_controller_build_ms.
 	PrebuiltRequestMatcher *RequestMatcher
 	// TrieCache, when non-nil, enables persistent caching of compiled trie
-	// structures. SourceHash is the hash of geosite.dat used as the cache key.
+	// structures. SourceHash is the external geosite.dat hash; the request
+	// matcher combines it with lowered qname domain sets before cache lookup.
 	TrieCache  *domain_matcher.TrieCache
 	SourceHash []byte
 }

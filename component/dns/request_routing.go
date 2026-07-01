@@ -6,6 +6,8 @@
 package dns
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"strconv"
 
@@ -38,7 +40,9 @@ func (b *RequestMatcherBuilder) WithStats(stats *domain_matcher.BuildStats) *Req
 
 // WithCache attaches a trie cache and source hash. When set, the internal
 // AhocorasickSlimtrie attempts to load from cache first, and saves to cache
-// on cache miss. The sourceHash is typically the hash of geosite.dat.
+// on cache miss. The sourceHash is typically the hash of geosite.dat; Build
+// combines it with the lowered qname domain sets so config-only DNS routing
+// changes also invalidate the compiled trie cache.
 func (b *RequestMatcherBuilder) WithCache(cache *domain_matcher.TrieCache, sourceHash []byte) *RequestMatcherBuilder {
 	b.trieCache = cache
 	b.sourceHash = sourceHash
@@ -177,7 +181,7 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	if b.trieCache != nil {
 		// Type assert to access BuildWithCache
 		if slimtrie, ok := m.domainMatcher.(*domain_matcher.AhocorasickSlimtrie); ok {
-			if err = slimtrie.BuildWithCache(b.trieCache, b.sourceHash); err != nil {
+			if err = slimtrie.BuildWithCache(b.trieCache, b.trieCacheKey()); err != nil {
 				return nil, err
 			}
 		} else {
@@ -200,6 +204,31 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	m.matches = b.rules
 
 	return &m, nil
+}
+
+func (b *RequestMatcherBuilder) trieCacheKey() []byte {
+	if len(b.sourceHash) != sha256.Size {
+		return b.sourceHash
+	}
+
+	h := sha256.New()
+	h.Write([]byte("dae:dns-request-matcher-trie-cache:v2\x00"))
+	h.Write(b.sourceHash)
+
+	var buf [4]byte
+	for _, set := range b.simulatedDomainSet {
+		binary.LittleEndian.PutUint32(buf[:], uint32(set.RuleIndex))
+		h.Write(buf[:])
+		h.Write([]byte{0})
+		h.Write([]byte(set.Key))
+		h.Write([]byte{0})
+		for _, domain := range set.Domains {
+			h.Write([]byte(domain))
+			h.Write([]byte{0})
+		}
+		h.Write([]byte{0xff})
+	}
+	return h.Sum(nil)
 }
 
 type RequestMatcher struct {
