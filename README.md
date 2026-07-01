@@ -23,8 +23,17 @@ As a successor of [v2rayA](https://github.com/v2rayA/v2rayA), dae abandoned v2ra
 - [x] Support to split traffic by MAC address in LAN.
 - [x] Support to split traffic with invert match rules.
 - [x] Support to automatically switch nodes according to policy. That is to say, support to automatically test independent TCP/UDP/IPv4/IPv6 latencies, and then use the best nodes for corresponding traffic according to user-defined policy.
+- [x] Support event-driven priority failover groups with `policy: failover`, `priority` annotations, targeted TCP recovery probes, warm-reload state handoff, and structured `failover_switch` events.
 - [x] Support advanced DNS resolution process.
+- [x] Support dae-owned DNS routing for subscription fetches, node resolution, and subscription-derived node resolution through `sub()`, `node()`, and `subnode()` request selectors.
+- [x] Support optimistic DNS cache with stale-while-revalidate behavior, configurable stale window, and optional LRU size limit.
+- [x] Support native IPv4 FakeIP DNS synthesis with persistent domain mappings, TCP/UDP eBPF interception, reload-safe state reuse, direct-upstream fallback for direct traffic, and structured FakeIP observability events.
+- [x] Support `routing_outbound(...) -> fakeip` DNS request rules that derive FakeIP domain rules from main routing outbounds.
 - [x] Support full-cone NAT for shadowsocks, trojan(-go) and socks5 (no test).
+- [x] Support a TCP-only `reject` built-in routing outbound that actively resets rejected LAN ingress TCP flows and drops unsupported traffic like `block`.
+- [x] Support structured startup, reload, validation, config-load, DNS-controller, routing-matcher, and rule-build timing events for production diagnostics.
+- [x] Support faster startup and reload on large rule sets with the vendored config parser, prebuilt DNS router reuse, trie-cache persistence, and shared geosite/geoip dat-reader expansion caches.
+- [x] Support runtime log-output gating through a watched state file without changing the configured log level or reloading dae.
 - [x] Support various trending proxy protocols, seen in [proxy-protocols.md](./docs/en/proxy-protocols.md).
 
 ## Getting Started

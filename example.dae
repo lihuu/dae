@@ -34,6 +34,11 @@ global {
     # Takes effect on fresh eBPF load or restart; same-port reload keeps the live map.
     bpf_conn_state_map_size: 262144
 
+    # Persist compiled DNS request trie structures to speed up warm restarts on large rule sets.
+    # The cache is validated against the current rule content before reuse.
+    trie_cache_enabled: true
+    trie_cache_path: /var/cache/dae/trie-cache.bin
+
     # Socket mark for dae-originated traffic.
     # If omitted, dae auto-selects an internal mark to prevent UDP self-capture.
     # Set a non-zero value to override that mark.
@@ -199,7 +204,7 @@ dns {
     #}
 
     # Enable optimistic cache (RFC 8767) to improve cache hit rate and reduce latency.
-    # When enabled, expired cache entries within stale window are still returned while 
+    # When enabled, expired cache entries within stale window are still returned while
     # background refresh updates the cache.
     # This significantly improves user experience by serving stale data instead of waiting.
     # Default: true
@@ -254,6 +259,8 @@ dns {
     # decisions before real DNS resolution. Synthetic IPs are persistent
     # (survive restart/reload) and unique per domain. Proxy traffic sends
     # the domain to the remote endpoint, not the synthetic IP.
+    # direct_upstream must be a real upstream declared in dns.upstream. It is
+    # used only when business routing selects direct for a FakeIP destination.
     # Changing enabled/inet4_range/store requires a full restart;
     # ttl and direct_upstream are reloadable.
     #fakeip {
@@ -270,6 +277,9 @@ dns {
         request {
             # Lookup China mainland domains using alidns, otherwise googledns.
             qname(geosite:cn) -> alidns
+
+            # Reject HTTPS/SVCB DNS answers to avoid ECH affecting domain-based traffic split.
+            # qtype(https) -> reject
 
             # The same request block can also route dae's own internal DNS lookups.
             # These selectors are independent from normal qname/qtype matching and can only use names
@@ -294,6 +304,14 @@ dns {
             #
             # Note: sub() only affects fetching the subscription itself.
             # Parsed nodes from that subscription will still follow subnode()/node() rules instead.
+
+            # FakeIP auto routing can derive DNS request rules from main routing.
+            # Enable dns.fakeip above before using rules that point to fakeip.
+            # routing_outbound(...) must be the only selector on the left-hand side,
+            # and it must point to the built-in fakeip DNS outbound.
+            # Example: domains that match main-routing rules whose outbound is
+            # proxy_failover will receive synthetic IPv4 answers.
+            # routing_outbound(proxy_failover) -> fakeip
 
             # fallback is also called default.
             fallback: googledns
@@ -372,6 +390,25 @@ group {
         # Override check_tolerance in global
         #check_tolerance: 50ms
     }
+
+    # Priority failover selects exactly one primary and one fallback dialer.
+    # priority: 0 is the primary; priority: 1 is the fallback.
+    # TCP health transitions trigger failover. UDP failures do not trigger failover,
+    # but new UDP sessions follow the current active role after TCP has switched it.
+    # A warm reload preserves failover state when the primary/fallback identities match.
+    #proxy_failover {
+    #    filter: name(node1) [priority: 0]
+    #    filter: name(node2) [priority: 1]
+    #
+    #    policy: failover
+    #
+    #    # Recovery probes are targeted TCP probes used after failover to decide
+    #    # when it is safe to switch back to the primary.
+    #    recovery_probe_initial: 15s
+    #    recovery_probe_max: 5m
+    #    recovery_successes: 3
+    #    recovery_stable_time: 30s
+    #}
 }
 
 # See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.
@@ -397,6 +434,16 @@ routing {
     l4proto(udp) && dport(443) -> block
     dip(geoip:cn) -> direct
     domain(geosite:cn) -> direct
+
+    # Actively refuse matching LAN ingress TCP flows with a TCP reset.
+    # Non-TCP or non-LAN traffic routed to reject is dropped like block.
+    # DNS-layer reject in dns.routing.request is independent from this outbound.
+    # domain(full: blocked.example.com) -> reject
+
+    # Example main-routing rule for the priority failover group above.
+    # If dns.fakeip is enabled, pair this with:
+    #   dns.routing.request: routing_outbound(proxy_failover) -> fakeip
+    # domain(suffix: example.com) -> proxy_failover
 
     fallback: my_group
 }
