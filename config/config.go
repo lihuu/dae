@@ -140,6 +140,19 @@ type Group struct {
 	RecoveryProbeMax     time.Duration `mapstructure:"recovery_probe_max" default:"5m"`
 	RecoverySuccesses    int           `mapstructure:"recovery_successes" default:"3"`
 	RecoveryStableTime   time.Duration `mapstructure:"recovery_stable_time" default:"30s"`
+
+	// Failover notification settings (only used when policy: failover).
+	// failover_notify enables notifications only when set to "bark".
+	// failover_notify_bark_url is the preferred Bark URL source; the _env
+	// variant is consulted only when the direct URL is empty. If neither
+	// resolves, the notifier is disabled for this group.
+	FailoverNotify              string `mapstructure:"failover_notify"`
+	FailoverNotifyBarkURL       string `mapstructure:"failover_notify_bark_url"`
+	FailoverNotifyBarkURLEnv    string `mapstructure:"failover_notify_bark_url_env"`
+	FailoverNotifySwitchTitle   string `mapstructure:"failover_notify_switch_title"`
+	FailoverNotifySwitchBody    string `mapstructure:"failover_notify_switch_body"`
+	FailoverNotifyFailbackTitle string `mapstructure:"failover_notify_failback_title"`
+	FailoverNotifyFailbackBody  string `mapstructure:"failover_notify_failback_body"`
 }
 
 type DnsRequestRouting struct {

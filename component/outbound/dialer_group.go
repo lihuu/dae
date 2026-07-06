@@ -224,6 +224,17 @@ func (g *DialerGroup) HasFailoverController() bool {
 	return g.failoverController != nil
 }
 
+// SetFailoverEventCallback installs a failover event callback on the
+// controller. It is a no-op if the group does not use a failover policy.
+// Must be called immediately after NewDialerGroup, before traffic starts.
+// Keeping this separate from NewDialerGroup avoids changing its signature
+// (which has many existing callers across tests and production).
+func (g *DialerGroup) SetFailoverEventCallback(cb FailoverEventCallback) {
+	if g.failoverController != nil {
+		g.failoverController.SetEventCallback(cb)
+	}
+}
+
 // FailoverIdentity returns the names of the primary and fallback dialers
 // for failover identity matching during reload. Returns empty strings if
 // the group does not use failover.

@@ -34,6 +34,7 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/daedns"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/notifier"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
@@ -797,6 +798,8 @@ func newControlPlaneWithContextOptions(
 		}
 		// Create dialer group and append it to outbounds.
 		var failoverCfg *outbound.FailoverConfig
+		var eventCb outbound.FailoverEventCallback
+		var eventCbClose func()
 		if policy.Policy == consts.DialerSelectionPolicy_Failover {
 			recovery := outbound.FailoverRecoveryConfig{
 				ProbeInitial: group.RecoveryProbeInitial,
@@ -808,10 +811,40 @@ func newControlPlaneWithContextOptions(
 			if err != nil {
 				return nil, fmt.Errorf(`failed to create group "%v": %w`, group.Name, err)
 			}
+			// Build the failover event callback (Bark notifier + dispatcher).
+			// Returns (nil, nil) when notifications are disabled; in that case
+			// nothing is registered and DAE continues normally.
+			eventCb, eventCbClose = buildFailoverEventCallback(
+				log,
+				group.FailoverNotify,
+				group.FailoverNotifyBarkURL,
+				group.FailoverNotifyBarkURLEnv,
+				group.FailoverNotifySwitchTitle,
+				group.FailoverNotifySwitchBody,
+				group.FailoverNotifyFailbackTitle,
+				group.FailoverNotifyFailbackBody,
+			)
+			// Register the dispatcher closer before NewDialerGroup so it is
+			// always torn down (in reverse) alongside dialerGroup.Close on
+			// shutdown/reload via closeTail. Matches the existing deferFuncs
+			// pattern and prevents worker goroutine leaks across generations.
+			if eventCbClose != nil {
+				deferFuncs = append(deferFuncs, func() error {
+					eventCbClose()
+					return nil
+				})
+			}
 		}
 		dialerGroup := outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy,
 			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback),
 			failoverCfg)
+		// Install the callback after construction (NewDialerGroup signature is
+		// unchanged, so its 25+ existing callers are unaffected). No-op when
+		// notifications are disabled (eventCb == nil) or the group is not
+		// failover (SetFailoverEventCallback guards on failoverController).
+		if eventCb != nil {
+			dialerGroup.SetFailoverEventCallback(eventCb)
+		}
 		deferFuncs = append(deferFuncs, dialerGroup.Close)
 		outbounds = append(outbounds, dialerGroup)
 	}
@@ -1104,6 +1137,52 @@ func newControlPlaneWithContextOptions(
 		plane.markReady()
 	}
 	return plane, nil
+}
+
+// failoverNotifyDispatcherCapacity bounds the per-group failover event queue.
+// A full queue drops events (the dispatcher never blocks the controller hot
+// path). 16 is generous for switch/failback transitions while bounding memory.
+const failoverNotifyDispatcherCapacity = 16
+
+// buildFailoverEventCallback constructs the FailoverEventCallback for a
+// failover group. It returns (nil, nil) when notifications are disabled, which
+// happens when:
+//   - notify is not "bark" (failover_notify missing or other value), OR
+//   - notify is "bark" but no Bark URL resolves (directURL empty AND envURL
+//     empty). In this case DAE continues normally without a notifier.
+//
+// On success the returned callback is an asynchronous FailoverEventDispatcher
+// whose worker invokes bark.Send, and the returned closer is dispatcher.Close.
+// The caller MUST register the closer with deferFuncs so the worker goroutine
+// is stopped on group close / control-plane reload (no goroutine leaks across
+// reload generations).
+//
+// URL priority is direct > env, matching the BarkNotifier constructor.
+func buildFailoverEventCallback(
+	log *logrus.Logger,
+	notify, directURL, envURL,
+	switchTitle, switchBody, failbackTitle, failbackBody string,
+) (outbound.FailoverEventCallback, func()) {
+	if notify != "bark" {
+		return nil, nil
+	}
+	bark := notifier.NewBarkNotifier(
+		log, directURL, envURL,
+		switchTitle, switchBody, failbackTitle, failbackBody,
+	)
+	if !bark.Enabled() {
+		// bark configured but no URL resolved: disable silently.
+		return nil, nil
+	}
+	dispatcher := outbound.NewFailoverEventDispatcher(log, "failover", failoverNotifyDispatcherCapacity)
+	dispatcher.SetProcessNext(func(ev outbound.FailoverEvent) {
+		// The dispatcher worker is the sole caller of Send, so the request
+		// timeout (httpTimeout inside the notifier) bounds blocking. Use a
+		// background context: notifications must outlive any request-scoped
+		// context that happened to trigger the failover transition.
+		bark.Send(context.Background(), ev)
+	})
+	return dispatcher, dispatcher.Close
 }
 
 func ParseFixedDomainTtl(ks []config.KeyableString) (map[string]int, error) {

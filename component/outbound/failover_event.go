@@ -55,9 +55,9 @@ type FailoverEventDispatcher struct {
 	log   *logrus.Logger
 	group string
 
-	queue    chan FailoverEvent
-	stop     chan struct{}
-	done     chan struct{}
+	queue     chan FailoverEvent
+	stop      chan struct{}
+	done      chan struct{}
 	closeOnce sync.Once
 
 	// processNext is the notifier invocation. Defaults to a no-op; set by
@@ -113,6 +113,19 @@ func (d *FailoverEventDispatcher) OnFailoverEvent(event FailoverEvent) {
 	default:
 		d.onDrop()
 	}
+}
+
+// SetProcessNext installs the notifier invocation run by the worker for each
+// dequeued event. It must be called before any event is enqueued (i.e.
+// immediately after construction, before the controller starts emitting). The
+// default is a no-op. This is the exported seam used by the control plane to
+// wire a BarkNotifier (or other provider) into the dispatcher without exposing
+// the unexported processNext field.
+func (d *FailoverEventDispatcher) SetProcessNext(fn func(ev FailoverEvent)) {
+	if fn == nil {
+		fn = func(ev FailoverEvent) {}
+	}
+	d.processNext = fn
 }
 
 // Close stops the worker goroutine. In-flight queued events may be dropped.
