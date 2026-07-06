@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/rulesload"
@@ -85,6 +86,17 @@ var (
 				fmt.Println(err)
 				os.Exit(1)
 			}
+			// Reject unknown failover_notify values on failover groups so a
+			// typo'd provider name (e.g. "webhook") fails at `dae validate`
+			// rather than silently disabling notifications at run time.
+			if err := validateFailoverNotify(conf); err != nil {
+				if collector != nil {
+					collector.SetError("failover_notify_error")
+					collector.Emit()
+				}
+				fmt.Println(err)
+				os.Exit(1)
+			}
 			if collector != nil {
 				collector.Emit()
 			}
@@ -107,6 +119,35 @@ var (
 // path uses validateConfigForExpansionWithCollector below.
 func validateConfigForExpansion(conf *config.Config) error {
 	return validateConfigForExpansionWithCollector(conf, nil, nil)
+}
+
+// validateFailoverNotify checks that failover groups with failover_notify use
+// a known provider value. Currently only "bark" (and empty, the default) are
+// accepted; any other value on a failover policy group is rejected with a
+// non-sensitive error so `dae validate -c` fails before reload. Non-failover
+// groups are not enforced — the field is only meaningful under policy: failover
+// — so an unknown value there is left for run time to ignore.
+//
+// Failover-group detection uses the real policy parser
+// (outbound.NewDialerSelectionPolicyFromGroupParam) rather than indexing
+// g.Policy directly, because FunctionListOrString is `any` and not indexable.
+func validateFailoverNotify(conf *config.Config) error {
+	for i := range conf.Group {
+		g := &conf.Group[i]
+		if g.FailoverNotify == "" || g.FailoverNotify == "bark" {
+			continue
+		}
+		policy, err := outbound.NewDialerSelectionPolicyFromGroupParam(g)
+		if err != nil {
+			// A malformed policy is reported by other validation; skip here.
+			continue
+		}
+		if policy.Policy == consts.DialerSelectionPolicy_Failover {
+			return fmt.Errorf("group %q: unknown failover_notify %q (only \"bark\" is supported)",
+				g.Name, g.FailoverNotify)
+		}
+	}
+	return nil
 }
 
 // validateConfigForExpansionWithCollector is the timings-aware variant.

@@ -408,6 +408,25 @@ group {
     #    recovery_probe_max: 5m
     #    recovery_successes: 3
     #    recovery_stable_time: 30s
+    #
+    #    # Failover transition notifications (optional). When set to "bark",
+    #    # DAE emits one Bark push per failover_switch and failback_complete
+    #    # transition. Notifications are async and never block failover.
+    #    failover_notify: bark
+    #
+    #    # Bark URL source. failover_notify_bark_url has priority over
+    #    # failover_notify_bark_url_env. If neither resolves, notifications
+    #    # are disabled for this group without failing startup.
+    #    failover_notify_bark_url: "https://api.day.app/YOUR_TOKEN/"
+    #    failover_notify_bark_url_env: DAE_FAILOVER_BARK_URL
+    #
+    #    # Optional templates. Supported tokens: {group} {primary} {fallback}
+    #    # {from} {to} {trigger} {transition_at} {stable_for} {successes}.
+    #    # Unknown tokens are left literal. Defaults are shown below.
+    #    failover_notify_switch_title: "DAE failover switched"
+    #    failover_notify_switch_body: "{group}: {primary} -> {fallback}; trigger={trigger}; at={transition_at}"
+    #    failover_notify_failback_title: "DAE failover recovered"
+    #    failover_notify_failback_body: "{group}: {fallback} -> {primary}; stable_for={stable_for}; at={transition_at}"
     #}
 }
 
