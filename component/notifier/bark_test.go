@@ -196,6 +196,40 @@ func TestBarkNotifier_NoSecretInLogs(t *testing.T) {
 	}
 }
 
+// TestBarkNotifier_NoSecretInLogs_OnRequestError locks the redaction property
+// on the request-error path. When client.Do errors, Go's HTTP client embeds
+// the full URL in the error message (e.g. `Get "http://host/TOKEN/": ...`).
+// errClass must strip the URL/token so it never reaches the logs.
+func TestBarkNotifier_NoSecretInLogs_OnRequestError(t *testing.T) {
+	var buf strings.Builder
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	log.SetOutput(&buf)
+
+	const secret = "SECRET_TOKEN_REQERR_98765"
+	// Port 1 refuses connections, producing a client.Do request_error without
+	// needing an httptest server. The token is embedded in the URL path.
+	unreachableURL := "http://127.0.0.1:1/" + secret + "/"
+
+	n := NewBarkNotifier(log, unreachableURL, "", "", "", "", "")
+	n.Send(context.Background(), outbound.FailoverEvent{
+		Type:         outbound.FailoverEventSwitch,
+		Group:        "g",
+		Primary:      "p",
+		Fallback:     "f",
+		TransitionAt: time.Now(),
+	})
+
+	out := buf.String()
+	if strings.Contains(out, secret) {
+		t.Fatalf("log output leaked secret token on request-error path:\n%s", out)
+	}
+	// Confirm the request_error debug path was actually exercised.
+	if !strings.Contains(out, "request_error") {
+		t.Fatalf("expected a request_error debug log, got:\n%s", out)
+	}
+}
+
 func TestBarkNotifier_SendHitsServer(t *testing.T) {
 	log := newSilentLog()
 	var hits atomic.Int32
