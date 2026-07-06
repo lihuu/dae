@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -54,9 +55,10 @@ type FailoverEventDispatcher struct {
 	log   *logrus.Logger
 	group string
 
-	queue chan FailoverEvent
-	stop  chan struct{}
-	done  chan struct{}
+	queue    chan FailoverEvent
+	stop     chan struct{}
+	done     chan struct{}
+	closeOnce sync.Once
 
 	// processNext is the notifier invocation. Defaults to a no-op; set by
 	// callers (e.g. the control plane) to wire in a BarkNotifier. Tests
@@ -116,12 +118,9 @@ func (d *FailoverEventDispatcher) OnFailoverEvent(event FailoverEvent) {
 // Close stops the worker goroutine. In-flight queued events may be dropped.
 // It is safe to call concurrently and more than once.
 func (d *FailoverEventDispatcher) Close() {
-	select {
-	case <-d.stop:
-		return
-	default:
+	d.closeOnce.Do(func() {
 		close(d.stop)
-	}
+	})
 	// Drain-stop: close the queue only after stop is closed so OnFailoverEvent
 	// sees the stop signal first. Then wait for the worker to finish.
 	// We cannot close `queue` here directly because OnFailoverEvent may still
