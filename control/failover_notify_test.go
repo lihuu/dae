@@ -56,17 +56,38 @@ func TestBuildFailoverEventCallback_EnabledWhenBarkAndURL(t *testing.T) {
 	defer closer()
 }
 
-// TestBuildFailoverEventCallback_EnvURLUsedWhenDirectEmpty asserts env URL
-// resolves when direct is empty (URL priority: direct > env).
+// TestBuildFailoverEventCallback_EnvURLUsedWhenDirectEmpty asserts the env var
+// NAME is resolved to its VALUE via os.Getenv when direct is empty (URL
+// priority: direct > env). This guards the C-1 bug where the env var name was
+// passed verbatim as the URL.
 func TestBuildFailoverEventCallback_EnvURLUsedWhenDirectEmpty(t *testing.T) {
+	const envVarName = "DAE_TEST_BARK_URL"
+	const envURLValue = "https://api.day.example/env-token/"
+	t.Setenv(envVarName, envURLValue)
 	cb, closer := buildFailoverEventCallback(
 		newTestLogger(),
 		"bark",
-		"",
-		"https://api.day.example/env-token/",
+		"",         // directURL empty
+		envVarName, // the env var NAME
 		"", "", "", "",
 	)
 	require.NotNil(t, cb)
 	require.NotNil(t, closer)
 	defer closer()
+}
+
+// TestBuildFailoverEventCallback_EnvUnsetDisablesWhenDirectEmpty asserts that
+// when the named env var is unset (and direct URL is empty), the notifier is
+// disabled: the resolved env value is empty so no URL is available.
+func TestBuildFailoverEventCallback_EnvUnsetDisablesWhenDirectEmpty(t *testing.T) {
+	// Use a name that is definitely unset (do not call t.Setenv for it).
+	cb, closer := buildFailoverEventCallback(
+		newTestLogger(),
+		"bark",
+		"",
+		"DAE_TEST_BARK_DEFINITELY_UNSET_VAR_XYZ",
+		"", "", "", "",
+	)
+	require.Nil(t, cb)
+	require.Nil(t, closer)
 }

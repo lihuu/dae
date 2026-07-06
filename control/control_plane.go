@@ -1148,8 +1148,9 @@ const failoverNotifyDispatcherCapacity = 16
 // failover group. It returns (nil, nil) when notifications are disabled, which
 // happens when:
 //   - notify is not "bark" (failover_notify missing or other value), OR
-//   - notify is "bark" but no Bark URL resolves (directURL empty AND envURL
-//     empty). In this case DAE continues normally without a notifier.
+//   - notify is "bark" but no Bark URL resolves (directURL empty AND the env
+//     var named by envVarName is unset/empty). In this case DAE continues
+//     normally without a notifier.
 //
 // On success the returned callback is an asynchronous FailoverEventDispatcher
 // whose worker invokes bark.Send, and the returned closer is dispatcher.Close.
@@ -1157,14 +1158,21 @@ const failoverNotifyDispatcherCapacity = 16
 // is stopped on group close / control-plane reload (no goroutine leaks across
 // reload generations).
 //
+// envVarName is the NAME of the environment variable whose VALUE is the Bark
+// URL; it is resolved here via os.Getenv before being passed to the notifier.
 // URL priority is direct > env, matching the BarkNotifier constructor.
 func buildFailoverEventCallback(
 	log *logrus.Logger,
-	notify, directURL, envURL,
+	notify, directURL, envVarName,
 	switchTitle, switchBody, failbackTitle, failbackBody string,
 ) (outbound.FailoverEventCallback, func()) {
 	if notify != "bark" {
 		return nil, nil
+	}
+	// Resolve the env var NAME to its VALUE. Direct URL has priority over env.
+	envURL := ""
+	if envVarName != "" {
+		envURL = os.Getenv(envVarName)
 	}
 	bark := notifier.NewBarkNotifier(
 		log, directURL, envURL,
@@ -1174,8 +1182,7 @@ func buildFailoverEventCallback(
 		// bark configured but no URL resolved: disable silently.
 		return nil, nil
 	}
-	dispatcher := outbound.NewFailoverEventDispatcher(log, "failover", failoverNotifyDispatcherCapacity)
-	dispatcher.SetProcessNext(func(ev outbound.FailoverEvent) {
+	dispatcher := outbound.NewFailoverEventDispatcher(log, "failover", failoverNotifyDispatcherCapacity, func(ev outbound.FailoverEvent) {
 		// The dispatcher worker is the sole caller of Send, so the request
 		// timeout (httpTimeout inside the notifier) bounds blocking. Use a
 		// background context: notifications must outlive any request-scoped

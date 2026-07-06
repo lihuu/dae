@@ -110,8 +110,8 @@ func (n *BarkNotifier) Send(ctx context.Context, event outbound.FailoverEvent) {
 		n.debug(event, "request_error", errClass(err))
 		return
 	}
-	defer io.Copy(io.Discard, resp.Body)
 	defer resp.Body.Close()
+	defer io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		n.debug(event, "http_status_class", httpStatusClass(resp.StatusCode))
 	}

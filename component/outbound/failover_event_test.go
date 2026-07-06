@@ -18,17 +18,15 @@ func TestFailoverEventDispatcher_QueueFullDrops(t *testing.T) {
 	log.SetLevel(logrus.PanicLevel) // suppress debug noise
 
 	// capacity 1, with a blocker so the worker never drains.
-	d := NewFailoverEventDispatcher(log, "g", 1)
-	defer d.Close()
-
 	// Block the worker so the queue stays full.
 	block := make(chan struct{})
 	released := make(chan struct{})
-	d.processNext = func(ev FailoverEvent) {
+	d := NewFailoverEventDispatcher(log, "g", 1, func(ev FailoverEvent) {
 		// signal we are holding the worker, then wait for release.
 		close(released)
 		<-block
-	}
+	})
+	defer d.Close()
 
 	// First event enters the worker (queue drains immediately).
 	d.OnFailoverEvent(FailoverEvent{Type: FailoverEventSwitch, Group: "g"})
@@ -61,10 +59,8 @@ func TestFailoverEventDispatcher_CloseStopsWorker(t *testing.T) {
 	log := logrus.New()
 	log.SetLevel(logrus.PanicLevel)
 
-	d := NewFailoverEventDispatcher(log, "g", 4)
-
 	var count atomic.Int32
-	d.processNext = func(ev FailoverEvent) { count.Add(1) }
+	d := NewFailoverEventDispatcher(log, "g", 4, func(ev FailoverEvent) { count.Add(1) })
 
 	for i := range 4 {
 		d.OnFailoverEvent(FailoverEvent{Type: FailoverEventSwitch, Group: "g"})

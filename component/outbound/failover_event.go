@@ -60,9 +60,9 @@ type FailoverEventDispatcher struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	// processNext is the notifier invocation. Defaults to a no-op; set by
-	// callers (e.g. the control plane) to wire in a BarkNotifier. Tests
-	// override it to observe dispatch behavior.
+	// processNext is the notifier invocation. It is injected via the
+	// constructor (the control plane wires in a BarkNotifier). Tests inject
+	// it the same way to observe dispatch behavior.
 	processNext func(ev FailoverEvent)
 	// onDrop is invoked when an event is dropped due to a full queue.
 	// Defaults to a debug log; tests override it to count drops.
@@ -70,11 +70,19 @@ type FailoverEventDispatcher struct {
 }
 
 // NewFailoverEventDispatcher creates a dispatcher with the given queue
-// capacity. The dispatcher starts one worker goroutine. Call Close to stop the
-// worker and release resources.
-func NewFailoverEventDispatcher(log *logrus.Logger, group string, capacity int) *FailoverEventDispatcher {
+// capacity and the per-event notifier invocation (processNext). The
+// dispatcher starts one worker goroutine. If processNext is nil it defaults to
+// a no-op. Call Close to stop the worker and release resources.
+//
+// processNext is a constructor parameter (rather than set after construction)
+// so the worker goroutine — started here — never observes a concurrent write
+// to the field, which would be a data race.
+func NewFailoverEventDispatcher(log *logrus.Logger, group string, capacity int, processNext func(ev FailoverEvent)) *FailoverEventDispatcher {
 	if capacity < 1 {
 		capacity = 1
+	}
+	if processNext == nil {
+		processNext = func(ev FailoverEvent) {}
 	}
 	d := &FailoverEventDispatcher{
 		log:         log,
@@ -82,7 +90,7 @@ func NewFailoverEventDispatcher(log *logrus.Logger, group string, capacity int) 
 		queue:       make(chan FailoverEvent, capacity),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
-		processNext: func(ev FailoverEvent) {},
+		processNext: processNext,
 		onDrop:      func() {},
 	}
 	d.onDrop = func() {
@@ -113,19 +121,6 @@ func (d *FailoverEventDispatcher) OnFailoverEvent(event FailoverEvent) {
 	default:
 		d.onDrop()
 	}
-}
-
-// SetProcessNext installs the notifier invocation run by the worker for each
-// dequeued event. It must be called before any event is enqueued (i.e.
-// immediately after construction, before the controller starts emitting). The
-// default is a no-op. This is the exported seam used by the control plane to
-// wire a BarkNotifier (or other provider) into the dispatcher without exposing
-// the unexported processNext field.
-func (d *FailoverEventDispatcher) SetProcessNext(fn func(ev FailoverEvent)) {
-	if fn == nil {
-		fn = func(ev FailoverEvent) {}
-	}
-	d.processNext = fn
 }
 
 // Close stops the worker goroutine. In-flight queued events may be dropped.
