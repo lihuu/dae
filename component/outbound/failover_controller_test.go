@@ -8,6 +8,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -863,5 +864,204 @@ func TestFailoverGroupActivatesPrimaryConnectivityCheck(t *testing.T) {
 	// failover controller, not latency-based selection).
 	if state := group.currentSelectionState(); state.aliveDialerSets[0] != nil {
 		t.Fatal("failover group must not create AliveDialerSet")
+	}
+}
+
+// --- Failover Event Emission Tests ---
+
+// recordingCallback captures events for test assertions.
+type recordingCallback struct {
+	mu     sync.Mutex
+	events []FailoverEvent
+}
+
+func (r *recordingCallback) OnFailoverEvent(ev FailoverEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, ev)
+}
+
+func (r *recordingCallback) snapshot() []FailoverEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]FailoverEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+func TestFailoverController_EmitsSwitchEvent(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	cb := &recordingCallback{}
+	fc := NewFailoverController(log, "proxy_failover", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	defer fc.Close()
+	fc.SetEventCallback(cb)
+
+	// Active dialer must be primary BEFORE the transition.
+	if fc.ActiveDialerIndex() != 0 {
+		t.Fatalf("pre-transition active = %d, want 0", fc.ActiveDialerIndex())
+	}
+
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	if fc.ActiveDialerIndex() != 1 {
+		t.Fatalf("post-transition active = %d, want 1", fc.ActiveDialerIndex())
+	}
+
+	evs := cb.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("emitted %d events, want 1", len(evs))
+	}
+	ev := evs[0]
+	if ev.Type != FailoverEventSwitch {
+		t.Fatalf("event type = %v, want failover_switch", ev.Type)
+	}
+	if ev.Group != "proxy_failover" {
+		t.Fatalf("event group = %q, want proxy_failover", ev.Group)
+	}
+	if ev.From != "primary" || ev.To != "fallback" {
+		t.Fatalf("event from/to = %q/%q, want primary/fallback", ev.From, ev.To)
+	}
+	if ev.Trigger != "tcp_unavailable" {
+		t.Fatalf("event trigger = %q, want tcp_unavailable", ev.Trigger)
+	}
+	if ev.TransitionAt.IsZero() {
+		t.Fatal("event transition_at is zero")
+	}
+}
+
+func TestFailoverController_DuplicateSwitchSuppressed(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	cb := &recordingCallback{}
+	fc := NewFailoverController(log, "g", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: time.Hour,
+		ProbeMax:     time.Hour,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+	})
+	defer fc.Close()
+	fc.SetEventCallback(cb)
+
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+	// Duplicate unhealthy callbacks while already in fallback.
+	fc.onPrimaryHealthChange(tcp4, false)
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	evs := cb.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("emitted %d switch events, want 1", len(evs))
+	}
+}
+
+func TestFailoverController_EmitsFailbackEvent(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     time.Hour,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	cb := &recordingCallback{}
+	fc := NewFailoverController(log, "g", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: time.Hour,
+		ProbeMax:     time.Hour,
+		Successes:    3,
+		StableTime:   time.Nanosecond,
+	})
+	defer fc.Close()
+	fc.SetEventCallback(cb)
+
+	fc.probeTCP = func(context.Context) (bool, error) {
+		return true, nil
+	}
+	// Trigger switch.
+	fc.onPrimaryHealthChange(&dialer.NetworkType{
+		L4Proto:   consts.L4ProtoStr_TCP,
+		IpVersion: consts.IpVersionStr_4,
+	}, false)
+	// Drive 3 successful probes -> failback.
+	for range 3 {
+		runFailoverProbeNow(t, fc)
+	}
+
+	if fc.ActiveDialerIndex() != 0 {
+		t.Fatalf("post-failback active = %d, want 0", fc.ActiveDialerIndex())
+	}
+	evs := cb.snapshot()
+	if len(evs) != 2 {
+		t.Fatalf("emitted %d events, want 2 (switch + failback)", len(evs))
+	}
+	if evs[0].Type != FailoverEventSwitch {
+		t.Fatalf("event 0 type = %v, want failover_switch", evs[0].Type)
+	}
+	if evs[1].Type != FailoverEventFailbackComplete {
+		t.Fatalf("event 1 type = %v, want failback_complete", evs[1].Type)
+	}
+	fb := evs[1]
+	if fb.From != "fallback" || fb.To != "primary" {
+		t.Fatalf("failback from/to = %q/%q, want fallback/primary", fb.From, fb.To)
+	}
+	if fb.Successes != 3 {
+		t.Fatalf("failback successes = %d, want 3", fb.Successes)
+	}
+	if fb.StableFor <= 0 {
+		t.Fatalf("failback stable_for = %v, want positive", fb.StableFor)
+	}
+	if fb.TransitionAt.IsZero() {
+		t.Fatal("failback transition_at is zero")
+	}
+}
+
+func TestFailoverController_NoEventAfterClose(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     time.Hour,
+	}
+	primary := newDirectDialer(option, false)
+	fallback := newDirectDialer(option, false)
+
+	cb := &recordingCallback{}
+	fc := NewFailoverController(log, "g", primary, fallback, FailoverRecoveryConfig{
+		ProbeInitial: time.Hour,
+		ProbeMax:     time.Hour,
+		Successes:    3,
+		StableTime:   time.Nanosecond,
+	})
+	fc.SetEventCallback(cb)
+	fc.Close()
+
+	tcp4 := &dialer.NetworkType{L4Proto: "tcp", IpVersion: "4"}
+	fc.onPrimaryHealthChange(tcp4, false)
+
+	evs := cb.snapshot()
+	if len(evs) != 0 {
+		t.Fatalf("emitted %d events after Close, want 0", len(evs))
 	}
 }

@@ -71,6 +71,12 @@ type FailoverController struct {
 	// early without modifying state or scheduling timers.
 	closed bool
 
+	// eventCallback receives transition events. May be nil (notifications
+	// disabled). Set via SetEventCallback before traffic starts. The callback
+	// must be non-blocking (queue-send only) because it is invoked while mu is
+	// held.
+	eventCallback FailoverEventCallback
+
 	// snapshot is read lock-free on the selection path.
 	snapshot atomic.Pointer[failoverSnapshot]
 }
@@ -115,6 +121,16 @@ func NewFailoverController(
 	primary.MarkKeepConnectivityCheck()
 
 	return fc
+}
+
+// SetEventCallback installs a failover event callback. It must be called
+// before traffic starts (i.e., immediately after construction). The callback
+// must be non-blocking because OnFailoverEvent is invoked while the
+// controller mutex is held.
+func (fc *FailoverController) SetEventCallback(cb FailoverEventCallback) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.eventCallback = cb
 }
 
 // ActiveDialerIndex returns the index of the currently active dialer.
@@ -167,6 +183,16 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 	fc.stableSince = time.Time{}
 	fc.currentDelay = fc.config.ProbeInitial
 	fc.publishSnapshot()
+	fc.emitEventLocked(FailoverEvent{
+		Type:         FailoverEventSwitch,
+		Group:        fc.groupName,
+		From:         "primary",
+		To:           "fallback",
+		Primary:      dialerName(fc.primary),
+		Fallback:     dialerName(fc.fallback),
+		Trigger:      "tcp_unavailable",
+		TransitionAt: time.Now(),
+	})
 
 	// Schedule the first recovery probe.
 	fc.scheduleProbeLocked()
@@ -278,11 +304,28 @@ func (fc *FailoverController) onProbeSuccessLocked() {
 			"stable_for": time.Since(fc.stableSince).Round(time.Second),
 		}).Info("failback_complete")
 
+		// Capture the values that made this failback qualify, before resetting.
+		// StableFor is left unrounded so sub-second stable windows (and the
+		// pre-reset value itself) are preserved; the log line above rounds for
+		// display only.
+		successes := fc.recoverySuccesses
+		stableFor := time.Since(fc.stableSince)
 		fc.state = statePrimaryActive
 		fc.recoverySuccesses = 0
 		fc.stableSince = time.Time{}
 		fc.currentDelay = fc.config.ProbeInitial
 		fc.publishSnapshot()
+		fc.emitEventLocked(FailoverEvent{
+			Type:         FailoverEventFailbackComplete,
+			Group:        fc.groupName,
+			From:         "fallback",
+			To:           "primary",
+			Primary:      dialerName(fc.primary),
+			Fallback:     dialerName(fc.fallback),
+			Successes:    successes,
+			StableFor:    stableFor,
+			TransitionAt: time.Now(),
+		})
 		return
 	}
 
@@ -327,6 +370,16 @@ func (fc *FailoverController) publishSnapshot() {
 		state:     fc.state,
 		activeIdx: activeIdx,
 	})
+}
+
+// emitEventLocked constructs and dispatches a FailoverEvent. Must be called
+// with mu held; the callback contract requires non-blocking dispatch. If the
+// callback is nil or the controller is closed, this is a no-op.
+func (fc *FailoverController) emitEventLocked(ev FailoverEvent) {
+	if fc.closed || fc.eventCallback == nil {
+		return
+	}
+	fc.eventCallback.OnFailoverEvent(ev)
 }
 
 // Close cancels all pending timers and probes. Must be called when the group
