@@ -29,7 +29,7 @@ func newTestLogger() *logrus.Logger {
 // TestBuildFailoverEventCallback_DisabledWhenNoNotify asserts that a group
 // without failover_notify gets a nil callback (notifications disabled).
 func TestBuildFailoverEventCallback_DisabledWhenNoNotify(t *testing.T) {
-	cb, closer := buildFailoverEventCallback(newTestLogger(), testNotifyConfig(""), "", "", "", "", "", "")
+	cb, closer := buildFailoverEventCallback(newTestLogger(), testNotifyConfig(""), "", "", "", "", "", "", "")
 	require.Nil(t, cb)
 	require.Nil(t, closer)
 }
@@ -37,7 +37,7 @@ func TestBuildFailoverEventCallback_DisabledWhenNoNotify(t *testing.T) {
 // TestBuildFailoverEventCallback_DisabledWhenBarkButNoURL asserts that
 // failover_notify: bark with no URL disables the notifier without error.
 func TestBuildFailoverEventCallback_DisabledWhenBarkButNoURL(t *testing.T) {
-	cb, closer := buildFailoverEventCallback(newTestLogger(), "bark", "", "", "", "", "", "")
+	cb, closer := buildFailoverEventCallback(newTestLogger(), "bark", "", "", "", "", "", "", "")
 	require.Nil(t, cb)
 	require.Nil(t, closer)
 }
@@ -50,6 +50,7 @@ func TestBuildFailoverEventCallback_EnabledWhenBarkAndURL(t *testing.T) {
 		"bark",
 		"https://api.day.example/token/",
 		"", "", "", "", "",
+		"",
 	)
 	require.NotNil(t, cb)
 	require.NotNil(t, closer)
@@ -70,6 +71,7 @@ func TestBuildFailoverEventCallback_EnvURLUsedWhenDirectEmpty(t *testing.T) {
 		"",         // directURL empty
 		envVarName, // the env var NAME
 		"", "", "", "",
+		"", // proxyURL
 	)
 	require.NotNil(t, cb)
 	require.NotNil(t, closer)
@@ -87,6 +89,7 @@ func TestBuildFailoverEventCallback_EnvUnsetDisablesWhenDirectEmpty(t *testing.T
 		"",
 		"DAE_TEST_BARK_DEFINITELY_UNSET_VAR_XYZ",
 		"", "", "", "",
+		"", // proxyURL
 	)
 	require.Nil(t, cb)
 	require.Nil(t, closer)

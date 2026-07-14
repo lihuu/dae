@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/net/proxy"
 )
 
 // Default Bark notification templates (verbatim from the design spec).
@@ -47,7 +49,13 @@ type BarkNotifier struct {
 // NewBarkNotifier constructs a BarkNotifier. directURL has priority over
 // envURL; if both are empty the notifier is disabled (Enabled() returns
 // false). Empty template strings fall back to the defaults.
-func NewBarkNotifier(log *logrus.Logger, directURL, envURL, switchTitle, switchBody, failbackTitle, failbackBody string) *BarkNotifier {
+//
+// proxyURL is an optional SOCKS5 proxy URL (e.g. "socks5://127.0.0.1:10808")
+// that routes notification HTTP requests through a local proxy instead of
+// being captured by DAE's own transparent proxy. When proxyURL is empty or
+// the proxy cannot be initialized, the notifier falls back to a direct
+// http.Client.
+func NewBarkNotifier(log *logrus.Logger, directURL, envURL, switchTitle, switchBody, failbackTitle, failbackBody, proxyURL string) *BarkNotifier {
 	base := directURL
 	if base == "" {
 		base = envURL
@@ -64,6 +72,17 @@ func NewBarkNotifier(log *logrus.Logger, directURL, envURL, switchTitle, switchB
 	if failbackBody == "" {
 		failbackBody = defaultFailbackBody
 	}
+	client := &http.Client{Timeout: httpTimeout}
+	if proxyURL != "" {
+		if transport, err := newSOCKS5Transport(proxyURL); err == nil {
+			client.Transport = transport
+		} else if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+			log.WithFields(logrus.Fields{
+				"provider": "bark",
+				"reason":   "proxy_init_error",
+			}).Debug("failover notify using direct (proxy unavailable)")
+		}
+	}
 	return &BarkNotifier{
 		log:           log,
 		baseURL:       base,
@@ -71,7 +90,7 @@ func NewBarkNotifier(log *logrus.Logger, directURL, envURL, switchTitle, switchB
 		switchBody:    switchBody,
 		failbackTitle: failbackTitle,
 		failbackBody:  failbackBody,
-		client:        &http.Client{Timeout: httpTimeout},
+		client:        client,
 	}
 }
 
@@ -220,4 +239,32 @@ func errClass(err error) string {
 		return msg[:i]
 	}
 	return msg
+}
+
+// newSOCKS5Transport builds an http.RoundTripper that dials through a SOCKS5
+// proxy. The proxy URL must be a valid URL with a resolvable host (e.g.
+// "socks5://127.0.0.1:10808"). No authentication is configured; local Xray
+// SOCKS5 does not require it.
+func newSOCKS5Transport(proxyURL string) (http.RoundTripper, error) {
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("empty proxy host")
+	}
+	dialer, err := proxy.SOCKS5("tcp", u.Host, nil, proxy.Direct)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// proxy.SOCKS5 returns a dialer that also implements ContextDialer;
+			// prefer DialContext to respect cancellation/timeouts.
+			if cd, ok := dialer.(proxy.ContextDialer); ok {
+				return cd.DialContext(ctx, network, addr)
+			}
+			return dialer.Dial(network, addr)
+		},
+	}, nil
 }

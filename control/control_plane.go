@@ -823,6 +823,7 @@ func newControlPlaneWithContextOptions(
 				group.FailoverNotifySwitchBody,
 				group.FailoverNotifyFailbackTitle,
 				group.FailoverNotifyFailbackBody,
+				group.FailoverNotifyBarkProxy,
 			)
 			// Register the dispatcher closer before NewDialerGroup so it is
 			// always torn down (in reverse) alongside dialerGroup.Close on
@@ -1164,7 +1165,7 @@ const failoverNotifyDispatcherCapacity = 16
 func buildFailoverEventCallback(
 	log *logrus.Logger,
 	notify, directURL, envVarName,
-	switchTitle, switchBody, failbackTitle, failbackBody string,
+	switchTitle, switchBody, failbackTitle, failbackBody, proxyURL string,
 ) (outbound.FailoverEventCallback, func()) {
 	if notify != "bark" {
 		return nil, nil
@@ -1177,6 +1178,7 @@ func buildFailoverEventCallback(
 	bark := notifier.NewBarkNotifier(
 		log, directURL, envURL,
 		switchTitle, switchBody, failbackTitle, failbackBody,
+		proxyURL,
 	)
 	if !bark.Enabled() {
 		// bark configured but no URL resolved: disable silently.

@@ -420,6 +420,14 @@ group {
     #    failover_notify_bark_url: "https://api.day.app/YOUR_TOKEN/"
     #    failover_notify_bark_url_env: DAE_FAILOVER_BARK_URL
     #
+    #    # Optional SOCKS5 proxy for Bark notification delivery. When set, the
+    #    # notifier HTTP request goes through this proxy (e.g. local Xray)
+    #    # instead of being captured by DAE's own transparent proxy. This
+    #    # avoids delivery failures during failover/failback transitions when
+    #    # the transparent path is momentarily unstable. When empty or when the
+    #    # proxy cannot be initialized, the notifier falls back to direct.
+    #    failover_notify_bark_proxy: "socks5://127.0.0.1:10808"
+    #
     #    # Optional templates. Supported tokens: {group} {primary} {fallback}
     #    # {from} {to} {trigger} {transition_at} {stable_for} {successes}.
     #    # Unknown tokens are left literal. Defaults are shown below.

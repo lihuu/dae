@@ -153,6 +153,11 @@ type Group struct {
 	FailoverNotifySwitchBody    string `mapstructure:"failover_notify_switch_body"`
 	FailoverNotifyFailbackTitle string `mapstructure:"failover_notify_failback_title"`
 	FailoverNotifyFailbackBody  string `mapstructure:"failover_notify_failback_body"`
+	// failover_notify_bark_proxy routes Bark notification HTTP requests through
+	// the specified SOCKS5 proxy (e.g. local Xray) instead of letting them be
+	// captured by DAE's own transparent proxy. This avoids delivery failures
+	// during failover/failback transitions when the transparent path is unstable.
+	FailoverNotifyBarkProxy string `mapstructure:"failover_notify_bark_proxy"`
 }
 
 type DnsRequestRouting struct {

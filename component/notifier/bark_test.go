@@ -30,7 +30,7 @@ func TestBarkNotifier_DirectURLOverridesEnv(t *testing.T) {
 	env := "https://api.day.app/ENV_TOKEN/"
 
 	// direct URL wins when both are configured.
-	n := NewBarkNotifier(log, direct, env, "", "", "", "")
+	n := NewBarkNotifier(log, direct, env, "", "", "", "", "")
 	if got := n.baseURL; got != direct {
 		t.Fatalf("baseURL = %q, want direct %q", got, direct)
 	}
@@ -42,7 +42,7 @@ func TestBarkNotifier_DirectURLOverridesEnv(t *testing.T) {
 func TestBarkNotifier_EnvUsedWhenDirectEmpty(t *testing.T) {
 	log := newSilentLog()
 	env := "https://api.day.app/ENV_TOKEN/"
-	n := NewBarkNotifier(log, "", env, "", "", "", "")
+	n := NewBarkNotifier(log, "", env, "", "", "", "", "")
 	if got := n.baseURL; got != env {
 		t.Fatalf("baseURL = %q, want env %q", got, env)
 	}
@@ -53,7 +53,7 @@ func TestBarkNotifier_EnvUsedWhenDirectEmpty(t *testing.T) {
 
 func TestBarkNotifier_DisabledWhenNeitherURL(t *testing.T) {
 	log := newSilentLog()
-	n := NewBarkNotifier(log, "", "", "", "", "", "")
+	n := NewBarkNotifier(log, "", "", "", "", "", "", "")
 	if n.Enabled() {
 		t.Fatal("Enabled() = true, want false when no URL configured")
 	}
@@ -68,7 +68,7 @@ func TestBarkNotifier_SendDoesNotBlock(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := NewBarkNotifier(log, srv.URL, "", "", "", "", "")
+	n := NewBarkNotifier(log, srv.URL, "", "", "", "", "", "")
 	done := make(chan struct{})
 	go func() {
 		n.Send(context.Background(), outbound.FailoverEvent{
@@ -92,7 +92,7 @@ func TestBarkNotifier_SendDoesNotBlock(t *testing.T) {
 
 func TestBarkNotifier_RenderSwitchTokens(t *testing.T) {
 	log := newSilentLog()
-	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "")
+	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "", "")
 	ts := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
 	ev := outbound.FailoverEvent{
 		Type:         outbound.FailoverEventSwitch,
@@ -116,7 +116,7 @@ func TestBarkNotifier_RenderSwitchTokens(t *testing.T) {
 
 func TestBarkNotifier_RenderFailbackTokens(t *testing.T) {
 	log := newSilentLog()
-	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "")
+	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "", "")
 	ts := time.Date(2026, 7, 6, 12, 5, 0, 0, time.UTC)
 	ev := outbound.FailoverEvent{
 		Type:         outbound.FailoverEventFailbackComplete,
@@ -139,7 +139,7 @@ func TestBarkNotifier_RenderFailbackTokens(t *testing.T) {
 func TestBarkNotifier_UnknownTokenLeftLiteral(t *testing.T) {
 	log := newSilentLog()
 	n := NewBarkNotifier(log, "https://api.day.app/x", "",
-		"Title {unknown_token}", "{group} body", "", "")
+		"Title {unknown_token}", "{group} body", "", "", "")
 	ev := outbound.FailoverEvent{Type: outbound.FailoverEventSwitch, Group: "g"}
 	title, body := n.render(ev)
 	if title != "Title {unknown_token}" {
@@ -154,7 +154,7 @@ func TestBarkNotifier_MissingFieldsRenderEmpty(t *testing.T) {
 	log := newSilentLog()
 	// Custom body references every token; event leaves most empty.
 	n := NewBarkNotifier(log, "https://api.day.app/x", "",
-		"", "{group}|{primary}|{fallback}|{from}|{to}|{trigger}|{transition_at}|{stable_for}|{successes}", "", "")
+		"", "{group}|{primary}|{fallback}|{from}|{to}|{trigger}|{transition_at}|{stable_for}|{successes}", "", "", "")
 	ev := outbound.FailoverEvent{Type: outbound.FailoverEventSwitch}
 	_, body := n.render(ev)
 	want := "||||||||"
@@ -178,7 +178,7 @@ func TestBarkNotifier_NoSecretInLogs(t *testing.T) {
 	// Embed the secret in the URL path (typical Bark token location).
 	secretURL := srv.URL + "/" + secret + "/"
 
-	n := NewBarkNotifier(log, secretURL, "", "", "", "", "")
+	n := NewBarkNotifier(log, secretURL, "", "", "", "", "", "")
 	n.Send(context.Background(), outbound.FailoverEvent{
 		Type:         outbound.FailoverEventSwitch,
 		Group:        "g",
@@ -211,7 +211,7 @@ func TestBarkNotifier_NoSecretInLogs_OnRequestError(t *testing.T) {
 	// needing an httptest server. The token is embedded in the URL path.
 	unreachableURL := "http://127.0.0.1:1/" + secret + "/"
 
-	n := NewBarkNotifier(log, unreachableURL, "", "", "", "", "")
+	n := NewBarkNotifier(log, unreachableURL, "", "", "", "", "", "")
 	n.Send(context.Background(), outbound.FailoverEvent{
 		Type:         outbound.FailoverEventSwitch,
 		Group:        "g",
@@ -239,7 +239,7 @@ func TestBarkNotifier_SendHitsServer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := NewBarkNotifier(log, srv.URL, "", "", "", "", "")
+	n := NewBarkNotifier(log, srv.URL, "", "", "", "", "", "")
 	n.Send(context.Background(), outbound.FailoverEvent{
 		Type:         outbound.FailoverEventSwitch,
 		Group:        "g",
@@ -250,5 +250,39 @@ func TestBarkNotifier_SendHitsServer(t *testing.T) {
 	// Give the synchronous Send a moment to complete (it is synchronous).
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("server hits = %d, want 1", got)
+	}
+}
+
+// TestBarkNotifier_ProxyTransportBuilt asserts that when a proxyURL is
+// configured, the notifier's HTTP client gets a custom Transport (SOCKS5).
+func TestBarkNotifier_ProxyTransportBuilt(t *testing.T) {
+	log := newSilentLog()
+	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "", "socks5://127.0.0.1:10808")
+	if n.client.Transport == nil {
+		t.Fatal("client.Transport = nil, want non-nil when proxyURL configured")
+	}
+}
+
+// TestBarkNotifier_NoProxyWhenEmpty asserts that when proxyURL is empty,
+// the notifier uses a plain http.Client with no custom Transport.
+func TestBarkNotifier_NoProxyWhenEmpty(t *testing.T) {
+	log := newSilentLog()
+	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "", "")
+	if n.client.Transport != nil {
+		t.Fatal("client.Transport != nil, want nil when no proxy configured")
+	}
+}
+
+// TestBarkNotifier_InvalidProxyFallsBackToDirect asserts that an invalid
+// proxyURL does not panic and falls back to a direct client (Transport nil).
+func TestBarkNotifier_InvalidProxyFallsBackToDirect(t *testing.T) {
+	log := newSilentLog()
+	// An unparseable URL with invalid characters.
+	n := NewBarkNotifier(log, "https://api.day.app/x", "", "", "", "", "", "://invalid")
+	if n.Enabled() {
+		// The notifier should still be enabled (URL is valid); only the proxy failed.
+		if n.client.Transport != nil {
+			t.Fatal("client.Transport != nil, want nil when proxy init failed (fallback to direct)")
+		}
 	}
 }
