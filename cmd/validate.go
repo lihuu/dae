@@ -86,6 +86,18 @@ var (
 				fmt.Println(err)
 				os.Exit(1)
 			}
+			// Reject invalid primary_rotation_attempts values (negative, or
+			// nonzero on a non-failover policy) at `dae validate` so a
+			// misconfigured group fails before reload. The runtime policy
+			// parser performs the same checks at startup/reload.
+			if err := validateFailoverSettings(conf); err != nil {
+				if collector != nil {
+					collector.SetError("failover_settings_error")
+					collector.Emit()
+				}
+				fmt.Println(err)
+				os.Exit(1)
+			}
 			// Reject unknown failover_notify values on failover groups so a
 			// typo'd provider name (e.g. "webhook") fails at `dae validate`
 			// rather than silently disabling notifications at run time.
@@ -145,6 +157,29 @@ func validateFailoverNotify(conf *config.Config) error {
 		if policy.Policy == consts.DialerSelectionPolicy_Failover {
 			return fmt.Errorf("group %q: unknown failover_notify %q (only \"bark\" is supported)",
 				g.Name, g.FailoverNotify)
+		}
+	}
+	return nil
+}
+
+// validateFailoverSettings checks that primary_rotation_attempts is either
+// disabled (zero) or used with policy: failover and a non-negative value.
+// The runtime policy parser (outbound.NewDialerSelectionPolicyFromGroupParam)
+// performs the same checks at startup/reload, so an operator who skips
+// `dae validate` still gets a deterministic failure. This function mirrors
+// that guard at validate time and reports the offending group by name.
+//
+// Groups with primary_rotation_attempts == 0 are skipped to preserve the
+// legacy two-dialer failover contract and to avoid re-parsing every group
+// policy.
+func validateFailoverSettings(conf *config.Config) error {
+	for i := range conf.Group {
+		g := &conf.Group[i]
+		if g.PrimaryRotationAttempts == 0 {
+			continue
+		}
+		if _, err := outbound.NewDialerSelectionPolicyFromGroupParam(g); err != nil {
+			return fmt.Errorf("group %q: %w", g.Name, err)
 		}
 	}
 	return nil

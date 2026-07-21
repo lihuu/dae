@@ -141,6 +141,12 @@ type Group struct {
 	RecoverySuccesses    int           `mapstructure:"recovery_successes" default:"3"`
 	RecoveryStableTime   time.Duration `mapstructure:"recovery_stable_time" default:"30s"`
 
+	// PrimaryRotationAttempts enables ordered standby-Primary recovery after
+	// this many failed probes against the current Primary. Zero disables it
+	// and preserves the legacy two-dialer failover contract. A positive value
+	// is only valid with policy: failover.
+	PrimaryRotationAttempts int `mapstructure:"primary_rotation_attempts" default:"0"`
+
 	// Failover notification settings (only used when policy: failover).
 	// failover_notify enables notifications only when set to "bark".
 	// failover_notify_bark_url is the preferred Bark URL source; the _env
