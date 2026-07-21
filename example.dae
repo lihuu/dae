@@ -436,6 +436,42 @@ group {
     #    failover_notify_failback_title: "DAE failover recovered"
     #    failover_notify_failback_body: "{group}: {fallback} -> {primary}; stable_for={stable_for}; at={transition_at}"
     #}
+
+    # Primary rotation failover (opt-in). When the current primary exhausts
+    # primary_rotation_attempts failed recovery probes, the controller begins
+    # probing ordered standby primary candidates circularly (B -> C -> A -> B
+    # -> ...). The first candidate that satisfies the stable-recovery
+    # requirements becomes the new current primary; the fixed fallback keeps
+    # serving new traffic until then. A warm reload preserves the in-memory
+    # rotation state when the fixed-fallback identity, the ordered primary
+    # candidate list, and every recovery policy field all match; a process
+    # restart always resets to priority: 0. No candidate scanning occurs
+    # while the current primary is healthy.
+    #
+    # Priority semantics for policy: failover:
+    #   priority: 0  initial current primary (exactly one; selected on fresh start)
+    #   priority: 1  fixed fallback (exactly one; never rotates)
+    #   priority: 2+ standby primary candidates, sorted by numeric priority;
+    #              gaps are valid (e.g. 2, 4, 8 probe in that order)
+    #
+    # primary_rotation_attempts: integer, default 0. 0 disables rotation and
+    # preserves the legacy two-dialer failover contract. A positive value is
+    # the number of failed recovery probes the current primary receives before
+    # the recovery target advances to the next standby candidate. Only valid
+    # with policy: failover.
+    #proxy_failover {
+    #    filter: name(node_A) [priority: 0] # initial Primary after process start
+    #    filter: name(xray_local) [priority: 1] # fixed Fallback
+    #    filter: name(node_B) [priority: 2] # first standby Primary
+    #    filter: name(node_C) [priority: 3] # second standby Primary
+    #
+    #    policy: failover
+    #    primary_rotation_attempts: 5
+    #    recovery_probe_initial: 15s
+    #    recovery_probe_max: 5m
+    #    recovery_successes: 3
+    #    recovery_stable_time: 30s
+    #}
 }
 
 # See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.

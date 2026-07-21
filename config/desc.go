@@ -97,13 +97,20 @@ Available functions: name, subtag. Not operator is supported.
 Available keys in name function: keyword, regex. No key indicates full match.
 Available keys in subtag function: regex. No key indicates full match.`,
 	"policy": `Dialer selection policy. For each new connection, select a node as dialer from group by this policy.
-Available values: random, fixed, min, min_avg10, min_moving_avg.
+Available values: random, fixed, min, min_avg10, min_moving_avg, failover.
 random: Select randomly.
 fixed: Select the fixed node. Connectivity check will be disabled.
 min: Select node by the latency of last check.
 min_avg10: Select node by the average of latencies of last 10 checks.
 min_moving_avg: Select node by the moving average of latencies of checks, which means more recent latencies have higher weight.
-`,
+failover: Select the current primary dialer; fall back to a fixed fallback dialer when the primary's TCP health transitions to unavailable. Exactly one priority: 0 dialer (initial primary) and one priority: 1 dialer (fixed fallback) are required. Optional priority: 2+ dialers are standby primary candidates used when primary_rotation_attempts is set. A warm reload preserves in-memory failover state when the primary/fallback identities and recovery policy match; a process restart resets to priority: 0.`,
+	"recovery_probe_initial": "Targeted TCP recovery probe initial backoff after failover (failover policy only). Default 15s. Failed probes double this delay, capped by recovery_probe_max. Confirmation probes after a successful probe run at this initial interval.",
+	"recovery_probe_max":     "Maximum backoff between recovery probes (failover policy only). Default 5m. Failed-probe exponential backoff is capped at this value and stays capped across rotation targets.",
+	"recovery_successes":     "Consecutive successful recovery probes required before promoting a recovery target back to current primary (failover policy only). Default 3.",
+	"recovery_stable_time":   "Minimum elapsed time since the first successful recovery probe before promotion (failover policy only). Default 30s. Promotion requires both recovery_successes consecutive successes and this stable time.",
+	"primary_rotation_attempts": `Number of failed recovery probes the current primary receives before the recovery target advances to the next standby primary candidate (failover policy only). Integer, default 0.
+0 disables primary rotation and preserves the legacy two-dialer failover contract (exactly one priority: 0 primary and one priority: 1 fallback, no standby candidates).
+A positive value enables primary rotation: once the threshold is reached, the controller probes ordered standby candidates (priority: 2+, sorted numerically, gaps valid) circularly while the fixed fallback carries new traffic. The first candidate that satisfies recovery_successes and recovery_stable_time becomes the new current primary. A warm reload preserves compatible in-memory rotation state; a process restart resets to priority: 0. No candidate scanning occurs while the current primary is healthy.`,
 	"tcp_check_url":         "Override global config.",
 	"tcp_check_http_method": "Override global config.",
 	"udp_check_dns":         "Override global config.",

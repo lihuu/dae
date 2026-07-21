@@ -319,10 +319,10 @@ func TestFailoverRotationProbeErrorMatchesFalseResult(t *testing.T) {
 	// error instead of a plain false. The assertion is that the resulting
 	// controller state is identical in both cases.
 	type caseState struct {
-		failedProbes    int
-		rotationActive  bool
-		recoveryTarget  int
-		currentDelay    time.Duration
+		failedProbes   int
+		rotationActive bool
+		recoveryTarget int
+		currentDelay   time.Duration
 	}
 	runCase := func(t *testing.T, errorResultFor map[string]bool) caseState {
 		fc, sched, _, _ := newRotationControllerTest(t, cfg)
@@ -345,10 +345,10 @@ func TestFailoverRotationProbeErrorMatchesFalseResult(t *testing.T) {
 		fc.mu.Lock()
 		defer fc.mu.Unlock()
 		return caseState{
-			failedProbes:    fc.failedRecoveryProbes,
-			rotationActive:  fc.rotationActive,
-			recoveryTarget:  fc.recoveryTarget,
-			currentDelay:    fc.currentDelay,
+			failedProbes:   fc.failedRecoveryProbes,
+			rotationActive: fc.rotationActive,
+			recoveryTarget: fc.recoveryTarget,
+			currentDelay:   fc.currentDelay,
 		}
 	}
 
@@ -458,14 +458,14 @@ func TestFailoverRotationRecoveryPromotion(t *testing.T) {
 	// matching advance[i] so the final success occurs at a known offset from
 	// the first success (stableSince). It returns the post-run state.
 	type recoveryState struct {
-		state            failoverState
-		successes        int
+		state             failoverState
+		successes         int
 		stableSinceIsZero bool
-		currentPrimary   int
-		rotationActive   bool
-		failedProbes     int
-		delay            time.Duration
-		pendingTimers    int
+		currentPrimary    int
+		rotationActive    bool
+		failedProbes      int
+		delay             time.Duration
+		pendingTimers     int
 	}
 	runRecovery := func(t *testing.T, results []bool, advances []time.Duration) recoveryState {
 		t.Helper()
@@ -585,9 +585,9 @@ func TestFailoverRotationRecoveryPromotion(t *testing.T) {
 				if got.pendingTimers != 1 {
 					t.Fatalf("pending timers = %d, want 1 (recovery schedule running)", got.pendingTimers)
 				}
-				}
-			})
-		}
+			}
+		})
+	}
 }
 
 // findLogEntries returns all log entries whose message matches one of the

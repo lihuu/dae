@@ -7,6 +7,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -386,5 +387,257 @@ func TestFailoverRotationUDPTransitionOnCurrentPrimaryIgnored(t *testing.T) {
 	group.failoverController.mu.Unlock()
 	if state != statePrimaryActive {
 		t.Fatalf("state = %v, want statePrimaryActive (UDP transitions ignored)", state)
+	}
+}
+
+// assertTCPAndUDPSelected asserts that the group selects the wanted dialer for
+// both the TCP and DNS-UDP test network types. Rotation/failover selection is
+// network-type-agnostic: the atomic snapshot returns the same active dialer
+// regardless of L4Proto, so both selections must agree. This guards against a
+// regression that routes UDP through a different (e.g. alive-set) path.
+func assertTCPAndUDPSelected(t *testing.T, group *DialerGroup, want *dialer.Dialer) {
+	t.Helper()
+	if d := selectedDialer(t, group); d != want {
+		t.Fatalf("TCP selection = %v, want %v", d, want)
+	}
+	// UDP selection follows the same atomic snapshot path as TCP for the
+	// failover policy; the snapshot is network-type-agnostic.
+	d, _, _, err := group.SelectWithExclusionResult(TestDnsUdp4NetworkType, false, nil)
+	if err != nil {
+		t.Fatalf("UDP selection errored: %v", err)
+	}
+	if d != want {
+		t.Fatalf("UDP selection = %v, want %v", d, want)
+	}
+}
+
+// TestFailoverRotationIntegrationAtoBRecovery is the complete end-to-end
+// recovery scenario from the implementation spec. It drives the fake
+// scheduler deterministically (no real-time sleeps) through the full primary
+// rotation episode:
+//
+//	A TCP unavailable
+//	-> fixed Fallback selected
+//	-> five failed A probes
+//	-> one failed B probe
+//	-> C recovery starts but fails confirmation
+//	-> A fails after circular wrap
+//	-> B gets three successes across stable time
+//	-> B becomes current Primary
+//	-> A healthy callback does not preempt B
+//	-> B future failure immediately selects the same fixed Fallback
+//
+// TCP and UDP selections are asserted at each active-role transition. Existing
+// test connections are untouched (this scenario only observes new selections).
+func TestFailoverRotationIntegrationAtoBRecovery(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+	scheduler := installRotationTestScheduler(group)
+
+	// Initial state: A (priority 0) is the current primary.
+	assertTCPAndUDPSelected(t, group, nodes.A)
+
+	// A TCP unavailable triggers the failure transition. The fixed Fallback
+	// is selected for new TCP and UDP traffic; recoveryTarget is A.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+
+	// Scripted probe sequence (target, ok). driveProbeResults fires one
+	// scheduler timer per result and asserts the target identity on every
+	// probe. The fake scheduler's FireNext advances the logical clock to
+	// each timer's scheduled deadline, so the 15s confirmation cadence
+	// produces a 30s first-to-third success span for B without real sleeps.
+	driveProbeResults(t, group, scheduler,
+		// Five failed A probes. After probe 5, failedRecoveryProbes reaches
+		// the threshold (5), rotationActive becomes true, and recoveryTarget
+		// advances from A to B.
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		// One failed B probe. rotationActive is already true, so a single
+		// failure advances recoveryTarget from B to C.
+		scriptedProbeResult{target: nodes.B},
+		// C recovery starts: the first C probe succeeds, recording
+		// stableSince and entering stateRecovering.
+		scriptedProbeResult{target: nodes.C, ok: true},
+		// C confirmation fails: the second C probe fails, clearing
+		// recoverySuccesses/stableSince and advancing recoveryTarget from
+		// C to A (circular wrap).
+		scriptedProbeResult{target: nodes.C},
+		// A fails after the circular wrap. rotationActive stays true, so a
+		// single failure advances recoveryTarget from A to B.
+		scriptedProbeResult{target: nodes.A},
+		// B gets three successes across stable time. The first success
+		// records stableSince; confirmation probes run at the 15s initial
+		// cadence, so the third success lands 30s after the first and
+		// satisfies recovery_stable_time. B is promoted to currentPrimary.
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+	)
+
+	// B is now the current primary for both TCP and UDP selection.
+	assertTCPAndUDPSelected(t, group, nodes.B)
+
+	// A healthy callback must NOT preempt B. B remains the current primary
+	// until B itself fails.
+	triggerCandidateHealth(group, 0, TestNetworkType, true)
+	assertTCPAndUDPSelected(t, group, nodes.B)
+
+	// B future failure immediately selects the same fixed Fallback. The
+	// controller does not scan standby candidates on the hot path; it
+	// selects the fixed Fallback and begins a fresh recovery episode.
+	triggerCandidateHealth(group, 1, TestNetworkType, false)
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+
+	// The new episode's recoveryTarget is B (the failed current primary).
+	// Drive one B probe to confirm the episode targets B first, then
+	// circularly scans C, A, B, ... after the five-attempt threshold.
+	driveProbeResults(t, group, scheduler,
+		scriptedProbeResult{target: nodes.B},
+	)
+}
+
+// TestFailoverRotationAllUnavailableStaysOnFallback verifies that when every
+// primary candidate is unavailable, the controller stays on the fixed
+// Fallback and continues the bounded-backoff circular scan indefinitely. It
+// does NOT exit recovery, does NOT select a failed candidate, and keeps at
+// most one pending timer / one in-flight probe. More than two complete B/C/A
+// wraps (9 probes = 3 full wraps) are driven with all probes failing.
+//
+// Excluding the fixed Fallback during this state returns ErrNoAliveDialer
+// without opportunistically selecting an unconfirmed candidate.
+func TestFailoverRotationAllUnavailableStaysOnFallback(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+	scheduler := installRotationTestScheduler(group)
+
+	// A TCP unavailable triggers failover to the fixed Fallback.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+
+	// 9 scripted failures = 3 full B/C/A wraps after the five-attempt
+	// threshold activates rotation. The cursor sequence after the threshold
+	// is B -> C -> A -> B -> C -> A -> B -> C -> A. driveProbeResults fires
+	// one timer per probe and asserts the target identity, proving the
+	// circular order.
+	driveProbeResults(t, group, scheduler,
+		// Five A failures: probe the failed current primary until the
+		// threshold activates rotation and advances to B.
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		// Wrap 1: B -> C -> A.
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.C},
+		scriptedProbeResult{target: nodes.A},
+		// Wrap 2: B -> C -> A.
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.C},
+		scriptedProbeResult{target: nodes.A},
+		// Wrap 3: B -> C -> A.
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.C},
+		scriptedProbeResult{target: nodes.A},
+	)
+
+	// After every candidate has failed three full wraps, the fixed Fallback
+	// is still selected for new TCP and UDP traffic.
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+
+	// The controller is still in fallback/recovering state and still has
+	// exactly one pending recovery timer (bounded-backoff circular scan).
+	group.failoverController.mu.Lock()
+	state := group.failoverController.state
+	rotationActive := group.failoverController.rotationActive
+	failedProbes := group.failoverController.failedRecoveryProbes
+	group.failoverController.mu.Unlock()
+	if state != stateFallbackActive {
+		t.Fatalf("state = %v, want stateFallbackActive (still recovering)", state)
+	}
+	if !rotationActive {
+		t.Fatal("rotationActive = false, want true (rotation stays active)")
+	}
+	if failedProbes != 14 {
+		t.Fatalf("failedRecoveryProbes = %d, want 14 (5 A + 9 wraps)", failedProbes)
+	}
+	if got := scheduler.PendingCount(); got != 1 {
+		t.Fatalf("pending timers = %d, want 1 (bounded scan, one timer max)", got)
+	}
+
+	// Excluding the fixed Fallback returns ErrNoAliveDialer. The controller
+	// must NOT opportunistically select an unconfirmed primary candidate
+	// on the hot path: the fallback role is the only other active role,
+	// and when it is excluded selection fails rather than scanning.
+	d, _, _, err := group.SelectWithExclusionResult(TestNetworkType, false, nodes.Fallback)
+	if !errors.Is(err, ErrNoAliveDialer) {
+		t.Fatalf("excluding fallback: err = %v, want ErrNoAliveDialer", err)
+	}
+	if d != nil {
+		t.Fatalf("excluding fallback returned dialer %v, want nil", d)
+	}
+}
+
+// TestFailoverRotationFallbackFailureReturnsError proves that when the fixed
+// Fallback is the active role and is excluded for a connection attempt, the
+// operation returns ErrNoAliveDialer rather than opportunistically selecting
+// an unconfirmed primary candidate. This is the testable level of the spec's
+// "fallback failure returns an error without selecting an unconfirmed target"
+// requirement: the existing test infrastructure does not simulate a real dial
+// failure of the fallback dialer, but SelectWithExclusionResult with the
+// fallback excluded exercises the same _select code path that a real dial
+// failure would hit (the failover policy branch returns ErrNoAliveDialer
+// when the active role is excluded). The test asserts the error and the nil
+// dialer, proving rotation does NOT promote an unconfirmed candidate when the
+// fallback is unavailable.
+func TestFailoverRotationFallbackFailureReturnsError(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+	scheduler := installRotationTestScheduler(group)
+
+	// Drive the group into the fallback/recovering state with rotation
+	// active so unconfirmed candidates exist on the recovery cursor.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+	driveProbeResults(t, group, scheduler,
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		// One B failure advances the cursor to C, leaving B and C as
+		// unconfirmed candidates that must NOT be selected on the hot path.
+		scriptedProbeResult{target: nodes.B},
+	)
+
+	// The fixed Fallback is active for new traffic.
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+
+	// Exclude the fixed Fallback. The failover policy must return
+	// ErrNoAliveDialer rather than scanning the ordered candidate list for
+	// an unconfirmed primary. This is the selection-level proof that a
+	// fallback dial failure surfaces as an error to the caller without
+	// promoting an unconfirmed candidate.
+	d, _, _, err := group.SelectWithExclusionResult(TestNetworkType, false, nodes.Fallback)
+	if !errors.Is(err, ErrNoAliveDialer) {
+		t.Fatalf("excluding fallback during recovery: err = %v, want ErrNoAliveDialer", err)
+	}
+	if d != nil {
+		t.Fatalf("excluding fallback returned dialer %v, want nil (no unconfirmed candidate)", d)
+	}
+
+	// The controller state is unchanged by the failed selection: still on
+	// the fixed Fallback with rotation active.
+	assertTCPAndUDPSelected(t, group, nodes.Fallback)
+	group.failoverController.mu.Lock()
+	state := group.failoverController.state
+	rotationActive := group.failoverController.rotationActive
+	group.failoverController.mu.Unlock()
+	if state != stateFallbackActive {
+		t.Fatalf("state = %v, want stateFallbackActive", state)
+	}
+	if !rotationActive {
+		t.Fatal("rotationActive = false, want true (exclusion must not change state)")
 	}
 }
