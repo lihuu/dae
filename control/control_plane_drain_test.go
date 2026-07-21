@@ -650,8 +650,10 @@ func TestInheritDialerHealthFromUsesReloadSafeSnapshot(t *testing.T) {
 	oldCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{oldGroup}}}
 	newCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{newGroup}}}
 
-	if got := newCP.InheritDialerHealthFrom(oldCP); !got {
-		t.Fatal("expected InheritDialerHealthFrom to return true when dialers overlap")
+	inheritance := newCP.InheritDialerHealthFrom(oldCP)
+	defer inheritance.Commit()
+	if !inheritance.HasOverlap() {
+		t.Fatal("expected InheritDialerHealthFrom to report overlap when dialers overlap")
 	}
 
 	if !newDialer.MustGetAlive(tcp4) {
@@ -732,8 +734,10 @@ func TestInheritDialerHealthFromDoesNotReviveDeadDialerWhenGroupHasCandidate(t *
 	oldCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{oldGroup}}}
 	newCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{newGroup}}}
 
-	if got := newCP.InheritDialerHealthFrom(oldCP); !got {
-		t.Fatal("expected InheritDialerHealthFrom to return true when dialers overlap")
+	inheritance := newCP.InheritDialerHealthFrom(oldCP)
+	defer inheritance.Commit()
+	if !inheritance.HasOverlap() {
+		t.Fatal("expected InheritDialerHealthFrom to report overlap when dialers overlap")
 	}
 
 	if newDialerA.MustGetAlive(tcp4) {
@@ -800,8 +804,10 @@ func TestInheritDialerHealthFromReturnsFalseWhenNoOverlap(t *testing.T) {
 	oldCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{oldGroup}}}
 	newCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{newGroup}}}
 
-	if got := newCP.InheritDialerHealthFrom(oldCP); got {
-		t.Fatal("expected InheritDialerHealthFrom to return false when no dialers overlap")
+	inheritance := newCP.InheritDialerHealthFrom(oldCP)
+	defer inheritance.Commit()
+	if inheritance.HasOverlap() {
+		t.Fatal("expected InheritDialerHealthFrom to report no overlap when no dialers overlap")
 	}
 }
 

@@ -750,9 +750,9 @@ func (fc *FailoverController) emitEventLocked(ev FailoverEvent) {
 	defer func() {
 		if r := recover(); r != nil {
 			fc.log.WithFields(logrus.Fields{
-				"group":  fc.groupName,
-				"event":  string(ev.Type),
-				"panic":  r,
+				"group": fc.groupName,
+				"event": string(ev.Type),
+				"panic": r,
 			}).Warn("failover notifier panic recovered; state machine unaffected")
 		}
 	}()
@@ -774,56 +774,6 @@ func (fc *FailoverController) Close() {
 	if fc.probeCancel != nil {
 		fc.probeCancel()
 		fc.probeCancel = nil
-	}
-}
-
-// FailoverControllerSnapshot captures the failover state for warm reload
-// inheritance.
-type FailoverControllerSnapshot struct {
-	State             failoverState
-	RecoverySuccesses int
-	StableSince       time.Time
-	CurrentDelay      time.Duration
-	NextProbeAt       time.Time // when the next probe was scheduled to fire
-}
-
-// CaptureSnapshot returns a snapshot of the controller state for reload.
-func (fc *FailoverController) CaptureSnapshot() FailoverControllerSnapshot {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-	return FailoverControllerSnapshot{
-		State:             fc.state,
-		RecoverySuccesses: fc.recoverySuccesses,
-		StableSince:       fc.stableSince,
-		CurrentDelay:      fc.currentDelay,
-		NextProbeAt:       fc.nextProbeAt,
-	}
-}
-
-// RestoreSnapshot restores controller state from a reload snapshot.
-func (fc *FailoverController) RestoreSnapshot(snap FailoverControllerSnapshot) {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-
-	fc.state = snap.State
-	fc.recoverySuccesses = snap.RecoverySuccesses
-	fc.stableSince = snap.StableSince
-	fc.currentDelay = snap.CurrentDelay
-	fc.publishSnapshot()
-
-	// If we were in fallback/recovering, re-arm the recovery probe with the
-	// remaining delay from the old generation.
-	if fc.state == stateFallbackActive || fc.state == stateRecovering {
-		remaining := time.Until(snap.NextProbeAt)
-		if remaining <= 0 || snap.NextProbeAt.IsZero() {
-			// nextProbeAt is in the past or unset — fire immediately.
-			remaining = time.Millisecond
-		}
-		originalDelay := fc.currentDelay
-		fc.currentDelay = remaining
-		fc.scheduleProbeLocked()
-		// Restore the original delay for subsequent probes.
-		fc.currentDelay = originalDelay
 	}
 }
 

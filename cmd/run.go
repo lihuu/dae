@@ -139,6 +139,23 @@ type stagedReloadHandoff struct {
 	newListener      *control.Listener
 	abortConnections bool
 	hasOverlap       bool
+	// reloadInheritance carries the failover rotation transfer(s) created by
+	// InheritDialerHealthFrom so the staged cutover can Commit them on success
+	// (old plane retires) or Rollback on a failed staged cutover (new plane
+	// closes, old plane resumes). The narrow interface lets command tests
+	// supply a recording mock while production receives *control.ReloadInheritance.
+	reloadInheritance reloadInheritanceTxn
+}
+
+// reloadInheritanceTxn is the narrow transaction interface the staged reload
+// handoff uses to drive failover rotation transfers. *control.ReloadInheritance
+// satisfies it; tests supply a recording implementation to assert Commit is
+// called on a successful cutover and Rollback after the new plane closes on a
+// failed staged cutover.
+type reloadInheritanceTxn interface {
+	HasOverlap() bool
+	Commit()
+	Rollback()
 }
 
 func tryQueueReloadRequest(
@@ -568,22 +585,24 @@ func (r *Runner) Run() (err error) {
 				oldConf := conf
 				oldListener := listener
 
-				hasOverlap := newC.InheritDialerHealthFrom(oldC)
+				inheritance := newC.InheritDialerHealthFrom(oldC)
+				hasOverlap := inheritance.HasOverlap()
 				configureTransparentHugePages(log, newConf.Global.DisableTHP)
 				c = newC
 				currCancel = cancel
 				conf = newConf
 				listener = stagedListener
 				reloadManager.setPendingStagedReload(&stagedReloadHandoff{
-					oldControlPlane:  oldC,
-					oldCancel:        oldCancel,
-					oldConf:          oldConf,
-					oldListener:      oldListener,
-					newControlPlane:  newC,
-					newCancel:        cancel,
-					newListener:      stagedListener,
-					abortConnections: abortConnections,
-					hasOverlap:       hasOverlap,
+					oldControlPlane:   oldC,
+					oldCancel:         oldCancel,
+					oldConf:           oldConf,
+					oldListener:       oldListener,
+					newControlPlane:   newC,
+					newCancel:         cancel,
+					newListener:       stagedListener,
+					abortConnections:  abortConnections,
+					hasOverlap:        hasOverlap,
+					reloadInheritance: inheritance,
 				}, reloadStartedAt, reloadStartedAtMono, reloadCollector)
 				reloadManager.beginHandoff()
 				notifyRunStateChange(runStateChanges)
@@ -680,7 +699,8 @@ func (r *Runner) Run() (err error) {
 			oldCancel := currCancel
 			oldConf := conf
 
-			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			inheritance := newC.InheritDialerHealthFrom(oldC)
+			hasOverlap := inheritance.HasOverlap()
 			configureTransparentHugePages(log, newConf.Global.DisableTHP)
 			c = newC
 			currCancel = newCancel
@@ -688,17 +708,22 @@ func (r *Runner) Run() (err error) {
 			listener = stagedListener
 			if stagedHotHandoff {
 				reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
-					oldControlPlane:  oldC,
-					oldCancel:        oldCancel,
-					oldConf:          oldConf,
-					oldListener:      oldListener,
-					newControlPlane:  newC,
-					newCancel:        newCancel,
-					newListener:      stagedListener,
-					abortConnections: abortConnections,
-					hasOverlap:       hasOverlap,
+					oldControlPlane:   oldC,
+					oldCancel:         oldCancel,
+					oldConf:           oldConf,
+					oldListener:       oldListener,
+					newControlPlane:   newC,
+					newCancel:         newCancel,
+					newListener:       stagedListener,
+					abortConnections:  abortConnections,
+					hasOverlap:        hasOverlap,
+					reloadInheritance: inheritance,
 				}, reloadStartedAt, reloadStartedAtMono)
 			} else {
+				// Non-staged cutover: the old generation retires immediately,
+				// so commit the failover reload transfer before starting old-
+				// control-plane retirement. There is no rollback path here.
+				inheritance.Commit()
 				reloadManager.clearPendingStagedHandoff()
 			}
 			reloadManager.clearPendingRetirement()
@@ -877,6 +902,14 @@ loop:
 					oldCancel := handoff.oldCancel
 					abortConnections := handoff.abortConnections
 					hasOverlap := handoff.hasOverlap
+					// Staged cutover succeeded: commit the failover reload
+					// transfer immediately before clearing the pending handoff
+					// and retiring the old plane. The old generation's failover
+					// controllers stay paused (Commit is a no-op confirmation)
+					// and the new plane's restored controllers keep serving.
+					if handoff.reloadInheritance != nil {
+						handoff.reloadInheritance.Commit()
+					}
 					if oldC != nil {
 						bpf := oldC.EjectBpf()
 						c.InjectBpf(bpf)
@@ -1035,6 +1068,14 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 		if err := handoff.newControlPlane.Close(); err != nil && log != nil {
 			log.WithError(err).Warnln("[Reload] Failed to close staged control plane during rollback")
 		}
+	}
+	// After the new plane is closed, roll back the failover reload transfer so
+	// the old plane's failover controllers resume exactly one probe each with
+	// the captured state. Rollback must run AFTER newCancel/newControlPlane.Close
+	// so the new generation's probe/timer cannot race the old generation's
+	// resumed probe. Idempotent (sync.Once inside each transfer).
+	if handoff.reloadInheritance != nil {
+		handoff.reloadInheritance.Rollback()
 	}
 }
 

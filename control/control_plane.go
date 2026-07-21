@@ -1470,16 +1470,63 @@ func (c *ControlPlane) SetDNSHandoffController(controller *DnsController) {
 	}
 }
 
+// ReloadInheritance is the transactional handle returned by
+// InheritDialerHealthFrom. It aggregates one FailoverReloadTransfer per
+// failover group whose rotation state was inherited (or would have been, on a
+// compatible reload) so the cmd reload path can Commit the transfer on a
+// successful cutover or Rollback on a failed staged cutover.
+//
+// hasOverlap reports whether at least one dialer matched by group+name between
+// the old and new generation (active connections on those dialers may survive
+// the reload). Commit/Rollback drive every aggregated transfer; both are
+// safe to call on a nil receiver.
+type ReloadInheritance struct {
+	hasOverlap bool
+	transfers  []*outbound.FailoverReloadTransfer
+}
+
+// HasOverlap returns true when at least one dialer matched by group+name
+// between the old and new generation. Safe on a nil receiver.
+func (r *ReloadInheritance) HasOverlap() bool { return r != nil && r.hasOverlap }
+
+// Commit finalizes every aggregated failover reload transfer (keeps the new
+// generation; the old generation stays paused until it is closed). Safe on a
+// nil receiver.
+func (r *ReloadInheritance) Commit() {
+	if r == nil {
+		return
+	}
+	for _, t := range r.transfers {
+		t.Commit()
+	}
+}
+
+// Rollback discards every aggregated failover reload transfer's new-generation
+// restore and resumes exactly one old-generation probe per transfer. Safe on
+// a nil receiver.
+func (r *ReloadInheritance) Rollback() {
+	if r == nil {
+		return
+	}
+	for i := len(r.transfers) - 1; i >= 0; i-- {
+		r.transfers[i].Rollback()
+	}
+}
+
 // InheritDialerHealthFrom copies health snapshots from a previous control plane
-// generation into the current one. It returns true when at least one dialer
-// matched by group+name between the old and new generation, indicating that
-// active connections on those dialers may survive the reload.
-func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
+// generation into the current one and returns a transactional ReloadInheritance
+// handle whose HasOverlap reports whether at least one dialer matched by
+// group+name between the old and new generation (active connections on those
+// dialers may survive the reload). The caller drives the returned transaction
+// with Commit (on a successful cutover) or Rollback (on a failed staged
+// cutover, after closing the new plane).
+func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) *ReloadInheritance {
 	if c == nil || previous == nil {
-		return false
+		return nil
 	}
 
 	var hasOverlap bool
+	var transfers []*outbound.FailoverReloadTransfer
 
 	previousGroups := make(map[string]*outbound.DialerGroup, len(previous.outbounds))
 	for _, group := range previous.outbounds {
@@ -1516,19 +1563,20 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 		}
 		group.EnsureReloadSelectionFloor(fallback)
 
-		// Inherit failover controller state if identities match.
+		// Inherit failover rotation state through the transactional transfer.
+		// On a compatible reload the transfer pauses the old generation and
+		// restores this group's controller; on an incompatible reload the new
+		// controller stays at its fresh priority-0 initial primary and the
+		// info-level failover_rotation_state_reset log has already been emitted
+		// by the controller. The transfer is aggregated so the cmd reload path
+		// can Commit/Rollback all groups together.
 		if group.HasFailoverController() && oldGroup.HasFailoverController() {
-			newPrimary, newFallback := group.FailoverIdentity()
-			oldPrimary, oldFallback := oldGroup.FailoverIdentity()
-			if newPrimary == oldPrimary && newFallback == oldFallback {
-				if snap := oldGroup.CaptureFailoverSnapshot(); snap != nil {
-					group.RestoreFailoverSnapshot(snap)
-				}
+			if transfer, _ := group.PrepareFailoverReloadFrom(oldGroup); transfer != nil {
+				transfers = append(transfers, transfer)
 			}
-			// If identities differ, the new group stays in primary_active (default).
 		}
 	}
-	return hasOverlap
+	return &ReloadInheritance{hasOverlap: hasOverlap, transfers: transfers}
 }
 
 func updateConnStateJanitorPressure(

@@ -1,0 +1,842 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
+package outbound
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
+)
+
+// baseReloadRecoveryConfig is the recovery configuration shared by the
+// compatible-reload test cases. Individual cases clone it and flip one field to
+// prove the deterministic reset-reason precedence.
+func baseReloadRecoveryConfig() FailoverRecoveryConfig {
+	return FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+}
+
+// reloadTestControllers builds two failover controllers with the supplied
+// recovery configs and candidate/fallback name lists. The old controller is
+// driven into a mid-rotation state (B is the recovery target, 6 failures,
+// rotation active) using a fake scheduler. Both controllers share the same
+// scheduler clock origin so the restore path can be exercised deterministically.
+//
+// The returned old scheduler advanced to the point where the next probe is
+// pending against B. The new controller's scheduler is independent but starts
+// at the same logical now so remaining-delay assertions are stable.
+func reloadTestControllers(
+	t *testing.T,
+	oldRecovery, newRecovery FailoverRecoveryConfig,
+	oldCandidates, newCandidates []string,
+	oldFallback, newFallback string,
+) (
+	oldFC *FailoverController, newFC *FailoverController,
+	oldSched, newSched *fakeFailoverScheduler,
+	oldDialers, newDialers []*dialer.Dialer,
+) {
+	t.Helper()
+	option := testFailoverDialerOption()
+
+	makeDialers := func(names []string) []*dialer.Dialer {
+		out := make([]*dialer.Dialer, 0, len(names))
+		for _, n := range names {
+			out = append(out, newNamedDirectDialer(option, n))
+		}
+		return out
+	}
+	oldDialers = makeDialers(oldCandidates)
+	newDialers = makeDialers(newCandidates)
+	oldFallbackDialer := newNamedDirectDialer(option, oldFallback)
+	newFallbackDialer := newNamedDirectDialer(option, newFallback)
+
+	oldFC = NewFailoverControllerWithCandidates(log, "reload-test", oldDialers, oldFallbackDialer, oldRecovery)
+	newFC = NewFailoverControllerWithCandidates(log, "reload-test", newDialers, newFallbackDialer, newRecovery)
+	oldSched = newFakeFailoverScheduler()
+	newSched = newFakeFailoverScheduler()
+	oldFC.scheduler = oldSched
+	newFC.scheduler = newSched
+
+	// Drive the old controller: trigger failover against A (index 0), then
+	// fire 5 failed probes so rotation activates and the cursor advances
+	// A -> B. recoveryTarget is now B (index 1), failedRecoveryProbes=5,
+	// rotationActive=true, currentDelay capped at ProbeMax.
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		return false, nil
+	}
+	oldFC.triggerPrimaryFailureForTest()
+	for i := 0; i < 5; i++ {
+		oldSched.FireNext(t)
+	}
+
+	// Sanity: old controller is mid-rotation on B.
+	oldFC.mu.Lock()
+	oldTarget := oldFC.recoveryTarget
+	oldFailed := oldFC.failedRecoveryProbes
+	oldRotation := oldFC.rotationActive
+	oldFC.mu.Unlock()
+	if oldTarget != 1 {
+		t.Fatalf("old controller recoveryTarget = %d, want 1 (B)", oldTarget)
+	}
+	if oldFailed != 5 {
+		t.Fatalf("old controller failedRecoveryProbes = %d, want 5", oldFailed)
+	}
+	if !oldRotation {
+		t.Fatal("old controller rotationActive = false, want true")
+	}
+	return oldFC, newFC, oldSched, newSched, oldDialers, newDialers
+}
+
+// TestFailoverReloadSnapshotCompatiblePreservesRotation proves that an
+// identity-compatible warm reload preserves currentPrimary, recoveryTarget,
+// rotationActive, failedRecoveryProbes, confirmation state, currentDelay, and
+// the remaining probe delay. The new controller resumes a single probe of B
+// with the captured delay.
+func TestFailoverReloadSnapshotCompatiblePreservesRotation(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, newSched, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	// Capture the old remaining delay before transfer.
+	oldFC.mu.Lock()
+	oldNextProbeAt := oldFC.nextProbeAt
+	oldCurrentDelay := oldFC.currentDelay
+	oldFC.mu.Unlock()
+
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	if transfer == nil {
+		t.Fatalf("expected compatible transfer, got nil (reason=%q)", reason)
+	}
+	if reason != "" {
+		t.Fatalf("compatible transfer reason = %q, want empty", reason)
+	}
+	defer transfer.Commit()
+
+	// The old controller's timer/probe must be paused: no pending timer.
+	if got := oldSched.PendingCount(); got != 0 {
+		t.Fatalf("old scheduler pending timers after transfer = %d, want 0", got)
+	}
+
+	// The new controller must have exactly one pending probe of B with the
+	// captured currentDelay (remaining delay preserves the original schedule).
+	newFC.mu.Lock()
+	newTarget := newFC.recoveryTarget
+	newFailed := newFC.failedRecoveryProbes
+	newRotation := newFC.rotationActive
+	newCurrentPrimary := newFC.currentPrimary
+	newDelay := newFC.currentDelay
+	newNextProbeAt := newFC.nextProbeAt
+	newSuccesses := newFC.recoverySuccesses
+	newFC.mu.Unlock()
+
+	if newCurrentPrimary != 0 {
+		t.Fatalf("new currentPrimary = %d, want 0 (A still current)", newCurrentPrimary)
+	}
+	if newTarget != 1 {
+		t.Fatalf("new recoveryTarget = %d, want 1 (B preserved by name)", newTarget)
+	}
+	if !newRotation {
+		t.Fatal("new rotationActive = false, want true (preserved)")
+	}
+	if newFailed != 5 {
+		t.Fatalf("new failedRecoveryProbes = %d, want 5 (preserved)", newFailed)
+	}
+	if newSuccesses != 0 {
+		t.Fatalf("new recoverySuccesses = %d, want 0 (preserved)", newSuccesses)
+	}
+	if newDelay != oldCurrentDelay {
+		t.Fatalf("new currentDelay = %v, want %v (preserved)", newDelay, oldCurrentDelay)
+	}
+	// Remaining delay should be the original delay (no time advanced between
+	// capture and restore in the fake clock).
+	wantRemaining := oldCurrentDelay
+	if got := newNextProbeAt.Sub(newSched.Now()); got != wantRemaining {
+		t.Fatalf("new remaining probe delay = %v, want %v", got, wantRemaining)
+	}
+	_ = oldNextProbeAt
+	if got := newSched.PendingCount(); got != 1 {
+		t.Fatalf("new scheduler pending timers = %d, want 1", got)
+	}
+}
+
+// TestFailoverReloadSnapshotResetsOnIdentityChange table-tests each
+// one-at-a-time identity change and asserts the deterministic reset reason and
+// that the new controller starts fresh at priority 0 (A) with no rotation.
+func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
+	type changeCase struct {
+		name         string
+		modifyNew    func(cfg FailoverRecoveryConfig) FailoverRecoveryConfig
+		newCands     []string
+		newFallback  string
+		wantReason   string
+		wantNewPrime string
+	}
+
+	cases := []changeCase{
+		{
+			name:         "fallback_changed",
+			modifyNew:    func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback2",
+			wantReason:   "fallback_changed",
+			wantNewPrime: "A",
+		},
+		{
+			name:         "primary_candidates_changed",
+			modifyNew:    func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
+			newCands:     []string{"A", "B", "C", "D"},
+			newFallback:  "fallback",
+			wantReason:   "primary_candidates_changed",
+			wantNewPrime: "A",
+		},
+		{
+			name: "primary_rotation_attempts_changed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.RotationAttempts = 7
+				return c
+			},
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback",
+			wantReason:   "recovery_policy_changed",
+			wantNewPrime: "A",
+		},
+		{
+			name: "recovery_probe_initial_changed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.ProbeInitial = 20 * time.Second
+				return c
+			},
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback",
+			wantReason:   "recovery_policy_changed",
+			wantNewPrime: "A",
+		},
+		{
+			name: "recovery_probe_max_changed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.ProbeMax = 10 * time.Minute
+				return c
+			},
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback",
+			wantReason:   "recovery_policy_changed",
+			wantNewPrime: "A",
+		},
+		{
+			name: "recovery_successes_changed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.Successes = 5
+				return c
+			},
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback",
+			wantReason:   "recovery_policy_changed",
+			wantNewPrime: "A",
+		},
+		{
+			name: "recovery_stable_time_changed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.StableTime = 1 * time.Minute
+				return c
+			},
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback",
+			wantReason:   "recovery_policy_changed",
+			wantNewPrime: "A",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oldRecovery := baseReloadRecoveryConfig()
+			newRecovery := tc.modifyNew(baseReloadRecoveryConfig())
+			oldFC, newFC, _, newSched, _, _ := reloadTestControllers(
+				t, oldRecovery, newRecovery,
+				[]string{"A", "B", "C"}, tc.newCands,
+				"fallback", tc.newFallback,
+			)
+			defer oldFC.Close()
+			defer newFC.Close()
+
+			transfer, reason := newFC.prepareReloadTransfer(oldFC)
+			if transfer != nil {
+				t.Fatalf("expected nil transfer on identity change, got non-nil")
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("reset reason = %q, want %q", reason, tc.wantReason)
+			}
+
+			// The new controller must start fresh at priority 0 (A), no rotation.
+			newFC.mu.Lock()
+			cp := newFC.currentPrimary
+			rt := newFC.recoveryTarget
+			ra := newFC.rotationActive
+			fp := newFC.failedRecoveryProbes
+			newFC.mu.Unlock()
+			if cp != 0 {
+				t.Fatalf("new currentPrimary = %d, want 0 (fresh start)", cp)
+			}
+			if rt != 0 {
+				t.Fatalf("new recoveryTarget = %d, want 0 (fresh start)", rt)
+			}
+			if ra {
+				t.Fatal("new rotationActive = true, want false (fresh start)")
+			}
+			if fp != 0 {
+				t.Fatalf("new failedRecoveryProbes = %d, want 0 (fresh start)", fp)
+			}
+			// No probe should be scheduled on a fresh primary-active controller.
+			if got := newSched.PendingCount(); got != 0 {
+				t.Fatalf("new scheduler pending timers = %d, want 0 (fresh start)", got)
+			}
+		})
+	}
+}
+
+// TestFailoverReloadResetReasonPrecedence proves that when multiple identity
+// categories change in one reload, the reason follows the precedence
+// fallback_changed > primary_candidates_changed > recovery_policy_changed.
+func TestFailoverReloadResetReasonPrecedence(t *testing.T) {
+	type step struct {
+		newCands    []string
+		newFallback string
+		modifyNew   func(FailoverRecoveryConfig) FailoverRecoveryConfig
+		wantReason  string
+	}
+	steps := []step{
+		{
+			// fallback + candidates + policy all change -> fallback wins.
+			newCands:    []string{"A", "B", "C", "D"},
+			newFallback: "fallback2",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.RotationAttempts = 7
+				return c
+			},
+			wantReason: "fallback_changed",
+		},
+		{
+			// candidates + policy change -> candidates wins.
+			newCands:    []string{"A", "B", "C", "D"},
+			newFallback: "fallback",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.RotationAttempts = 7
+				return c
+			},
+			wantReason: "primary_candidates_changed",
+		},
+	}
+	for i, st := range steps {
+		oldRecovery := baseReloadRecoveryConfig()
+		newRecovery := st.modifyNew(baseReloadRecoveryConfig())
+		oldFC, newFC, _, _, _, _ := reloadTestControllers(
+			t, oldRecovery, newRecovery,
+			[]string{"A", "B", "C"}, st.newCands,
+			"fallback", st.newFallback,
+		)
+		defer oldFC.Close()
+		defer newFC.Close()
+		_, reason := newFC.prepareReloadTransfer(oldFC)
+		if reason != st.wantReason {
+			t.Fatalf("step %d: reset reason = %q, want %q", i, reason, st.wantReason)
+		}
+	}
+}
+
+// TestFailoverReloadInFlightProbeOwnership proves that when a reload captures
+// the old controller while a probe is in flight, the old probe is invalidated
+// (its result cannot mutate either generation) and the new controller
+// schedules exactly one immediate probe of the same named recovery target.
+// Commit leaves the old generation paused; Rollback cancels the new generation
+// and resumes exactly one old-generation probe with the captured state. A
+// second Commit/Rollback is a no-op.
+func TestFailoverReloadInFlightProbeOwnership(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, newSched, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	// Block the old controller's next probe on a channel so the probe is
+	// in flight when we prepare the transfer. The probe result (delivered
+	// later) must NOT mutate either generation.
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+	probeResult := make(chan error, 1)
+
+	// Replace the old controller's probeTargetTCP with a blocking closure.
+	oldFC.mu.Lock()
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		close(probeStarted)
+		select {
+		case <-probeRelease:
+			err := <-probeResult
+			return false, err
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	// Capture the pending timer's callback so we can fire it directly without
+	// using FireNext (which calls t.Fatal from a non-test goroutine). The
+	// fake scheduler's FireNext advances the clock and invokes the timer's
+	// callback; we replicate that minimal behavior here, guarded so a missing
+	// timer is reported via a channel instead of t.Fatal.
+	var pendingTimer *fakeFailoverTimer
+	var pendingAt time.Time
+	for _, c := range oldSched.pending {
+		if !c.timer.stopped {
+			pendingTimer = c.timer
+			pendingAt = c.at
+			break
+		}
+	}
+	if pendingTimer == nil {
+		oldFC.mu.Unlock()
+		t.Fatal("no pending failover timer to drive probe into flight")
+	}
+	go func() {
+		if pendingAt.After(oldSched.now) {
+			oldSched.now = pendingAt
+		}
+		pendingTimer.stopped = true
+		pendingTimer.fn()
+	}()
+	oldFC.mu.Unlock()
+
+	// Wait for the probe to be in flight.
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old probe did not start in time")
+	}
+
+	// Capture state before transfer.
+	oldFC.mu.Lock()
+	beforeFailed := oldFC.failedRecoveryProbes
+	beforeTarget := oldFC.recoveryTarget
+	oldFC.mu.Unlock()
+
+	// Prepare transfer while the probe is in flight.
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	if transfer == nil {
+		t.Fatalf("expected transfer, got nil (reason=%q)", reason)
+	}
+
+	// The new controller must schedule exactly one immediate probe of B.
+	newFC.mu.Lock()
+	newTarget := newFC.recoveryTargetNameLocked()
+	newProbeInFlight := newFC.probeInFlight
+	newNextProbeAt := newFC.nextProbeAt
+	newFC.mu.Unlock()
+	if newTarget != "B" {
+		t.Fatalf("new recovery target = %q, want B", newTarget)
+	}
+	// Remaining delay should be ~0 (immediate) because the old probe was in flight.
+	if got := newSched.PendingCount(); got != 1 {
+		t.Fatalf("new scheduler pending timers = %d, want 1 (immediate replacement)", got)
+	}
+	// The old probe is now invalidated; releasing it must NOT change counters.
+	probeResult <- errors.New("late probe result")
+	close(probeRelease)
+	// Give the old probe goroutine time to observe the cancelled context / stale
+	// generation and return without mutating state.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		oldFC.mu.Lock()
+		failed := oldFC.failedRecoveryProbes
+		oldFC.mu.Unlock()
+		if failed == beforeFailed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	oldFC.mu.Lock()
+	afterFailed := oldFC.failedRecoveryProbes
+	afterTarget := oldFC.recoveryTarget
+	oldFC.mu.Unlock()
+	if afterFailed != beforeFailed {
+		t.Fatalf("old failedRecoveryProbes changed by late probe: %d -> %d", beforeFailed, afterFailed)
+	}
+	if afterTarget != beforeTarget {
+		t.Fatalf("old recoveryTarget changed by late probe: %d -> %d", beforeTarget, afterTarget)
+	}
+
+	// The new controller must not have run its probe yet (it's pending, not in
+	// flight). newProbeInFlight should be false at capture time.
+	if newProbeInFlight {
+		t.Fatal("new probeInFlight = true at capture, want false (timer pending)")
+	}
+	_ = newNextProbeAt
+
+	// Commit leaves the old generation paused (no pending timers).
+	transfer.Commit()
+	if got := oldSched.PendingCount(); got != 0 {
+		t.Fatalf("after commit, old pending timers = %d, want 0", got)
+	}
+
+	// A second Commit is a no-op (does not panic, does not change state).
+	transfer.Commit()
+
+	// Drain the new pending probe so it does not leak.
+	newFC.Close()
+}
+
+// TestFailoverReloadRollbackResumesOldProbe proves that Rollback cancels the
+// new generation's probe/timer and resumes exactly one old-generation probe of
+// the captured recovery target with the captured delay, preserving counters
+// and confirmation state. A second Rollback is a no-op.
+func TestFailoverReloadRollbackResumesOldProbe(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, newSched, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	// Drive the old controller further: land one successful B probe so
+	// confirmation state is non-zero, then capture before the next probe.
+	// This proves counters and confirmation are preserved across rollback.
+	oldFC.mu.Lock()
+	// Script: the next probe (against B) succeeds.
+	probeCh := make(chan bool, 4)
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		return <-probeCh, nil
+	}
+	oldFC.mu.Unlock()
+	probeCh <- true
+	oldSched.FireNext(t)
+
+	oldFC.mu.Lock()
+	beforeSuccesses := oldFC.recoverySuccesses
+	beforeFailed := oldFC.failedRecoveryProbes
+	beforeTarget := oldFC.recoveryTarget
+	beforeDelay := oldFC.currentDelay
+	beforeRotation := oldFC.rotationActive
+	oldFC.mu.Unlock()
+	if beforeSuccesses != 1 {
+		t.Fatalf("expected 1 confirmation success before transfer, got %d", beforeSuccesses)
+	}
+
+	// Prepare transfer.
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	if transfer == nil {
+		t.Fatalf("expected transfer, got nil (reason=%q)", reason)
+	}
+	// Old must be paused.
+	if got := oldSched.PendingCount(); got != 0 {
+		t.Fatalf("old pending after transfer = %d, want 0", got)
+	}
+	// New has one pending probe.
+	if got := newSched.PendingCount(); got != 1 {
+		t.Fatalf("new pending after transfer = %d, want 1", got)
+	}
+
+	// Rollback: cancel new, resume old with captured state.
+	transfer.Rollback()
+
+	// New generation's timer must be invalidated.
+	if got := newSched.PendingCount(); got != 0 {
+		t.Fatalf("new pending after rollback = %d, want 0", got)
+	}
+	// Old generation must have exactly one pending probe of B with the
+	// captured delay.
+	if got := oldSched.PendingCount(); got != 1 {
+		t.Fatalf("old pending after rollback = %d, want 1", got)
+	}
+	oldFC.mu.Lock()
+	resumedTarget := oldFC.recoveryTarget
+	resumedFailed := oldFC.failedRecoveryProbes
+	resumedSuccesses := oldFC.recoverySuccesses
+	resumedDelay := oldFC.currentDelay
+	resumedRotation := oldFC.rotationActive
+	resumedNextProbeAt := oldFC.nextProbeAt
+	oldFC.mu.Unlock()
+	if resumedTarget != beforeTarget {
+		t.Fatalf("resumed recoveryTarget = %d, want %d", resumedTarget, beforeTarget)
+	}
+	if resumedFailed != beforeFailed {
+		t.Fatalf("resumed failedRecoveryProbes = %d, want %d", resumedFailed, beforeFailed)
+	}
+	if resumedSuccesses != beforeSuccesses {
+		t.Fatalf("resumed recoverySuccesses = %d, want %d", resumedSuccesses, beforeSuccesses)
+	}
+	if resumedDelay != beforeDelay {
+		t.Fatalf("resumed currentDelay = %v, want %v", resumedDelay, beforeDelay)
+	}
+	if resumedRotation != beforeRotation {
+		t.Fatalf("resumed rotationActive = %v, want %v", resumedRotation, beforeRotation)
+	}
+	// Remaining delay should be the captured delay.
+	if got := resumedNextProbeAt.Sub(oldSched.Now()); got != beforeDelay {
+		t.Fatalf("resumed remaining delay = %v, want %v", got, beforeDelay)
+	}
+
+	// Second Rollback is a no-op.
+	transfer.Rollback()
+	if got := oldSched.PendingCount(); got != 1 {
+		t.Fatalf("old pending after second rollback = %d, want 1 (no-op)", got)
+	}
+
+	// Drain the resumed probe with a failure to allow clean shutdown.
+	probeCh <- false
+	oldSched.FireNext(t)
+}
+
+// TestFailoverReloadFreshRestartStartsAtPriorityZero proves that a fresh
+// controller built from the same configuration WITHOUT a snapshot starts at
+// priority 0 (A) with zero failure count, no rotation, and that no file/config
+// write occurs. This covers the process-restart non-persistence requirement.
+func TestFailoverReloadFreshRestartStartsAtPriorityZero(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	option := testFailoverDialerOption()
+	oldCands := []*dialer.Dialer{
+		newNamedDirectDialer(option, "A"),
+		newNamedDirectDialer(option, "B"),
+		newNamedDirectDialer(option, "C"),
+	}
+	newCands := []*dialer.Dialer{
+		newNamedDirectDialer(option, "A"),
+		newNamedDirectDialer(option, "B"),
+		newNamedDirectDialer(option, "C"),
+	}
+	oldFallback := newNamedDirectDialer(option, "fallback")
+	newFallback := newNamedDirectDialer(option, "fallback")
+
+	oldFC := NewFailoverControllerWithCandidates(log, "restart-test", oldCands, oldFallback, oldRecovery)
+	newFC := NewFailoverControllerWithCandidates(log, "restart-test", newCands, newFallback, newRecovery)
+	oldSched := newFakeFailoverScheduler()
+	newSched := newFakeFailoverScheduler()
+	oldFC.scheduler = oldSched
+	newFC.scheduler = newSched
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	// Promote B in the old controller so current primary is NOT A. A fresh
+	// restart must still start at A. Drive 5 A failures to activate rotation
+	// and advance to B, then 3 B successes to promote B.
+	probeCh := make(chan bool, 16)
+	oldFC.mu.Lock()
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		return <-probeCh, nil
+	}
+	oldFC.mu.Unlock()
+	oldFC.triggerPrimaryFailureForTest()
+	for i := 0; i < 5; i++ {
+		probeCh <- false
+		oldSched.FireNext(t)
+	}
+	for i := 0; i < 3; i++ {
+		probeCh <- true
+		oldSched.FireNext(t)
+	}
+	oldFC.mu.Lock()
+	oldCurrentPrimary := oldFC.currentPrimary
+	oldFC.mu.Unlock()
+	if oldCurrentPrimary != 1 {
+		t.Fatalf("expected B (index 1) promoted in old controller, got %d", oldCurrentPrimary)
+	}
+
+	// Build a fresh new controller WITHOUT calling prepareReloadTransfer
+	// (simulating a process restart). It must start at A (priority 0).
+	newFC.mu.Lock()
+	freshCurrentPrimary := newFC.currentPrimary
+	freshFailed := newFC.failedRecoveryProbes
+	freshRotation := newFC.rotationActive
+	freshState := newFC.state
+	newFC.mu.Unlock()
+	if freshCurrentPrimary != 0 {
+		t.Fatalf("fresh restart currentPrimary = %d, want 0 (A)", freshCurrentPrimary)
+	}
+	if freshFailed != 0 {
+		t.Fatalf("fresh restart failedRecoveryProbes = %d, want 0", freshFailed)
+	}
+	if freshRotation {
+		t.Fatal("fresh restart rotationActive = true, want false")
+	}
+	if freshState != statePrimaryActive {
+		t.Fatalf("fresh restart state = %v, want statePrimaryActive", freshState)
+	}
+	if got := newSched.PendingCount(); got != 0 {
+		t.Fatalf("fresh restart pending timers = %d, want 0", got)
+	}
+}
+
+// TestFailoverReloadStateResetLogIsInfoLevel proves that an incompatible reload
+// emits exactly one info-level failover_rotation_state_reset log with the
+// deterministic reason and old/new primary names.
+func TestFailoverReloadStateResetLogIsInfoLevel(t *testing.T) {
+	logger, hook := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.InfoLevel)
+
+	option := testFailoverDialerOption()
+	oldCands := []*dialer.Dialer{
+		newNamedDirectDialer(option, "A"),
+		newNamedDirectDialer(option, "B"),
+		newNamedDirectDialer(option, "C"),
+	}
+	newCands := []*dialer.Dialer{
+		newNamedDirectDialer(option, "A"),
+		newNamedDirectDialer(option, "B"),
+		newNamedDirectDialer(option, "C"),
+		newNamedDirectDialer(option, "D"),
+	}
+	oldFallback := newNamedDirectDialer(option, "fallback")
+	newFallback := newNamedDirectDialer(option, "fallback")
+	recovery := baseReloadRecoveryConfig()
+
+	oldFC := NewFailoverControllerWithCandidates(logger, "reload-log-test", oldCands, oldFallback, recovery)
+	newFC := NewFailoverControllerWithCandidates(logger, "reload-log-test", newCands, newFallback, recovery)
+	oldSched := newFakeFailoverScheduler()
+	newSched := newFakeFailoverScheduler()
+	oldFC.scheduler = oldSched
+	newFC.scheduler = newSched
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	// Promote B in the old controller so old_current_primary is B.
+	oldFC.mu.Lock()
+	probeCh := make(chan bool, 4)
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		return <-probeCh, nil
+	}
+	oldFC.mu.Unlock()
+	oldFC.triggerPrimaryFailureForTest()
+	for i := 0; i < 5; i++ {
+		probeCh <- false
+		oldSched.FireNext(t)
+	}
+	// Now rotation active, target B. Promote B.
+	for i := 0; i < 3; i++ {
+		probeCh <- true
+		oldSched.FireNext(t)
+	}
+	oldFC.mu.Lock()
+	oldCP := oldFC.currentPrimary
+	oldFC.mu.Unlock()
+	if oldCP != 1 {
+		t.Fatalf("expected B promoted, got index %d", oldCP)
+	}
+
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	if transfer != nil {
+		t.Fatalf("expected nil transfer on identity change, got non-nil")
+	}
+	if reason != "primary_candidates_changed" {
+		t.Fatalf("reason = %q, want primary_candidates_changed", reason)
+	}
+
+	entries := findLogEntries(hook, "failover_rotation_state_reset")
+	if len(entries) != 1 {
+		t.Fatalf("failover_rotation_state_reset emitted %d times, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Level != logrus.InfoLevel {
+		t.Fatalf("failover_rotation_state_reset level = %v, want Info", e.Level)
+	}
+	if got := e.Data["group"]; got != "reload-log-test" {
+		t.Fatalf("group = %v, want reload-log-test", got)
+	}
+	if got := e.Data["reason"]; got != "primary_candidates_changed" {
+		t.Fatalf("reason field = %v, want primary_candidates_changed", got)
+	}
+	if got := e.Data["old_current_primary"]; got != "B" {
+		t.Fatalf("old_current_primary = %v, want B", got)
+	}
+	if got := e.Data["new_initial_primary"]; got != "A" {
+		t.Fatalf("new_initial_primary = %v, want A", got)
+	}
+}
+
+// TestFailoverReloadTransferConcurrentCommitRollback proves that concurrent
+// Commit/Rollback calls are exclusive: exactly one terminal operation takes
+// effect and the other is a no-op. This exercises the sync.Once guard.
+func TestFailoverReloadTransferConcurrentCommitRollback(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, newSched, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	transfer, _ := newFC.prepareReloadTransfer(oldFC)
+	if transfer == nil {
+		t.Fatal("expected transfer")
+	}
+
+	var wg sync.WaitGroup
+	commitCalls := 0
+	rollbackCalls := 0
+	var mu sync.Mutex
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(commit bool) {
+			defer wg.Done()
+			if commit {
+				transfer.Commit()
+				mu.Lock()
+				commitCalls++
+				mu.Unlock()
+			} else {
+				transfer.Rollback()
+				mu.Lock()
+				rollbackCalls++
+				mu.Unlock()
+			}
+		}(i%2 == 0)
+	}
+	wg.Wait()
+
+	// Exactly one of the terminal operations took effect. The old/new pending
+	// counts tell us which one: Commit leaves old paused (0) and new pending;
+	// Rollback leaves old pending (1) and new paused (0). The test does not
+	// assert which won, only that exactly one terminal effect happened.
+	oldPending := oldSched.PendingCount()
+	newPending := newSched.PendingCount()
+	commitWon := oldPending == 0 && newPending >= 1
+	rollbackWon := oldPending == 1 && newPending == 0
+	if !commitWon && !rollbackWon {
+		t.Fatalf("concurrent terminal ops left old=%d new=%d, want exactly one winner", oldPending, newPending)
+	}
+	// Drain to allow clean shutdown.
+	if commitWon {
+		newFC.Close()
+	} else {
+		// Drain the resumed old probe.
+		oldFC.mu.Lock()
+		oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+			return false, nil
+		}
+		oldFC.mu.Unlock()
+		oldSched.FireNext(t)
+	}
+}

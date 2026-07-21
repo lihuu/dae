@@ -78,7 +78,7 @@ func ValidateFailoverGroup(
 
 	// Collect roles by priority. Use a map to detect duplicate priorities and
 	// slices to enumerate priority 0, priority 1, and priority 2+ candidates.
-	seenPriority := make(map[int]int, len(dialers))    // priority -> dialer index
+	seenPriority := make(map[int]int, len(dialers))             // priority -> dialer index
 	seenDialerPtr := make(map[*dialer.Dialer]int, len(dialers)) // dialer pointer -> first dialer index
 	var primaryIdx, fallbackIdx = -1, -1
 	type priorityRole struct {
@@ -359,6 +359,34 @@ func (g *DialerGroup) RestoreFailoverSnapshot(snap *FailoverControllerSnapshot) 
 		return
 	}
 	g.failoverController.RestoreSnapshot(*snap)
+}
+
+// PrepareFailoverReloadFrom compares this group's failover identity against the
+// previous generation's group and returns a transactional transfer. On
+// compatibility (same fixed fallback name, same ordered primary-candidate
+// names, identical recovery policy) the returned transfer has paused the old
+// generation and restored this group's controller with the captured rotation
+// state; the reason string is empty. On incompatibility the returned transfer
+// is nil and the reason is the deterministic reset reason
+// (fallback_changed > primary_candidates_changed > recovery_policy_changed);
+// this group's controller stays at its fresh priority-0 initial primary and
+// the info-level failover_rotation_state_reset log has already been emitted by
+// the controller.
+//
+// The caller drives the transfer to a terminal state with Commit (keep the new
+// generation) or Rollback (discard the new generation's restore and resume
+// exactly one old-generation probe). Exactly one of Commit/Rollback takes
+// effect; both are idempotent.
+//
+// Returns (nil, "") if either group does not use a failover controller.
+func (g *DialerGroup) PrepareFailoverReloadFrom(old *DialerGroup) (*FailoverReloadTransfer, string) {
+	if g == nil || old == nil {
+		return nil, ""
+	}
+	if !g.HasFailoverController() || !old.HasFailoverController() {
+		return nil, ""
+	}
+	return g.failoverController.prepareReloadTransfer(old.failoverController)
 }
 
 func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
