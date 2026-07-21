@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -158,5 +159,232 @@ func TestFailoverRotationStandbyIdle(t *testing.T) {
 	}
 	if d, _ := group.failoverController.ActiveDialer(); d != nodes.A {
 		t.Fatalf("active dialer after idle window = %v, want A", d)
+	}
+}
+
+// scriptedProbeResult pairs an expected target dialer with the result its
+// probe should return. driveProbeResults installs a probeTargetTCP closure
+// that consumes the scripted results in order, asserting the target identity
+// on every probe.
+type scriptedProbeResult struct {
+	target *dialer.Dialer
+	ok     bool
+	err    error
+}
+
+// installRotationTestScheduler swaps the group's failover controller
+// scheduler for a deterministic fake so tests can drive the recovery loop
+// without real-time sleeps.
+func installRotationTestScheduler(group *DialerGroup) *fakeFailoverScheduler {
+	scheduler := newFakeFailoverScheduler()
+	group.failoverController.scheduler = scheduler
+	return scheduler
+}
+
+// triggerCandidateHealth dispatches a candidate alive-transition callback as
+// if the candidate's TCP health had changed. It is the identity-aware entry
+// point added in Packet 4.
+func triggerCandidateHealth(group *DialerGroup, candidate int, networkType *dialer.NetworkType, alive bool) {
+	group.failoverController.onCandidateHealthChange(candidate, networkType, alive)
+}
+
+// driveProbeResults installs a probeTargetTCP closure that consumes the
+// scripted results in order and fires one scheduler timer per result. It
+// asserts the target identity on every probe.
+func driveProbeResults(
+	t *testing.T,
+	group *DialerGroup,
+	scheduler *fakeFailoverScheduler,
+	results ...scriptedProbeResult,
+) {
+	t.Helper()
+	next := 0
+	group.failoverController.probeTargetTCP = func(_ context.Context, target *dialer.Dialer) (bool, error) {
+		if next >= len(results) {
+			t.Fatalf("unexpected probe of %s", target.Property().Name)
+		}
+		result := results[next]
+		next++
+		if target != result.target {
+			t.Fatalf("probe target = %s, want %s", target.Property().Name, result.target.Property().Name)
+		}
+		return result.ok, result.err
+	}
+	for range results {
+		scheduler.FireNext(t)
+	}
+	if next != len(results) {
+		t.Fatalf("consumed %d probe results, want %d", next, len(results))
+	}
+}
+
+// selectedDialer returns the dialer the group currently selects for the test
+// TCP network type, failing the test if selection errors out.
+func selectedDialer(t *testing.T, group *DialerGroup) *dialer.Dialer {
+	t.Helper()
+	d, _, _, err := group.SelectWithExclusionResult(TestNetworkType, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// TestFailoverRotationPromotedBIsSticky verifies that after B is promoted to
+// current primary, A becoming healthy later does NOT preempt B. B remains the
+// current primary until B itself fails. The first-to-third confirmation
+// success span is exactly 30 seconds at the 15-second confirmation cadence.
+func TestFailoverRotationPromotedBIsSticky(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+	scheduler := installRotationTestScheduler(group)
+
+	// A's TCP transition to unavailable triggers failover. B is the first
+	// standby candidate; five failed A probes activate rotation and advance
+	// the cursor to B, then three B successes at 15s cadence promote B.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	driveProbeResults(t, group, scheduler,
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+	)
+	if d := selectedDialer(t, group); d != nodes.B {
+		t.Fatalf("selected %v, want promoted B", d)
+	}
+
+	// Advance the clock so the three B successes span 30s of stable time.
+	// stableSince is recorded on the first B success; the test fake scheduler
+	// starts at time.Unix(0,0) and FireNext advances to each timer's
+	// scheduled deadline. The 15s confirmation cadence makes the third
+	// success land 30s after the first, satisfying recovery_stable_time.
+	_ = scheduler
+
+	// A becomes healthy later — must NOT preempt B.
+	triggerCandidateHealth(group, 0, TestNetworkType, true)
+	if d := selectedDialer(t, group); d != nodes.B {
+		t.Fatalf("A preempted B: selected %v", d)
+	}
+}
+
+// TestFailoverRotationPromotedBFailureStartsAtC verifies that after B is
+// promoted, a later B TCP failure immediately selects the fixed fallback,
+// gives B five failed recovery attempts, and then scans starting at C
+// (circular from currentPrimary+1).
+func TestFailoverRotationPromotedBFailureStartsAtC(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+	scheduler := installRotationTestScheduler(group)
+
+	// Promote B first.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	driveProbeResults(t, group, scheduler,
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+	)
+	if d := selectedDialer(t, group); d != nodes.B {
+		t.Fatalf("selected %v, want promoted B", d)
+	}
+
+	// Now B fails. The controller selects the fallback and gives B five
+	// failed attempts before advancing to C. The scripted probes below prove
+	// the exact sequence: five B probes (the threshold window), then the
+	// sixth probe targets C (circular from currentPrimary+1).
+	triggerCandidateHealth(group, 1, TestNetworkType, false)
+	if d := selectedDialer(t, group); d != nodes.Fallback {
+		t.Fatalf("after B failure selected %v, want fallback", d)
+	}
+	driveProbeResults(t, group, scheduler,
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.C},
+	)
+
+	// After the sixth (C) probe fails, the cursor has advanced past C to A
+	// (circular wrap). rotationActive is true and failedRecoveryProbes is 6.
+	group.failoverController.mu.Lock()
+	currentPrimary := group.failoverController.currentPrimary
+	recoveryTarget := group.failoverController.recoveryTarget
+	rotationActive := group.failoverController.rotationActive
+	failedProbes := group.failoverController.failedRecoveryProbes
+	group.failoverController.mu.Unlock()
+
+	if currentPrimary != 1 {
+		t.Fatalf("currentPrimary = %d, want 1 (B)", currentPrimary)
+	}
+	if recoveryTarget != 0 {
+		t.Fatalf("recoveryTarget = %d, want 0 (A, circular wrap after C)", recoveryTarget)
+	}
+	if !rotationActive {
+		t.Fatal("rotationActive = false, want true after B's five failures")
+	}
+	if failedProbes != 6 {
+		t.Fatalf("failedRecoveryProbes = %d, want 6", failedProbes)
+	}
+}
+
+// TestFailoverRotationNonCurrentCandidateFailureIgnored verifies that a TCP
+// down transition on a non-current candidate (A) does NOT switch the group
+// after B has been promoted. Only transitions on currentPrimary trigger
+// failover.
+func TestFailoverRotationNonCurrentCandidateFailureIgnored(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+	scheduler := installRotationTestScheduler(group)
+
+	// Promote B.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	driveProbeResults(t, group, scheduler,
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+		scriptedProbeResult{target: nodes.B, ok: true},
+	)
+	if d := selectedDialer(t, group); d != nodes.B {
+		t.Fatalf("selected %v, want promoted B", d)
+	}
+
+	// A (candidate 0) reports TCP down — must not affect the group.
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+	if d := selectedDialer(t, group); d != nodes.B {
+		t.Fatalf("non-current candidate failure switched group: selected %v, want B", d)
+	}
+	group.failoverController.mu.Lock()
+	state := group.failoverController.state
+	group.failoverController.mu.Unlock()
+	if state != statePrimaryActive {
+		t.Fatalf("state = %v, want statePrimaryActive (non-current candidate ignored)", state)
+	}
+}
+
+// TestFailoverRotationUDPTransitionOnCurrentPrimaryIgnored verifies that a
+// UDP transition on the current primary does NOT trigger failover. Only TCP
+// transitions of currentPrimary trigger failover.
+func TestFailoverRotationUDPTransitionOnCurrentPrimaryIgnored(t *testing.T) {
+	group, nodes := newRotationIntegrationGroup(t)
+
+	// UDP down on the current primary (A) — must NOT switch.
+	triggerCandidateHealth(group, 0, TestDnsUdp4NetworkType, false)
+	if d := selectedDialer(t, group); d != nodes.A {
+		t.Fatalf("UDP transition switched group: selected %v, want A", d)
+	}
+	group.failoverController.mu.Lock()
+	state := group.failoverController.state
+	group.failoverController.mu.Unlock()
+	if state != statePrimaryActive {
+		t.Fatalf("state = %v, want statePrimaryActive (UDP transitions ignored)", state)
 	}
 }

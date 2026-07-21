@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
 
 // fakeFailoverTimer is a fake failoverTimer produced by fakeFailoverScheduler.
@@ -115,6 +117,26 @@ func newRotationControllerTest(t *testing.T, cfg FailoverRecoveryConfig) (
 	fallback := newNamedDirectDialer(option, "fallback")
 
 	fc := NewFailoverControllerWithCandidates(log, "rotation-test", candidates, fallback, cfg)
+	sched := newFakeFailoverScheduler()
+	fc.scheduler = sched
+	return fc, sched, candidates, fallback
+}
+
+// newRotationControllerWithLogger is like newRotationControllerTest but uses a
+// caller-supplied logger so structured-log tests can attach a Logrus test hook.
+func newRotationControllerWithLogger(t *testing.T, logger *logrus.Logger, cfg FailoverRecoveryConfig) (
+	*FailoverController, *fakeFailoverScheduler, []*dialer.Dialer, *dialer.Dialer,
+) {
+	t.Helper()
+	option := testFailoverDialerOption()
+	candidates := []*dialer.Dialer{
+		newNamedDirectDialer(option, "A"),
+		newNamedDirectDialer(option, "B"),
+		newNamedDirectDialer(option, "C"),
+	}
+	fallback := newNamedDirectDialer(option, "fallback")
+
+	fc := NewFailoverControllerWithCandidates(logger, "rotation-test", candidates, fallback, cfg)
 	sched := newFakeFailoverScheduler()
 	fc.scheduler = sched
 	return fc, sched, candidates, fallback
@@ -563,7 +585,314 @@ func TestFailoverRotationRecoveryPromotion(t *testing.T) {
 				if got.pendingTimers != 1 {
 					t.Fatalf("pending timers = %d, want 1 (recovery schedule running)", got.pendingTimers)
 				}
-			}
-		})
+				}
+			})
+		}
+}
+
+// findLogEntries returns all log entries whose message matches one of the
+// supplied names.
+func findLogEntries(hook *logrustest.Hook, messages ...string) []*logrus.Entry {
+	want := map[string]struct{}{}
+	for _, m := range messages {
+		want[m] = struct{}{}
 	}
+	var out []*logrus.Entry
+	for _, e := range hook.AllEntries() {
+		if _, ok := want[e.Message]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestFailoverRotationStructuredLogs verifies the structured
+// primary_rotation_started and recovery_target_advanced logs. Both are
+// debug-level and carry group, failed_primary, from_target, to_target,
+// failed_attempts, and next_probe_in. failed_primary stays A across the whole
+// episode; failed_attempts increases monotonically; from_target/to_target
+// report the cursor edge; next_probe_in is the actual scheduled delay.
+func TestFailoverRotationStructuredLogs(t *testing.T) {
+	logger, hook := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	cfg := FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+	fc, sched, candidates, _ := newRotationControllerWithLogger(t, logger, cfg)
+	defer fc.Close()
+
+	fc.probeTargetTCP = func(_ context.Context, d *dialer.Dialer) (bool, error) {
+		// All probes fail; the cursor advances through A -> B -> C -> A.
+		_ = d
+		return false, nil
+	}
+	fc.triggerPrimaryFailureForTest()
+
+	// Fire 7 probes: 5 against A (the fifth activates rotation and advances
+	// to B), then B, then C, then A.
+	for i := 0; i < 7; i++ {
+		sched.FireNext(t)
+	}
+
+	started := findLogEntries(hook, "primary_rotation_started")
+	if len(started) != 1 {
+		t.Fatalf("primary_rotation_started emitted %d times, want 1", len(started))
+	}
+	if started[0].Level != logrus.DebugLevel {
+		t.Fatalf("primary_rotation_started level = %v, want Debug", started[0].Level)
+	}
+	checkRotationFields(t, started[0], "A", "A", "B", 5, 5*time.Minute)
+
+	advanced := findLogEntries(hook, "recovery_target_advanced")
+	if len(advanced) != 2 {
+		t.Fatalf("recovery_target_advanced emitted %d times, want 2", len(advanced))
+	}
+	// 6th failure: B -> C, failed_attempts=6, next_probe_in=5m (capped).
+	checkRotationFields(t, advanced[0], "A", "B", "C", 6, 5*time.Minute)
+	// 7th failure: C -> A, failed_attempts=7, next_probe_in=5m (capped).
+	checkRotationFields(t, advanced[1], "A", "C", "A", 7, 5*time.Minute)
+	_ = candidates
+}
+
+// checkRotationFields asserts the structured rotation log fields.
+func checkRotationFields(t *testing.T, e *logrus.Entry, failedPrimary, fromTarget, toTarget string, failedAttempts int, nextProbeIn time.Duration) {
+	t.Helper()
+	if got := e.Data["group"]; got != "rotation-test" {
+		t.Fatalf("group = %v, want rotation-test", got)
+	}
+	if got := e.Data["failed_primary"]; got != failedPrimary {
+		t.Fatalf("failed_primary = %v, want %s", got, failedPrimary)
+	}
+	if got := e.Data["from_target"]; got != fromTarget {
+		t.Fatalf("from_target = %v, want %s", got, fromTarget)
+	}
+	if got := e.Data["to_target"]; got != toTarget {
+		t.Fatalf("to_target = %v, want %s", got, toTarget)
+	}
+	if got := e.Data["failed_attempts"]; got != failedAttempts {
+		t.Fatalf("failed_attempts = %v, want %d", got, failedAttempts)
+	}
+	got, ok := e.Data["next_probe_in"].(time.Duration)
+	if !ok {
+		t.Fatalf("next_probe_in type = %T, want time.Duration", e.Data["next_probe_in"])
+	}
+	if got != nextProbeIn {
+		t.Fatalf("next_probe_in = %v, want %v", got, nextProbeIn)
+	}
+}
+
+// TestFailoverRotationDynamicEventPrimary verifies that failover_switch and
+// failback_complete carry the actual dynamic current primary name in the
+// Primary field and the fixed fallback name in the Fallback field. Routine
+// candidate movement does NOT emit additional FailoverEvents.
+func TestFailoverRotationDynamicEventPrimary(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	cfg := FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+	fc, sched, candidates, fallback := newRotationControllerWithLogger(t, logger, cfg)
+	defer fc.Close()
+	_ = fallback
+	_ = candidates
+
+	cb := &recordingCallback{}
+	fc.SetEventCallback(cb)
+
+	// Script: 5 A failures (activates rotation, advances to B), then 3 B
+	// successes at 15s cadence promote B. The probe results alternate by
+	// target identity.
+	fc.probeTargetTCP = func(_ context.Context, d *dialer.Dialer) (bool, error) {
+		switch d.Property().Name {
+		case "A":
+			return false, nil
+		case "B":
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+	fc.triggerPrimaryFailureForTest()
+
+	// Drive: 5 A failures, then 3 B successes. The stable-time check uses
+	// sched.Now(); FireNext advances the clock to each timer's scheduled
+	// deadline. After the fifth A failure the cursor moves to B and the next
+	// probe is scheduled at +5m. The first B success records stableSince at
+	// that 5m offset; the next two B confirmation probes run at +15s each,
+	// so the third success lands at +5m30s — exactly 30s after stableSince.
+	for i := 0; i < 5; i++ {
+		sched.FireNext(t)
+	}
+	for i := 0; i < 3; i++ {
+		sched.FireNext(t)
+	}
+
+	events := cb.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("emitted %d events, want 2 (switch + failback)", len(events))
+	}
+	if events[0].Type != FailoverEventSwitch {
+		t.Fatalf("event 0 type = %v, want failover_switch", events[0].Type)
+	}
+	if events[0].Primary != "A" {
+		t.Fatalf("switch event Primary = %q, want A (dynamic current primary)", events[0].Primary)
+	}
+	if events[0].Fallback != "fallback" {
+		t.Fatalf("switch event Fallback = %q, want fallback", events[0].Fallback)
+	}
+	if events[1].Type != FailoverEventFailbackComplete {
+		t.Fatalf("event 1 type = %v, want failback_complete", events[1].Type)
+	}
+	if events[1].Primary != "B" {
+		t.Fatalf("failback event Primary = %q, want B (promoted candidate)", events[1].Primary)
+	}
+	if events[1].Fallback != "fallback" {
+		t.Fatalf("failback event Fallback = %q, want fallback", events[1].Fallback)
+	}
+	if got, _ := fc.ActiveDialer(); got != candidates[1] {
+		t.Fatalf("active dialer = %v, want promoted B", got)
+	}
+}
+
+// TestFailoverRotationNotifierIsolation verifies that a notifier (Bark
+// dispatch) failure does not change selection, counters, cursor, timers, or
+// the subsequent promotion. The state machine must remain unaffected by
+// notifier errors. The controller's own emitEventLocked recover is the
+// production safety net, so this test installs a panicking callback that
+// records events AND panics — the recording must still observe every event
+// and the state machine must match a no-op-notifier run.
+func TestFailoverRotationNotifierIsolation(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	cfg := FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+
+	// runWithNotifier builds a controller, installs the supplied event
+	// callback, drives the same probe script, and returns the post-run state.
+	type isolatedState struct {
+		activeName     string
+		currentPrimary int
+		failedProbes   int
+		recoveryTarget int
+		pendingTimers  int
+		promoted       bool
+		switchEvents   int
+		failbackEvents int
+	}
+	runWithCallback := func(t *testing.T, cb FailoverEventCallback) isolatedState {
+		t.Helper()
+		fc, sched, _, _ := newRotationControllerWithLogger(t, logger, cfg)
+		defer fc.Close()
+		fc.SetEventCallback(cb)
+
+		fc.probeTargetTCP = func(_ context.Context, d *dialer.Dialer) (bool, error) {
+			switch d.Property().Name {
+			case "A":
+				return false, nil
+			case "B":
+				return true, nil
+			default:
+				return false, nil
+			}
+		}
+		fc.triggerPrimaryFailureForTest()
+		for i := 0; i < 5; i++ {
+			sched.FireNext(t)
+		}
+		for i := 0; i < 3; i++ {
+			sched.FireNext(t)
+		}
+
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		active, _ := fc.ActiveDialer()
+		activeName := "<nil>"
+		if active != nil {
+			activeName = active.Property().Name
+		}
+		var switchEvents, failbackEvents int
+		switch recorder := cb.(type) {
+		case *recordingCallback:
+			events := recorder.snapshot()
+			for _, ev := range events {
+				switch ev.Type {
+				case FailoverEventSwitch:
+					switchEvents++
+				case FailoverEventFailbackComplete:
+					failbackEvents++
+				}
+			}
+		case *panickingCallback:
+			events := recorder.inner.snapshot()
+			for _, ev := range events {
+				switch ev.Type {
+				case FailoverEventSwitch:
+					switchEvents++
+				case FailoverEventFailbackComplete:
+					failbackEvents++
+				}
+			}
+		}
+		return isolatedState{
+			activeName:     activeName,
+			currentPrimary: fc.currentPrimary,
+			failedProbes:   fc.failedRecoveryProbes,
+			recoveryTarget: fc.recoveryTarget,
+			pendingTimers:  sched.PendingCount(),
+			promoted:       fc.state == statePrimaryActive,
+			switchEvents:   switchEvents,
+			failbackEvents: failbackEvents,
+		}
+	}
+
+	noopState := runWithCallback(t, &recordingCallback{})
+
+	// panickingRecorder records the event then panics. The controller's
+	// emitEventLocked recover must catch the panic so the state machine is
+	// unaffected. The recording still observes every event because
+	// OnFailoverEvent appends before panicking.
+	panickingRecorder := &recordingCallback{}
+	panicState := runWithCallback(t, &panickingCallback{inner: panickingRecorder})
+
+	if !reflect.DeepEqual(noopState, panicState) {
+		t.Fatalf("notifier failure changed state machine:\nnoop=%+v\npanic=%+v", noopState, panicState)
+	}
+	if panicState.promoted != true {
+		t.Fatalf("promoted = %v, want true (notifier failure must not block promotion)", panicState.promoted)
+	}
+	if panicState.activeName != "B" {
+		t.Fatalf("active = %s, want B (notifier failure must not change selection)", panicState.activeName)
+	}
+	if panicState.switchEvents != 1 || panicState.failbackEvents != 1 {
+		t.Fatalf("events = switch=%d failback=%d, want 1/1", panicState.switchEvents, panicState.failbackEvents)
+	}
+}
+
+// panickingCallback records the event via the inner recording callback and
+// then panics, simulating a Bark dispatch failure. The controller's
+// emitEventLocked recover catches the panic so the state machine is
+// unaffected; the recording still observes every event.
+type panickingCallback struct {
+	inner *recordingCallback
+}
+
+func (p *panickingCallback) OnFailoverEvent(ev FailoverEvent) {
+	p.inner.OnFailoverEvent(ev)
+	panic("bark dispatch failed")
 }

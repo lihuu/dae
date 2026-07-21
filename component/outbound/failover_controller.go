@@ -141,6 +141,12 @@ type FailoverController struct {
 	// stable recovery and is promoted, or on a fresh controller without an
 	// inherited snapshot.
 	failedRecoveryProbes int
+	// failedPrimaryName is the name of the primary that triggered the current
+	// failover episode. It is recorded when startFailureTransitionLocked runs
+	// and is preserved across rotation cursor advances until promotion resets
+	// the episode. It supplies the failed_primary field of the
+	// primary_rotation_started and recovery_target_advanced structured logs.
+	failedPrimaryName string
 	// probeInFlight tracks whether a recovery probe is currently running. At
 	// most one probe is in flight at any time; scheduling a new probe while
 	// one is running is prevented by the generation guard and this flag.
@@ -212,11 +218,19 @@ func NewFailoverControllerWithCandidates(
 	}
 	fc.publishSnapshot()
 
-	// Register for the current primary's TCP health transitions.
-	primary.RegisterAliveTransitionCallback(fc.onPrimaryHealthChange)
-	// Keep the current primary's connectivity check goroutine alive so that
-	// traffic-driven failures are detected and the above callback fires.
-	primary.MarkKeepConnectivityCheck()
+	// Register identity-aware alive-transition callbacks for every primary
+	// candidate so the controller can distinguish current-primary transitions
+	// (which trigger failover) from standby-candidate transitions (which are
+	// ignored until that candidate becomes currentPrimary). The closure
+	// captures the candidate index so onCandidateHealthChange can decide
+	// whether the transition is actionable.
+	for i, candidate := range fc.primaryCandidates {
+		idx := i
+		candidate.RegisterAliveTransitionCallback(func(nt *dialer.NetworkType, alive bool) {
+			fc.onCandidateHealthChange(idx, nt, alive)
+		})
+		candidate.MarkKeepConnectivityCheck()
+	}
 
 	return fc
 }
@@ -281,26 +295,51 @@ func (fc *FailoverController) State() failoverState {
 	return fc.state
 }
 
-// onPrimaryHealthChange is called when the primary dialer's TCP health transitions.
+// onPrimaryHealthChange is a legacy test helper that delegates to the
+// identity-aware candidate callback for the current primary. It exists so
+// legacy tests that call it directly against the single-primary controller
+// still compile and pass. Production wiring uses onCandidateHealthChange via
+// per-candidate callbacks registered in NewFailoverControllerWithCandidates.
 func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkType, alive bool) {
+	fc.mu.Lock()
+	current := fc.currentPrimary
+	fc.mu.Unlock()
+	fc.onCandidateHealthChange(current, networkType, alive)
+}
+
+// onCandidateHealthChange is the identity-aware alive-transition callback for
+// every primary candidate. Only a confirmed TCP unavailable transition of the
+// currentPrimary triggers failover. UDP transitions and transitions from
+// standby candidates are ignored. A controller that is closed or not in the
+// healthy-primary state also ignores the transition (a duplicate while in
+// fallback/recovering must not re-enter the transition path).
+func (fc *FailoverController) onCandidateHealthChange(candidate int, networkType *dialer.NetworkType, alive bool) {
 	// Only TCP transitions trigger failover.
-	if networkType.L4Proto != "tcp" {
+	if networkType == nil || networkType.L4Proto != "tcp" {
 		return
 	}
 
 	if alive {
-		// Primary recovered — handled by recovery probe, not here.
-		// Real traffic success during fallback_active/ recovering would be
-		// observed by the probe. We don't switch back on a single success.
+		// Recovery is driven by the probe loop, not by a single alive
+		// transition. Ignore alive transitions here.
 		return
 	}
 
-	// Primary TCP became unavailable.
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
-	if fc.closed || fc.state != statePrimaryActive {
-		// Already in fallback or recovering; ignore duplicate.
+	if fc.closed {
+		return
+	}
+	if fc.state != statePrimaryActive {
+		// Already in fallback or recovering; ignore duplicate or stale
+		// transition. Many concurrent failures collapse into one logical
+		// transition.
+		return
+	}
+	if candidate != fc.currentPrimary {
+		// A standby candidate's transition does not affect the active
+		// selection. Only currentPrimary transitions trigger failover.
 		return
 	}
 
@@ -314,12 +353,14 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 // Must hold mu. Called from the production health callback (Packet 4 wires
 // that to candidate transitions) and the test seam triggerPrimaryFailureForTest.
 func (fc *FailoverController) startFailureTransitionLocked(trigger string) {
+	fc.failedPrimaryName = dialerName(fc.primaryDialer())
+
 	fc.log.WithFields(logrus.Fields{
 		"group":    fc.groupName,
 		"from":     "primary",
 		"to":       "fallback",
 		"trigger":  trigger,
-		"primary":  dialerName(fc.primaryDialer()),
+		"primary":  fc.failedPrimaryName,
 		"fallback": dialerName(fc.fallback),
 	}).Info("failover_switch")
 
@@ -336,7 +377,7 @@ func (fc *FailoverController) startFailureTransitionLocked(trigger string) {
 		Group:        fc.groupName,
 		From:         "primary",
 		To:           "fallback",
-		Primary:      dialerName(fc.primaryDialer()),
+		Primary:      fc.failedPrimaryName,
 		Fallback:     dialerName(fc.fallback),
 		Trigger:      trigger,
 		TransitionAt: fc.scheduler.Now(),
@@ -520,6 +561,7 @@ func (fc *FailoverController) promoteRecoveryTargetLocked() {
 	fc.state = statePrimaryActive
 	fc.rotationActive = false
 	fc.failedRecoveryProbes = 0
+	fc.failedPrimaryName = ""
 	fc.recoverySuccesses = 0
 	fc.stableSince = time.Time{}
 	fc.currentDelay = fc.config.ProbeInitial
@@ -566,44 +608,83 @@ func (fc *FailoverController) promoteRecoveryTargetLocked() {
 // ProbeMax), and — if rotation is already active — advances recoveryTarget to
 // the next candidate circularly. If rotation is not yet active and the
 // configured RotationAttempts threshold has been reached, rotation activates
-// and recoveryTarget advances to the next candidate after currentPrimary. A
-// success never erased earlier failures, so reaching the threshold necessarily
-// follows a failed probe.
+// and recoveryTarget advances to the next candidate after currentPrimary; in
+// that case primary_rotation_started is emitted. On every later cursor edge
+// recovery_target_advanced is emitted. A success never erased earlier
+// failures, so reaching the threshold necessarily follows a failed probe.
 func (fc *FailoverController) onProbeFailureLocked() {
 	fc.failedRecoveryProbes++
 	fc.recoverySuccesses = 0
 	fc.stableSince = time.Time{}
 
-	// Exponential backoff: double the delay, capped at ProbeMax. The backoff
-	// continues across failed targets and stays capped.
-	fc.currentDelay = minDuration(fc.currentDelay*2, fc.config.ProbeMax)
+	// Capture the cursor edge for the structured rotation logs. fromTarget is
+	// the target whose probe just failed; toTarget is the next target the
+	// cursor will advance to. For the threshold transition, fromTarget is the
+	// failed current primary and toTarget is the first standby candidate.
+	fromTargetIdx := fc.recoveryTarget
+	fromTargetName := dialerName(fc.recoveryTargetDialer())
 
-	// Advance the recovery target. Rotation is only entered when
-	// RotationAttempts > 0; with RotationAttempts == 0 (legacy two-dialer
-	// contract) the target never advances and the failed primary keeps being
-	// probed with the capped backoff.
+	// Determine whether this failure advances the cursor. Rotation is only
+	// entered when RotationAttempts > 0; with RotationAttempts == 0 (legacy
+	// two-dialer contract) the target never advances and the failed primary
+	// keeps being probed.
+	rotationStarts := false
+	advances := false
 	if fc.config.RotationAttempts > 0 {
 		if fc.rotationActive {
-			fc.recoveryTarget = (fc.recoveryTarget + 1) % len(fc.primaryCandidates)
+			advances = true
 		} else if fc.failedRecoveryProbes >= fc.config.RotationAttempts {
-			fc.rotationActive = true
-			fc.recoveryTarget = (fc.currentPrimary + 1) % len(fc.primaryCandidates)
+			rotationStarts = true
+			advances = true
 		}
 	}
+
+	// Exponential backoff: double the delay, capped at ProbeMax. The backoff
+	// continues across failed targets and stays capped. The new currentDelay
+	// is the delay that will be used to schedule the probe of toTarget.
+	fc.currentDelay = minDuration(fc.currentDelay*2, fc.config.ProbeMax)
+
+	// Advance the recovery target.
+	if advances {
+		if rotationStarts {
+			fc.rotationActive = true
+			fc.recoveryTarget = (fc.currentPrimary + 1) % len(fc.primaryCandidates)
+		} else {
+			fc.recoveryTarget = (fc.recoveryTarget + 1) % len(fc.primaryCandidates)
+		}
+	}
+
+	toTargetName := dialerName(fc.recoveryTargetDialer())
 
 	// Return to fallback_active (snapshot unchanged: still on fallback).
 	fc.state = stateFallbackActive
 	fc.publishSnapshot()
 
 	if fc.log.IsLevelEnabled(logrus.DebugLevel) {
-		fc.log.WithFields(logrus.Fields{
-			"group":           fc.groupName,
-			"primary":         dialerName(fc.recoveryTargetDialer()),
-			"failed_attempts": fc.failedRecoveryProbes,
-			"rotation_active": fc.rotationActive,
-			"next_in":         fc.currentDelay,
-		}).Debug("recovery probe failed, backing off")
+		if advances {
+			eventName := "recovery_target_advanced"
+			if rotationStarts {
+				eventName = "primary_rotation_started"
+			}
+			fc.log.WithFields(logrus.Fields{
+				"group":           fc.groupName,
+				"failed_primary":  fc.failedPrimaryName,
+				"from_target":     fromTargetName,
+				"to_target":       toTargetName,
+				"failed_attempts": fc.failedRecoveryProbes,
+				"next_probe_in":   fc.currentDelay,
+			}).Debug(eventName)
+		} else {
+			fc.log.WithFields(logrus.Fields{
+				"group":           fc.groupName,
+				"primary":         dialerName(fc.recoveryTargetDialer()),
+				"failed_attempts": fc.failedRecoveryProbes,
+				"rotation_active": fc.rotationActive,
+				"next_in":         fc.currentDelay,
+			}).Debug("recovery probe failed, backing off")
+		}
 	}
+	_ = fromTargetIdx
 
 	// Schedule next probe (against the possibly-advanced target).
 	fc.scheduleProbeLocked()
@@ -616,6 +697,22 @@ func (fc *FailoverController) recoveryTargetDialer() *dialer.Dialer {
 		return nil
 	}
 	return fc.primaryCandidates[fc.recoveryTarget]
+}
+
+// currentPrimaryDialerLocked returns the dialer of the currentPrimary. Must be
+// called with mu held. Returns nil if the index is out of range. This is the
+// locked-path alias of primaryDialer used by the dynamic-event helpers.
+func (fc *FailoverController) currentPrimaryDialerLocked() *dialer.Dialer {
+	if fc.currentPrimary < 0 || fc.currentPrimary >= len(fc.primaryCandidates) {
+		return nil
+	}
+	return fc.primaryCandidates[fc.currentPrimary]
+}
+
+// recoveryTargetDialerLocked is a locked-path alias of recoveryTargetDialer
+// for the dynamic-event helpers. Must be called with mu held.
+func (fc *FailoverController) recoveryTargetDialerLocked() *dialer.Dialer {
+	return fc.recoveryTargetDialer()
 }
 
 // publishSnapshot updates the atomic snapshot for lock-free reads. Must be
@@ -639,10 +736,26 @@ func (fc *FailoverController) publishSnapshot() {
 // emitEventLocked constructs and dispatches a FailoverEvent. Must be called
 // with mu held; the callback contract requires non-blocking dispatch. If the
 // callback is nil or the controller is closed, this is a no-op.
+//
+// A notifier (Bark dispatch) failure must remain isolated: it cannot change
+// failover state, timers, counters, or the selected dialer. The callback is
+// invoked with panic recovery so a panicking notifier cannot unwind through
+// the locked transition path. The mutex is still released by the caller's
+// deferred Unlock because Go defers run during panic unwinding, but the
+// recover here prevents the unwinding entirely.
 func (fc *FailoverController) emitEventLocked(ev FailoverEvent) {
 	if fc.closed || fc.eventCallback == nil {
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			fc.log.WithFields(logrus.Fields{
+				"group":  fc.groupName,
+				"event":  string(ev.Type),
+				"panic":  r,
+			}).Warn("failover notifier panic recovered; state machine unaffected")
+		}
+	}()
 	fc.eventCallback.OnFailoverEvent(ev)
 }
 
