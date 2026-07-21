@@ -8,6 +8,9 @@ package outbound
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -639,5 +642,204 @@ func TestFailoverRotationFallbackFailureReturnsError(t *testing.T) {
 	}
 	if !rotationActive {
 		t.Fatal("rotationActive = false, want true (exclusion must not change state)")
+	}
+}
+
+// newPerNodeHTTPServer starts an HTTP health-check server whose availability
+// is gated by the returned *atomic.Bool. When the flag is false the server
+// hijacks and closes the connection, causing ProbeTCPOnce to report the node
+// as unavailable. The server is auto-closed on test cleanup.
+func newPerNodeHTTPServer(t *testing.T, up *atomic.Bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !up.Load() {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if conn, _, err := hijacker.Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newNamedDirectDialerWithCheck builds a direct dialer whose TCP health check
+// targets the given URL, so each node's ProbeTCPOnce resolves to a distinct
+// HTTP server. This is what production uses (no test probe seam).
+func newNamedDirectDialerWithCheck(option *dialer.GlobalOption, name, tcpCheckURL string) *dialer.Dialer {
+	nodeOption := *option
+	nodeOption.TcpCheckOptionRaw = dialer.TcpCheckOptionRaw{Raw: []string{tcpCheckURL}}
+	d := newDirectDialer(&nodeOption, false)
+	d.Property().Name = name
+	return d
+}
+
+// newRotationIntegrationGroupPerNode builds a rotation-enabled DialerGroup
+// where each primary candidate and the fallback point at their own HTTP health
+// server via distinct TcpCheckOptionRaw URLs. This exercises the PRODUCTION
+// probe path (d.ProbeTCPOnce(ctx)) rather than a test-injected probe seam.
+//
+// The returned up flags gate each node's HTTP server. The fake scheduler is
+// installed so the recovery loop can be driven deterministically without
+// real-time sleeps; the probe function itself is NOT injected.
+func newRotationIntegrationGroupPerNode(t *testing.T) (*DialerGroup, rotationTestNodes, map[string]*atomic.Bool, *fakeFailoverScheduler) {
+	t.Helper()
+
+	baseOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     time.Hour, // no periodic probes; only the recovery loop probes
+		CheckTolerance:    0,
+	}
+
+	up := map[string]*atomic.Bool{
+		"A":        &atomic.Bool{},
+		"B":        &atomic.Bool{},
+		"C":        &atomic.Bool{},
+		"Fallback": &atomic.Bool{},
+	}
+	for _, flag := range up {
+		flag.Store(true)
+	}
+
+	srvA := newPerNodeHTTPServer(t, up["A"])
+	srvB := newPerNodeHTTPServer(t, up["B"])
+	srvC := newPerNodeHTTPServer(t, up["C"])
+	srvFallback := newPerNodeHTTPServer(t, up["Fallback"])
+
+	nodes := rotationTestNodes{
+		A:        newNamedDirectDialerWithCheck(baseOption, "A", srvA.URL),
+		B:        newNamedDirectDialerWithCheck(baseOption, "B", srvB.URL),
+		C:        newNamedDirectDialerWithCheck(baseOption, "C", srvC.URL),
+		Fallback: newNamedDirectDialerWithCheck(baseOption, "fallback", srvFallback.URL),
+	}
+	dialers := []*dialer.Dialer{nodes.Fallback, nodes.C, nodes.A, nodes.B}
+	annotations := []*dialer.Annotation{
+		{Priority: 1}, // Fallback
+		{Priority: 3}, // C
+		{Priority: 0}, // A
+		{Priority: 2}, // B
+	}
+	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	})
+	if err != nil {
+		t.Fatalf("ValidateFailoverGroup failed: %v", err)
+	}
+	group := NewDialerGroup(
+		baseOption,
+		"rotation-per-node",
+		dialers,
+		annotations,
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover},
+		func(bool, *dialer.NetworkType, bool) {},
+		cfg,
+	)
+	t.Cleanup(func() { _ = group.Close() })
+
+	// Install the fake scheduler for deterministic timer firing. Crucially, do
+	// NOT inject probeTargetTCP: the production path (d.ProbeTCPOnce(ctx) when
+	// probeTCP is nil, or the legacy probeTCP closure when set by the ctor) must
+	// be exercised against each node's own HTTP server.
+	scheduler := installRotationTestScheduler(group)
+
+	return group, nodes, up, scheduler
+}
+
+// TestFailoverRotationProductionProbeTargetsRecoveryTarget is a PRODUCTION-path
+// regression test for a Critical bug where probeTarget's production fallback
+// bound a closure to the initial primary at construction time and ignored the
+// recoveryTarget dialer, so rotation to B/C would still probe A in production.
+//
+// This test deliberately does NOT inject probeTargetTCP or probeTCP. Each
+// candidate points at its own HTTP health server, so d.ProbeTCPOnce(ctx)
+// resolves to the node being probed. After five failed A probes activate
+// rotation, the next probe must target B: we keep A down and bring B up, so a
+// correct production path yields a successful B probe (confirmation starts on
+// B), while the bug would yield a failed A probe and advance to C.
+func TestFailoverRotationProductionProbeTargetsRecoveryTarget(t *testing.T) {
+	group, nodes, up, scheduler := newRotationIntegrationGroupPerNode(t)
+
+	// Sanity: initial selection is A.
+	if d := selectedDialer(t, group); d != nodes.A {
+		t.Fatalf("initial selection = %v, want A", d)
+	}
+
+	// A goes down — trigger failover via the identity-aware callback path.
+	up["A"].Store(false)
+	triggerCandidateHealth(group, 0, TestNetworkType, false)
+
+	// The controller must now be on the fixed Fallback.
+	if d := selectedDialer(t, group); d != nodes.Fallback {
+		t.Fatalf("after A failure, selection = %v, want Fallback", d)
+	}
+
+	// Drive five failed recovery probes. A is down, so a production probe of A
+	// (the recovery target before rotation) returns false. Each FireNext fires
+	// the pending recovery timer, which runs runProbe -> probeTarget ->
+	// d.ProbeTCPOnce(ctx) against A's (down) HTTP server.
+	for i := 1; i <= 5; i++ {
+		scheduler.FireNext(t)
+	}
+
+	// After five failures: rotation active, recoveryTarget advanced to B (index 1).
+	group.failoverController.mu.Lock()
+	failedRecoveryProbes := group.failoverController.failedRecoveryProbes
+	rotationActive := group.failoverController.rotationActive
+	recoveryTarget := group.failoverController.recoveryTarget
+	recoverySuccesses := group.failoverController.recoverySuccesses
+	group.failoverController.mu.Unlock()
+
+	if failedRecoveryProbes != 5 {
+		t.Fatalf("failedRecoveryProbes = %d, want 5", failedRecoveryProbes)
+	}
+	if !rotationActive {
+		t.Fatal("rotationActive = false, want true after 5 failed probes")
+	}
+	if recoveryTarget != 1 {
+		t.Fatalf("recoveryTarget = %d, want 1 (B) after rotation activates", recoveryTarget)
+	}
+	if recoverySuccesses != 0 {
+		t.Fatalf("recoverySuccesses = %d, want 0 before any B probe", recoverySuccesses)
+	}
+
+	// The decisive assertion: keep A down and bring B up. Fire the next
+	// recovery timer. The production probe must now hit B's HTTP server (up),
+	// returning ok=true, which starts confirmation on B.
+	//
+	// If the production path ignored the recoveryTarget dialer and probed A
+	// (the original bug), this probe would fail (A is still down), advancing
+	// the cursor to C and incrementing failedRecoveryProbes to 6.
+	up["B"].Store(true)
+	scheduler.FireNext(t)
+
+	group.failoverController.mu.Lock()
+	failedRecoveryProbes = group.failoverController.failedRecoveryProbes
+	recoveryTarget = group.failoverController.recoveryTarget
+	recoverySuccesses = group.failoverController.recoverySuccesses
+	group.failoverController.mu.Unlock()
+
+	if recoverySuccesses != 1 {
+		t.Fatalf("recoverySuccesses = %d, want 1: production probe did not successfully hit B (recoveryTarget). "+
+			"failedRecoveryProbes=%d, recoveryTarget=%d. This indicates probeTarget's production path is not "+
+			"probing the recoveryTarget dialer.", recoverySuccesses, failedRecoveryProbes, recoveryTarget)
+	}
+	if recoveryTarget != 1 {
+		t.Fatalf("recoveryTarget = %d, want 1 (B): a successful B probe must hold the cursor on B", recoveryTarget)
+	}
+	if failedRecoveryProbes != 5 {
+		t.Fatalf("failedRecoveryProbes = %d, want 5 (a successful probe must not increment the failure count)",
+			failedRecoveryProbes)
 	}
 }

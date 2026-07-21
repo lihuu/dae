@@ -106,12 +106,20 @@ type FailoverController struct {
 	recoveryTarget int
 	fallback       *dialer.Dialer
 	config         FailoverRecoveryConfig
-	probeTCP       func(context.Context) (bool, error)
-	// probeTargetTCP, when set, overrides probeTCP for target-aware recovery
-	// probes. It receives the dialer of the current recoveryTarget. When nil,
-	// the controller falls back to probeTCP against the current target dialer
-	// (the legacy single-primary path). Tests inject it to script per-target
-	// results deterministically.
+	// probeTCP is a LEGACY single-primary TEST injection seam. It is nil in
+	// production. When a legacy single-primary test sets it, probeTarget uses it
+	// (ignoring the target dialer, which is always the single initial primary in
+	// those tests) to drive deterministic probe results. Production MUST NOT set
+	// this field: doing so would bind recovery probes to one fixed dialer and
+	// silently break rotation, because the production path must probe the dialer
+	// at the current recoveryTarget (which advances through the ordered
+	// candidates during rotation).
+	probeTCP func(context.Context) (bool, error)
+	// probeTargetTCP, when set, overrides the production probe for target-aware
+	// recovery probes. It receives the dialer of the current recoveryTarget.
+	// Rotation tests inject it to script per-target results deterministically.
+	// When both probeTargetTCP and probeTCP are nil, probeTarget calls
+	// targetDialer.ProbeTCPOnce(ctx) — the production path.
 	probeTargetTCP func(context.Context, *dialer.Dialer) (bool, error)
 	// scheduler is the time/timer source. It defaults to
 	// systemFailoverScheduler so production and legacy tests use real time;
@@ -201,8 +209,6 @@ func NewFailoverControllerWithCandidates(
 		primaryCandidates = []*dialer.Dialer{nil}
 	}
 
-	primary := primaryCandidates[0]
-
 	fc := &FailoverController{
 		log:               log,
 		groupName:         groupName,
@@ -211,10 +217,16 @@ func NewFailoverControllerWithCandidates(
 		recoveryTarget:    0,
 		fallback:          fallback,
 		config:            config,
-		probeTCP:          primary.ProbeTCPOnce,
-		scheduler:         systemFailoverScheduler{},
-		state:             statePrimaryActive,
-		currentDelay:      config.ProbeInitial,
+		// probeTCP is intentionally left nil here: production recovery probes
+		// must target the dialer at the current recoveryTarget (which advances
+		// through the ordered candidates during rotation), not a closure bound
+		// to the initial primary at construction time. probeTarget resolves the
+		// production path to targetDialer.ProbeTCPOnce(ctx) when no test seam is
+		// injected. probeTCP is a legacy single-primary test injection seam only.
+		probeTCP:     nil,
+		scheduler:    systemFailoverScheduler{},
+		state:        statePrimaryActive,
+		currentDelay: config.ProbeInitial,
 	}
 	fc.publishSnapshot()
 
@@ -487,19 +499,31 @@ func (fc *FailoverController) runProbe(gen uint64) {
 }
 
 // probeTarget runs one TCP connectivity check against the recovery target
-// dialer. It prefers the target-aware probeTargetTCP injection seam (used by
-// rotation tests to script per-target results) and otherwise falls back to
-// the legacy probeTCP closure bound to the initial primary (which is correct
-// for the legacy single-primary case where the recovery target is always the
-// initial primary at index 0). Each invocation returns its own result.
+// dialer d. Resolution order:
+//
+//  1. probeTargetTCP (target-aware test seam) — rotation tests inject it to
+//     script per-target results deterministically.
+//  2. probeTCP (legacy single-primary test seam) — legacy single-primary tests
+//     inject it to drive deterministic results; the target dialer is always
+//     the single initial primary in those tests, so ignoring d is safe.
+//  3. d.ProbeTCPOnce(ctx) — the PRODUCTION path. This must probe the dialer at
+//     the current recoveryTarget, which advances through the ordered candidates
+//     during rotation. Binding production to a fixed closure would silently
+//     break rotation by always probing the initial primary.
+//
+// A nil target dialer (defensive; callers guard against this) returns a failure
+// result so the schedule keeps moving.
 func (fc *FailoverController) probeTarget(ctx context.Context, d *dialer.Dialer) (bool, error) {
+	if d == nil {
+		return false, errors.New("no target dialer to probe")
+	}
 	if fc.probeTargetTCP != nil {
 		return fc.probeTargetTCP(ctx, d)
 	}
 	if fc.probeTCP != nil {
 		return fc.probeTCP(ctx)
 	}
-	return false, errors.New("no probe function configured")
+	return d.ProbeTCPOnce(ctx)
 }
 
 // onProbeSuccessLocked handles a successful recovery probe for the current
