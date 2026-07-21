@@ -7,7 +7,7 @@ package outbound
 
 import (
 	"context"
-	"math"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +15,40 @@ import (
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/sirupsen/logrus"
 )
+
+// failoverTimer is the minimal timer interface the controller depends on so a
+// fake scheduler can intercept scheduling in tests. time.Timer and the fake
+// timer both satisfy it.
+type failoverTimer interface {
+	Stop() bool
+}
+
+// failoverScheduler abstracts the controller's time source and one-shot
+// timer scheduling so the rotation state-machine tests can drive the recovery
+// loop deterministically without real-time sleeps. The production
+// implementation is systemFailoverScheduler; tests inject a fake.
+type failoverScheduler interface {
+	Now() time.Time
+	AfterFunc(time.Duration, func()) failoverTimer
+}
+
+// systemFailoverScheduler wraps the real time package. It is the default
+// scheduler so legacy tests that rely on real time.AfterFunc keep working
+// unchanged.
+type systemFailoverScheduler struct{}
+
+func (systemFailoverScheduler) Now() time.Time { return time.Now() }
+func (systemFailoverScheduler) AfterFunc(d time.Duration, fn func()) failoverTimer {
+	return time.AfterFunc(d, fn)
+}
+
+// minDuration returns the smaller of two durations.
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // failoverState represents the logical state of the failover group.
 type failoverState int
@@ -73,6 +107,16 @@ type FailoverController struct {
 	fallback       *dialer.Dialer
 	config         FailoverRecoveryConfig
 	probeTCP       func(context.Context) (bool, error)
+	// probeTargetTCP, when set, overrides probeTCP for target-aware recovery
+	// probes. It receives the dialer of the current recoveryTarget. When nil,
+	// the controller falls back to probeTCP against the current target dialer
+	// (the legacy single-primary path). Tests inject it to script per-target
+	// results deterministically.
+	probeTargetTCP func(context.Context, *dialer.Dialer) (bool, error)
+	// scheduler is the time/timer source. It defaults to
+	// systemFailoverScheduler so production and legacy tests use real time;
+	// rotation tests inject a fakeFailoverScheduler for deterministic timing.
+	scheduler failoverScheduler
 
 	// mu protects mutable state below. It must NOT be held during network ops.
 	mu sync.Mutex
@@ -81,10 +125,26 @@ type FailoverController struct {
 	recoverySuccesses int
 	stableSince       time.Time // when the first recovery success occurred
 	currentDelay      time.Duration
-	recoveryTimer     *time.Timer
+	recoveryTimer     failoverTimer
 	nextProbeAt       time.Time          // when the current recovery timer is scheduled to fire
 	probeCancel       context.CancelFunc // cancels the in-flight probe
 	generation        uint64             // incremented on close/reload to invalidate stale callbacks
+
+	// rotationActive is true once failedRecoveryProbes has reached
+	// config.RotationAttempts and the recoveryTarget has begun advancing
+	// through the ordered primary candidates. Before that, failed probes
+	// keep targeting the failed current primary.
+	rotationActive bool
+	// failedRecoveryProbes is the monotonically increasing total failed
+	// recovery-probe count during the current failover episode. A successful
+	// probe does NOT reset it. It resets only when a candidate completes
+	// stable recovery and is promoted, or on a fresh controller without an
+	// inherited snapshot.
+	failedRecoveryProbes int
+	// probeInFlight tracks whether a recovery probe is currently running. At
+	// most one probe is in flight at any time; scheduling a new probe while
+	// one is running is prevented by the generation guard and this flag.
+	probeInFlight bool
 
 	// closed is set by Close(). After closed, onPrimaryHealthChange returns
 	// early without modifying state or scheduling timers.
@@ -146,6 +206,7 @@ func NewFailoverControllerWithCandidates(
 		fallback:          fallback,
 		config:            config,
 		probeTCP:          primary.ProbeTCPOnce,
+		scheduler:         systemFailoverScheduler{},
 		state:             statePrimaryActive,
 		currentDelay:      config.ProbeInitial,
 	}
@@ -243,16 +304,29 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 		return
 	}
 
+	fc.startFailureTransitionLocked("tcp_unavailable")
+}
+
+// startFailureTransitionLocked performs the Failure Transition for the current
+// primary: selects the fixed fallback for new traffic, sets recoveryTarget to
+// the failed current primary, resets rotationActive and failedRecoveryProbes,
+// resets the backoff, schedules the first probe, and emits failover_switch.
+// Must hold mu. Called from the production health callback (Packet 4 wires
+// that to candidate transitions) and the test seam triggerPrimaryFailureForTest.
+func (fc *FailoverController) startFailureTransitionLocked(trigger string) {
 	fc.log.WithFields(logrus.Fields{
 		"group":    fc.groupName,
 		"from":     "primary",
 		"to":       "fallback",
-		"trigger":  "tcp_unavailable",
+		"trigger":  trigger,
 		"primary":  dialerName(fc.primaryDialer()),
 		"fallback": dialerName(fc.fallback),
 	}).Info("failover_switch")
 
 	fc.state = stateFallbackActive
+	fc.recoveryTarget = fc.currentPrimary
+	fc.rotationActive = false
+	fc.failedRecoveryProbes = 0
 	fc.recoverySuccesses = 0
 	fc.stableSince = time.Time{}
 	fc.currentDelay = fc.config.ProbeInitial
@@ -264,12 +338,27 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 		To:           "fallback",
 		Primary:      dialerName(fc.primaryDialer()),
 		Fallback:     dialerName(fc.fallback),
-		Trigger:      "tcp_unavailable",
-		TransitionAt: time.Now(),
+		Trigger:      trigger,
+		TransitionAt: fc.scheduler.Now(),
 	})
 
 	// Schedule the first recovery probe.
 	fc.scheduleProbeLocked()
+}
+
+// triggerPrimaryFailureForTest is a test-only seam that performs the Failure
+// Transition inline against the current primary without going through the
+// alive-transition callback machinery. Packet 4 wires the real health
+// callbacks; this method exists so the rotation state machine (Packet 3) can
+// be exercised deterministically before that wiring exists. Do NOT call from
+// production code.
+func (fc *FailoverController) triggerPrimaryFailureForTest() {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.state != statePrimaryActive {
+		return
+	}
+	fc.startFailureTransitionLocked("tcp_unavailable")
 }
 
 // scheduleProbeLocked schedules the next recovery probe. Must be called with mu held.
@@ -282,16 +371,16 @@ func (fc *FailoverController) scheduleProbeLocked() {
 	delay := fc.currentDelay
 	gen := fc.generation
 
-	fc.nextProbeAt = time.Now().Add(delay)
-	fc.recoveryTimer = time.AfterFunc(delay, func() {
+	fc.nextProbeAt = fc.scheduler.Now().Add(delay)
+	fc.recoveryTimer = fc.scheduler.AfterFunc(delay, func() {
 		fc.runProbe(gen)
 	})
 }
 
-// runProbe executes a one-shot TCP probe against the primary dialer.
+// runProbe executes a one-shot TCP probe against the current recovery target.
 func (fc *FailoverController) runProbe(gen uint64) {
 	fc.mu.Lock()
-	// Check if this probe is stale (from an old generation).
+	// Stale probe from an older generation: ignore without mutating state.
 	if gen != fc.generation {
 		fc.mu.Unlock()
 		return
@@ -301,6 +390,22 @@ func (fc *FailoverController) runProbe(gen uint64) {
 		fc.mu.Unlock()
 		return
 	}
+	// At most one probe in flight. If a probe is already running (which should
+	// not happen given the single pending timer), bail out.
+	if fc.probeInFlight {
+		fc.mu.Unlock()
+		return
+	}
+
+	// Capture the recovery target dialer while holding mu; release the mutex
+	// for the network I/O. A nil target dialer (defensive) means we cannot
+	// probe and we treat it as a failure so the schedule keeps moving.
+	targetIdx := fc.recoveryTarget
+	var targetDialer *dialer.Dialer
+	if targetIdx >= 0 && targetIdx < len(fc.primaryCandidates) {
+		targetDialer = fc.primaryCandidates[targetIdx]
+	}
+	fc.probeInFlight = true
 
 	// Create a cancellable context for this probe.
 	ctx, cancel := context.WithTimeout(context.Background(), dialer.Timeout)
@@ -308,98 +413,91 @@ func (fc *FailoverController) runProbe(gen uint64) {
 	fc.mu.Unlock()
 
 	defer cancel()
+	defer func() {
+		fc.mu.Lock()
+		fc.probeCancel = nil
+		fc.probeInFlight = false
+		fc.mu.Unlock()
+	}()
 
-	// Perform the TCP health check on the primary.
-	ok := fc.probePrimaryTCP(ctx)
+	// Perform the target-aware TCP health check outside the mutex.
+	ok, err := fc.probeTarget(ctx, targetDialer)
 
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
-	// Re-check generation after the network call.
+	// Re-check generation after the network call: a close/reload happened.
 	if gen != fc.generation {
 		return
 	}
 
-	// Clear the cancel func.
-	fc.probeCancel = nil
+	if errors.Is(err, context.Canceled) {
+		// Cancellation during shutdown/reload is NOT a failure: leave
+		// counters, cursor, and backoff unchanged. Do not reschedule; the
+		// close/reload path owns the next schedule.
+		return
+	}
 
-	if ok {
+	if ok && err == nil {
 		fc.onProbeSuccessLocked()
-	} else {
-		fc.onProbeFailureLocked()
+		return
 	}
+	fc.onProbeFailureLocked()
 }
 
-// probePrimaryTCP performs a one-shot TCP connectivity check on the primary.
-// Each invocation returns its own result and does not depend on a canonical
-// health-state transition.
-func (fc *FailoverController) probePrimaryTCP(ctx context.Context) bool {
-	ok, err := fc.probeTCP(ctx)
-	if err != nil && fc.log.IsLevelEnabled(logrus.DebugLevel) {
-		fc.log.WithError(err).WithFields(logrus.Fields{
-			"group":   fc.groupName,
-			"primary": dialerName(fc.primaryDialer()),
-		}).Debug("recovery TCP probe failed")
+// probeTarget runs one TCP connectivity check against the recovery target
+// dialer. It prefers the target-aware probeTargetTCP injection seam (used by
+// rotation tests to script per-target results) and otherwise falls back to
+// the legacy probeTCP closure bound to the initial primary (which is correct
+// for the legacy single-primary case where the recovery target is always the
+// initial primary at index 0). Each invocation returns its own result.
+func (fc *FailoverController) probeTarget(ctx context.Context, d *dialer.Dialer) (bool, error) {
+	if fc.probeTargetTCP != nil {
+		return fc.probeTargetTCP(ctx, d)
 	}
-	return ok && err == nil
+	if fc.probeTCP != nil {
+		return fc.probeTCP(ctx)
+	}
+	return false, errors.New("no probe function configured")
 }
 
-// onProbeSuccessLocked handles a successful recovery probe. Must hold mu.
+// onProbeSuccessLocked handles a successful recovery probe for the current
+// recoveryTarget. Must hold mu.
+//
+// A success always starts or continues recovery confirmation for the current
+// target. The first success records stableSince; confirmation probes run at
+// recovery_probe_initial (NOT doubled). Promotion requires both
+// recovery_successes consecutive successes AND recovery_stable_time elapsed
+// since the first success. The attempt threshold never interrupts a target
+// producing successes; only failed probes consume the budget. A success does
+// NOT erase earlier failures (failedRecoveryProbes is unchanged).
 func (fc *FailoverController) onProbeSuccessLocked() {
 	fc.recoverySuccesses++
 
 	if fc.recoverySuccesses == 1 {
 		// First success — record stability start time.
-		fc.stableSince = time.Now()
+		fc.stableSince = fc.scheduler.Now()
 		fc.log.WithFields(logrus.Fields{
 			"group":     fc.groupName,
-			"primary":   dialerName(fc.primaryDialer()),
+			"primary":   dialerName(fc.recoveryTargetDialer()),
 			"successes": fc.recoverySuccesses,
 		}).Info("failback_start")
 	}
 
-	// Reset failure backoff.
+	// Confirmation probes run at recovery_probe_initial (NOT doubled).
 	fc.currentDelay = fc.config.ProbeInitial
 
 	// Transition to recovering if not already there.
 	if fc.state == stateFallbackActive {
 		fc.state = stateRecovering
+		fc.publishSnapshot()
 	}
 
-	// Check if recovery is complete.
+	// Check if recovery is complete: both consecutive successes and stable
+	// time elapsed since the first success.
 	if fc.recoverySuccesses >= fc.config.Successes &&
-		time.Since(fc.stableSince) >= fc.config.StableTime {
-		// Failback!
-		fc.log.WithFields(logrus.Fields{
-			"group":      fc.groupName,
-			"from":       "fallback",
-			"to":         "primary",
-			"successes":  fc.recoverySuccesses,
-			"stable_for": time.Since(fc.stableSince).Round(time.Second),
-		}).Info("failback_complete")
-
-		// Capture the values that made this failback qualify, before resetting.
-		// StableFor is left unrounded so sub-second stable windows (and the
-		// pre-reset value itself) are preserved; the log line above rounds for
-		// display only.
-		successes := fc.recoverySuccesses
-		stableFor := time.Since(fc.stableSince)
-		fc.state = statePrimaryActive
-		fc.recoverySuccesses = 0
-		fc.stableSince = time.Time{}
-		fc.currentDelay = fc.config.ProbeInitial
-		fc.publishSnapshot()
-		fc.emitEventLocked(FailoverEvent{
-			Type:         FailoverEventFailbackComplete,
-			Group:        fc.groupName,
-			From:         "fallback",
-			To:           "primary",
-			Primary:      dialerName(fc.primaryDialer()),
-			Fallback:     dialerName(fc.fallback),
-			Successes:    successes,
-			StableFor:    stableFor,
-			TransitionAt: time.Now(),
-		})
+		fc.scheduler.Now().Sub(fc.stableSince) >= fc.config.StableTime {
+		fc.promoteRecoveryTargetLocked()
 		return
 	}
 
@@ -407,31 +505,117 @@ func (fc *FailoverController) onProbeSuccessLocked() {
 	fc.scheduleProbeLocked()
 }
 
-// onProbeFailureLocked handles a failed recovery probe. Must hold mu.
+// promoteRecoveryTargetLocked promotes the current recoveryTarget to
+// currentPrimary, resets all rotation/episode state, stops the recovery
+// schedule, and emits failback_complete. Must hold mu.
+func (fc *FailoverController) promoteRecoveryTargetLocked() {
+	promoted := fc.recoveryTarget
+	fromName := dialerName(fc.fallback)
+	toName := dialerName(fc.recoveryTargetDialer())
+
+	successes := fc.recoverySuccesses
+	stableFor := fc.scheduler.Now().Sub(fc.stableSince)
+
+	fc.currentPrimary = promoted
+	fc.state = statePrimaryActive
+	fc.rotationActive = false
+	fc.failedRecoveryProbes = 0
+	fc.recoverySuccesses = 0
+	fc.stableSince = time.Time{}
+	fc.currentDelay = fc.config.ProbeInitial
+
+	// Stop the recovery schedule: cancel timer and any in-flight probe.
+	if fc.recoveryTimer != nil {
+		fc.recoveryTimer.Stop()
+		fc.recoveryTimer = nil
+	}
+	if fc.probeCancel != nil {
+		fc.probeCancel()
+		fc.probeCancel = nil
+	}
+
+	fc.publishSnapshot()
+
+	fc.log.WithFields(logrus.Fields{
+		"group":      fc.groupName,
+		"from":       "fallback",
+		"to":         "primary",
+		"successes":  successes,
+		"stable_for": stableFor.Round(time.Second),
+	}).Info("failback_complete")
+
+	fc.emitEventLocked(FailoverEvent{
+		Type:         FailoverEventFailbackComplete,
+		Group:        fc.groupName,
+		From:         "fallback",
+		To:           "primary",
+		Primary:      toName,
+		Fallback:     fromName,
+		Successes:    successes,
+		StableFor:    stableFor,
+		TransitionAt: fc.scheduler.Now(),
+	})
+}
+
+// onProbeFailureLocked handles a failed recovery probe for the current
+// recoveryTarget. Must hold mu.
+//
+// A failed probe (ok=false or a non-cancellation error) consumes one attempt
+// from the episode budget: it increments failedRecoveryProbes, clears the
+// current target's successes and stableSince, doubles the backoff (capped at
+// ProbeMax), and — if rotation is already active — advances recoveryTarget to
+// the next candidate circularly. If rotation is not yet active and the
+// configured RotationAttempts threshold has been reached, rotation activates
+// and recoveryTarget advances to the next candidate after currentPrimary. A
+// success never erased earlier failures, so reaching the threshold necessarily
+// follows a failed probe.
 func (fc *FailoverController) onProbeFailureLocked() {
+	fc.failedRecoveryProbes++
 	fc.recoverySuccesses = 0
 	fc.stableSince = time.Time{}
 
-	// Exponential backoff: double the delay, capped at max.
-	fc.currentDelay = time.Duration(math.Min(
-		float64(fc.currentDelay)*2,
-		float64(fc.config.ProbeMax),
-	))
+	// Exponential backoff: double the delay, capped at ProbeMax. The backoff
+	// continues across failed targets and stays capped.
+	fc.currentDelay = minDuration(fc.currentDelay*2, fc.config.ProbeMax)
 
-	// Return to fallback_active.
+	// Advance the recovery target. Rotation is only entered when
+	// RotationAttempts > 0; with RotationAttempts == 0 (legacy two-dialer
+	// contract) the target never advances and the failed primary keeps being
+	// probed with the capped backoff.
+	if fc.config.RotationAttempts > 0 {
+		if fc.rotationActive {
+			fc.recoveryTarget = (fc.recoveryTarget + 1) % len(fc.primaryCandidates)
+		} else if fc.failedRecoveryProbes >= fc.config.RotationAttempts {
+			fc.rotationActive = true
+			fc.recoveryTarget = (fc.currentPrimary + 1) % len(fc.primaryCandidates)
+		}
+	}
+
+	// Return to fallback_active (snapshot unchanged: still on fallback).
 	fc.state = stateFallbackActive
 	fc.publishSnapshot()
 
 	if fc.log.IsLevelEnabled(logrus.DebugLevel) {
 		fc.log.WithFields(logrus.Fields{
-			"group":   fc.groupName,
-			"primary": dialerName(fc.primaryDialer()),
-			"next_in": fc.currentDelay,
+			"group":           fc.groupName,
+			"primary":         dialerName(fc.recoveryTargetDialer()),
+			"failed_attempts": fc.failedRecoveryProbes,
+			"rotation_active": fc.rotationActive,
+			"next_in":         fc.currentDelay,
 		}).Debug("recovery probe failed, backing off")
 	}
 
-	// Schedule next probe.
+	// Schedule next probe (against the possibly-advanced target).
 	fc.scheduleProbeLocked()
+}
+
+// recoveryTargetDialer returns the dialer of the current recoveryTarget. Must
+// be called with mu held. Returns nil if the index is out of range.
+func (fc *FailoverController) recoveryTargetDialer() *dialer.Dialer {
+	if fc.recoveryTarget < 0 || fc.recoveryTarget >= len(fc.primaryCandidates) {
+		return nil
+	}
+	return fc.primaryCandidates[fc.recoveryTarget]
 }
 
 // publishSnapshot updates the atomic snapshot for lock-free reads. Must be
