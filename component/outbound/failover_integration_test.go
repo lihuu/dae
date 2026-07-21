@@ -147,9 +147,9 @@ func newIntegrationGroup(t *testing.T) *integrationGroup {
 	}
 
 	failoverCfg := &FailoverConfig{
-		PrimaryIdx:  0,
-		FallbackIdx: 1,
-		Recovery:    recoveryConfig,
+		PrimaryCandidateIdxs: []int{0},
+		FallbackIdx:          1,
+		Recovery:             recoveryConfig,
 	}
 
 	policy := DialerSelectionPolicy{
@@ -534,9 +534,9 @@ func TestIntegration_Failover_WarmReload_PreservesState(t *testing.T) {
 	}
 
 	failoverCfg := &FailoverConfig{
-		PrimaryIdx:  0,
-		FallbackIdx: 1,
-		Recovery:    recoveryConfig,
+		PrimaryCandidateIdxs: []int{0},
+		FallbackIdx:          1,
+		Recovery:             recoveryConfig,
 	}
 
 	policy := DialerSelectionPolicy{
@@ -605,9 +605,9 @@ func TestIntegration_Failover_Reload_IdentityChanged_ResetsToPrimary(t *testing.
 	}
 
 	failoverCfg := &FailoverConfig{
-		PrimaryIdx:  0,
-		FallbackIdx: 1,
-		Recovery:    recoveryConfig,
+		PrimaryCandidateIdxs: []int{0},
+		FallbackIdx:          1,
+		Recovery:             recoveryConfig,
 	}
 
 	policy := DialerSelectionPolicy{

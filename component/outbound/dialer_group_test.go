@@ -124,8 +124,8 @@ func TestFailoverGroupInitializesAllBPFConnectivitySlots(t *testing.T) {
 		{Priority: 1},
 	}
 	failoverCfg := &FailoverConfig{
-		PrimaryIdx:  0,
-		FallbackIdx: 1,
+		PrimaryCandidateIdxs: []int{0},
+		FallbackIdx:          1,
 		Recovery: FailoverRecoveryConfig{
 			ProbeInitial: time.Second,
 			ProbeMax:     time.Minute,

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,56 +23,110 @@ import (
 
 // FailoverConfig holds the configuration needed to create a failover controller
 // for a DialerGroup. Only used when the policy is DialerSelectionPolicy_Failover.
+//
+// PrimaryCandidateIdxs is the ordered list of primary candidate dialer indices,
+// sorted by numeric priority ascending. Index 0 is the initial current primary
+// (priority: 0); the remaining indices are standby candidates (priority >= 2)
+// in the order they should be probed during rotation. FallbackIdx is the index
+// of the fixed fallback dialer (priority: 1) and never participates in rotation.
 type FailoverConfig struct {
-	PrimaryIdx  int // index of the primary dialer (priority: 0)
-	FallbackIdx int // index of the fallback dialer (priority: 1)
-	Recovery    FailoverRecoveryConfig
+	PrimaryCandidateIdxs []int
+	FallbackIdx          int
+	Recovery             FailoverRecoveryConfig
 }
 
 // ValidateFailoverGroup validates that the dialers and annotations form a valid
-// failover group and returns the FailoverConfig. It checks:
-// - Exactly two dialers
-// - Each dialer has a priority annotation (0 or 1)
-// - No duplicate priorities
-// - No same underlying dialer for both roles
+// failover group and returns the FailoverConfig.
+//
+// Priority semantics:
+//   - priority: 0 is the initial primary (exactly one required).
+//   - priority: 1 is the fixed fallback (exactly one required).
+//   - Each unique priority >= 2 is a standby primary candidate. Standby
+//     candidates are sorted by numeric priority; gaps are valid.
+//
+// When Recovery.RotationAttempts == 0 (rotation disabled, the legacy contract)
+// the group must resolve to exactly one priority 0 and one priority 1 dialer
+// and no priority 2+ candidates. When RotationAttempts > 0 (rotation enabled)
+// the group must additionally have at least one standby candidate (priority >= 2).
+//
+// Validation rejects:
+//   - a negative RotationAttempts;
+//   - a missing priority annotation (PriorityNotSet);
+//   - a negative priority;
+//   - a duplicate priority across dialers;
+//   - two roles resolving to the same underlying dialer pointer;
+//   - the wrong number of priority-0 or priority-1 dialers;
+//   - priority 2+ candidates when rotation is disabled; or
+//   - rotation enabled without any standby candidate.
 func ValidateFailoverGroup(
 	dialers []*dialer.Dialer,
 	annotations []*dialer.Annotation,
 	recovery FailoverRecoveryConfig,
 ) (*FailoverConfig, error) {
-	if len(dialers) != 2 {
-		return nil, fmt.Errorf("failover policy requires exactly 2 dialers, got %d", len(dialers))
+	if recovery.RotationAttempts < 0 {
+		return nil, fmt.Errorf("primary_rotation_attempts must not be negative: got %d", recovery.RotationAttempts)
 	}
 
 	if len(annotations) != len(dialers) {
 		return nil, fmt.Errorf("annotation count mismatch: got %d annotations for %d dialers", len(annotations), len(dialers))
 	}
+	if len(dialers) < 2 {
+		return nil, fmt.Errorf("failover policy requires at least 2 dialers (primary + fallback), got %d", len(dialers))
+	}
 
-	primaryIdx := -1
-	fallbackIdx := -1
+	rotationEnabled := recovery.RotationAttempts > 0
+
+	// Collect roles by priority. Use a map to detect duplicate priorities and
+	// slices to enumerate priority 0, priority 1, and priority 2+ candidates.
+	seenPriority := make(map[int]int, len(dialers))    // priority -> dialer index
+	seenDialerPtr := make(map[*dialer.Dialer]int, len(dialers)) // dialer pointer -> first dialer index
+	var primaryIdx, fallbackIdx = -1, -1
+	type priorityRole struct {
+		priority    int
+		dialerIndex int
+	}
+	var standbys []priorityRole
 
 	for i, anno := range annotations {
 		if anno == nil || anno.Priority == dialer.PriorityNotSet {
 			return nil, fmt.Errorf("dialer %d (%q) has no priority annotation", i, dialerDisplayName(dialers[i]))
 		}
-		switch anno.Priority {
-		case 0:
+		p := anno.Priority
+		if p < 0 {
+			return nil, fmt.Errorf("dialer %d (%q) has negative priority %d", i, dialerDisplayName(dialers[i]), p)
+		}
+		// Reject duplicate priority across dialers.
+		if prev, ok := seenPriority[p]; ok {
+			return nil, fmt.Errorf("duplicate priority %d: dialer %d (%q) and dialer %d (%q)",
+				p, prev, dialerDisplayName(dialers[prev]),
+				i, dialerDisplayName(dialers[i]))
+		}
+		seenPriority[p] = i
+		// Reject two roles resolving to the same underlying dialer pointer.
+		if prev, ok := seenDialerPtr[dialers[i]]; ok {
+			return nil, fmt.Errorf("dialer %d (%q) and dialer %d (%q) resolve to the same underlying dialer",
+				prev, dialerDisplayName(dialers[prev]),
+				i, dialerDisplayName(dialers[i]))
+		}
+		seenDialerPtr[dialers[i]] = i
+
+		switch {
+		case p == 0:
 			if primaryIdx >= 0 {
 				return nil, fmt.Errorf("duplicate priority 0: dialer %d (%q) and dialer %d (%q)",
 					primaryIdx, dialerDisplayName(dialers[primaryIdx]),
 					i, dialerDisplayName(dialers[i]))
 			}
 			primaryIdx = i
-		case 1:
+		case p == 1:
 			if fallbackIdx >= 0 {
 				return nil, fmt.Errorf("duplicate priority 1: dialer %d (%q) and dialer %d (%q)",
 					fallbackIdx, dialerDisplayName(dialers[fallbackIdx]),
 					i, dialerDisplayName(dialers[i]))
 			}
 			fallbackIdx = i
-		default:
-			return nil, fmt.Errorf("dialer %d (%q) has unsupported priority %d (must be 0 or 1)",
-				i, dialerDisplayName(dialers[i]), anno.Priority)
+		case p >= 2:
+			standbys = append(standbys, priorityRole{priority: p, dialerIndex: i})
 		}
 	}
 
@@ -82,9 +137,35 @@ func ValidateFailoverGroup(
 		return nil, fmt.Errorf("failover group requires a dialer with priority 1 (fallback)")
 	}
 
-	// Ensure the same underlying dialer doesn't occupy both roles.
+	// Ensure the same underlying dialer doesn't occupy both primary and fallback.
+	// (seenDialerPtr already catches this, but keep an explicit check for clarity.)
 	if dialers[primaryIdx] == dialers[fallbackIdx] {
 		return nil, fmt.Errorf("the same dialer cannot occupy both primary and fallback roles")
+	}
+
+	// Enforce role shape based on rotation toggle.
+	if !rotationEnabled {
+		if len(standbys) > 0 {
+			return nil, fmt.Errorf("failover group has %d standby candidate(s) with priority >= 2 but primary_rotation_attempts is 0 (rotation disabled); set primary_rotation_attempts > 0 or remove standby candidates",
+				len(standbys))
+		}
+	} else {
+		if len(standbys) == 0 {
+			return nil, fmt.Errorf("primary_rotation_attempts is %d (rotation enabled) but no standby candidate with priority >= 2 was provided",
+				recovery.RotationAttempts)
+		}
+	}
+
+	// Sort standby candidates by numeric priority ascending. Gaps are valid.
+	sort.Slice(standbys, func(i, j int) bool {
+		return standbys[i].priority < standbys[j].priority
+	})
+
+	// Build the ordered primary candidate list: priority 0 first, then standbys.
+	primaryCandidateIdxs := make([]int, 0, 1+len(standbys))
+	primaryCandidateIdxs = append(primaryCandidateIdxs, primaryIdx)
+	for _, s := range standbys {
+		primaryCandidateIdxs = append(primaryCandidateIdxs, s.dialerIndex)
 	}
 
 	// Validate recovery config.
@@ -106,9 +187,9 @@ func ValidateFailoverGroup(
 	}
 
 	return &FailoverConfig{
-		PrimaryIdx:  primaryIdx,
-		FallbackIdx: fallbackIdx,
-		Recovery:    recovery,
+		PrimaryCandidateIdxs: primaryCandidateIdxs,
+		FallbackIdx:          fallbackIdx,
+		Recovery:             recovery,
 	}, nil
 }
 
@@ -183,17 +264,28 @@ func NewDialerGroup(
 	if p.Policy == consts.DialerSelectionPolicy_Failover && failoverCfg != nil {
 		// Failover policy: use the failover controller instead of AliveDialerSet.
 		group.failoverCfg = failoverCfg
-		group.failoverController = NewFailoverController(
+		// Map PrimaryCandidateIdxs to dialer pointers in sorted-priority order.
+		primaryCandidates := make([]*dialer.Dialer, 0, len(failoverCfg.PrimaryCandidateIdxs))
+		for _, idx := range failoverCfg.PrimaryCandidateIdxs {
+			primaryCandidates = append(primaryCandidates, dialers[idx])
+		}
+		group.failoverController = NewFailoverControllerWithCandidates(
 			log, name,
-			dialers[failoverCfg.PrimaryIdx],
+			primaryCandidates,
 			dialers[failoverCfg.FallbackIdx],
 			failoverCfg.Recovery,
 		)
 		// Failover doesn't use AliveDialerSet, so we store a minimal state.
 		group.selectionState.Store(&dialerGroupSelectionState{policy: p})
-		// Activate the primary's connectivity check so that traffic-driven
-		// TCP failures trigger the failover controller's health transition callback.
-		dialers[failoverCfg.PrimaryIdx].ActivateCheck()
+		// Activate every Primary candidate's connectivity check so that
+		// traffic-driven TCP failures can trigger the failover controller's
+		// health transition callback. The event callback wiring that actually
+		// drives failover transitions is added in a later packet; this packet
+		// only ensures the candidates' connectivity-check workers are
+		// registered/kept-alive so health callbacks can fire later.
+		for _, idx := range failoverCfg.PrimaryCandidateIdxs {
+			dialers[idx].ActivateCheck()
+		}
 	} else {
 		state := group.buildSelectionState(p, true)
 		group.registerAliveDialerSets(state.aliveDialerSets)
@@ -237,12 +329,16 @@ func (g *DialerGroup) SetFailoverEventCallback(cb FailoverEventCallback) {
 
 // FailoverIdentity returns the names of the primary and fallback dialers
 // for failover identity matching during reload. Returns empty strings if
-// the group does not use failover.
+// the group does not use failover. The primary name is the current primary
+// candidate (primaryCandidates[currentPrimary]).
 func (g *DialerGroup) FailoverIdentity() (primaryName, fallbackName string) {
 	if g.failoverController == nil {
 		return "", ""
 	}
-	return dialerName(g.failoverController.primary), dialerName(g.failoverController.fallback)
+	g.failoverController.mu.Lock()
+	primary := g.failoverController.primaryDialer()
+	g.failoverController.mu.Unlock()
+	return dialerName(primary), dialerName(g.failoverController.fallback)
 }
 
 // CaptureFailoverSnapshot captures the failover controller state for reload.
@@ -530,44 +626,31 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 		return nil, time.Hour, nil, ErrNoAliveDialer
 
 	case consts.DialerSelectionPolicy_Failover:
-		// Failover policy: select based on the controller's current state.
+		// Failover policy: select from the controller's atomic snapshot.
+		// The hot path performs one atomic load and never traverses candidates
+		// or acquires the controller mutex. Rotation/recovery is off the hot path.
 		if g.failoverController == nil || g.failoverCfg == nil {
 			return nil, 0, nil, fmt.Errorf("failover controller not initialized")
 		}
-		// ActiveDialerIndex returns a role: 0=primary, 1=fallback.
-		// Map it to the actual dialer index via failoverCfg.
-		role := g.failoverController.ActiveDialerIndex()
-		var dialerIdx int
-		switch role {
-		case 0:
-			dialerIdx = g.failoverCfg.PrimaryIdx
-		case 1:
-			dialerIdx = g.failoverCfg.FallbackIdx
-		default:
-			return nil, 0, nil, fmt.Errorf("failover active role out of range: %d", role)
+		d, usingFallback := g.failoverController.ActiveDialer()
+		if d == nil {
+			return nil, 0, nil, fmt.Errorf("failover active dialer is nil")
 		}
-		d := g.Dialers[dialerIdx]
-		// Respect excluded: if the active dialer is excluded, try the other.
 		if excluded != nil && d == excluded {
-			// Only fall back to the other dialer when the primary is excluded.
-			// When the fallback is excluded, the primary is unconfirmed —
-			// returning it would violate the spec requirement that "fallback
-			// exclusion returns an error rather than primary while primary
-			// is unconfirmed."
-			if role == 0 {
-				otherIdx := g.failoverCfg.FallbackIdx
-				if otherIdx >= 0 && otherIdx < len(g.Dialers) {
-					other := g.Dialers[otherIdx]
-					if other != excluded {
-						selected := preferAlternateSelectionNetworkType(other, networkType)
-						return other, 0, selected, nil
-					}
+			if !usingFallback {
+				// Active primary is excluded — fall through to the fixed
+				// fallback. Rotation to a standby candidate is a recovery
+				// concern (Packet 3) and must not happen on the hot path.
+				fallback := g.Dialers[g.failoverCfg.FallbackIdx]
+				if fallback != nil && fallback != excluded {
+					return fallback, 0, preferAlternateSelectionNetworkType(fallback, networkType), nil
 				}
 			}
+			// Fallback is excluded (or fallback is the active role and excluded)
+			// — return an error rather than an unconfirmed primary.
 			return nil, 0, nil, ErrNoAliveDialer
 		}
-		selected := preferAlternateSelectionNetworkType(d, networkType)
-		return d, 0, selected, nil
+		return d, 0, preferAlternateSelectionNetworkType(d, networkType), nil
 
 	case consts.DialerSelectionPolicy_Fixed:
 		// Fixed policy represents explicit user intent to use a specific dialer.

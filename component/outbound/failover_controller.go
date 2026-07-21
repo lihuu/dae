@@ -30,17 +30,24 @@ const (
 
 // failoverSnapshot is an immutable snapshot of the failover controller state,
 // stored atomically for lock-free reads on the hot selection path.
+//
+// activeDialer is the dialer pointer the hot path must return. usingFallback
+// is true only when the fixed Fallback role is active (states stateFallbackActive
+// and stateRecovering). When the current Primary is active, usingFallback is
+// false and activeDialer is primaryCandidates[currentPrimary].
 type failoverSnapshot struct {
-	state     failoverState
-	activeIdx int // index of the active dialer in the group
+	state         failoverState
+	activeDialer  *dialer.Dialer
+	usingFallback bool
 }
 
 // FailoverRecoveryConfig holds the recovery probe parameters.
 type FailoverRecoveryConfig struct {
-	ProbeInitial time.Duration
-	ProbeMax     time.Duration
-	Successes    int
-	StableTime   time.Duration
+	ProbeInitial     time.Duration
+	ProbeMax         time.Duration
+	Successes        int
+	StableTime       time.Duration
+	RotationAttempts int
 }
 
 // FailoverController manages the failover state machine for a DialerGroup.
@@ -50,10 +57,22 @@ type FailoverController struct {
 	log       *logrus.Logger
 	groupName string
 
-	primary  *dialer.Dialer
-	fallback *dialer.Dialer
-	config   FailoverRecoveryConfig
-	probeTCP func(context.Context) (bool, error)
+	// primaryCandidates is the ordered list of primary candidates, sorted by
+	// numeric priority ascending. Index 0 is the initial current primary.
+	primaryCandidates []*dialer.Dialer
+	// currentPrimary is the index into primaryCandidates of the dialer that
+	// serves new traffic during normal operation. Initialized to 0 on a fresh
+	// controller. Rotation advances this index (Packet 3).
+	currentPrimary int
+	// recoveryTarget is the index into primaryCandidates of the dialer the
+	// recovery probe is currently targeting. Before rotation activates it is
+	// the failed current primary; after rotation it advances through the
+	// candidates. Initialized to 0 on a fresh controller (Packet 3 drives the
+	// actual advancement).
+	recoveryTarget int
+	fallback       *dialer.Dialer
+	config         FailoverRecoveryConfig
+	probeTCP       func(context.Context) (bool, error)
 
 	// mu protects mutable state below. It must NOT be held during network ops.
 	mu sync.Mutex
@@ -81,11 +100,19 @@ type FailoverController struct {
 	snapshot atomic.Pointer[failoverSnapshot]
 }
 
-// NewFailoverController creates a new failover controller.
-func NewFailoverController(
+// NewFailoverControllerWithCandidates creates a failover controller with an
+// ordered list of primary candidates and a fixed fallback. The first candidate
+// (primaryCandidates[0]) is the initial current primary. The remaining
+// candidates are standby primaries reserved for rotation (Packet 3).
+//
+// This constructor stores the structural fields only; it does not wire rotation
+// state-machine logic or standby health callbacks. The current Primary's TCP
+// health transition callback is registered so the existing failover transition
+// continues to fire.
+func NewFailoverControllerWithCandidates(
 	log *logrus.Logger,
 	groupName string,
-	primary *dialer.Dialer,
+	primaryCandidates []*dialer.Dialer,
 	fallback *dialer.Dialer,
 	config FailoverRecoveryConfig,
 ) *FailoverController {
@@ -102,25 +129,49 @@ func NewFailoverController(
 		config.StableTime = 30 * time.Second
 	}
 
+	if len(primaryCandidates) == 0 {
+		// Defensive: callers validate this, but guard against a nil primary to
+		// keep the hot path's nil check meaningful.
+		primaryCandidates = []*dialer.Dialer{nil}
+	}
+
+	primary := primaryCandidates[0]
+
 	fc := &FailoverController{
-		log:          log,
-		groupName:    groupName,
-		primary:      primary,
-		fallback:     fallback,
-		config:       config,
-		probeTCP:     primary.ProbeTCPOnce,
-		state:        statePrimaryActive,
-		currentDelay: config.ProbeInitial,
+		log:               log,
+		groupName:         groupName,
+		primaryCandidates: primaryCandidates,
+		currentPrimary:    0,
+		recoveryTarget:    0,
+		fallback:          fallback,
+		config:            config,
+		probeTCP:          primary.ProbeTCPOnce,
+		state:             statePrimaryActive,
+		currentDelay:      config.ProbeInitial,
 	}
 	fc.publishSnapshot()
 
-	// Register for primary's TCP health transitions.
+	// Register for the current primary's TCP health transitions.
 	primary.RegisterAliveTransitionCallback(fc.onPrimaryHealthChange)
-	// Keep the primary's connectivity check goroutine alive so that
+	// Keep the current primary's connectivity check goroutine alive so that
 	// traffic-driven failures are detected and the above callback fires.
 	primary.MarkKeepConnectivityCheck()
 
 	return fc
+}
+
+// NewFailoverController creates a failover controller with a single primary
+// and a fixed fallback. It is a legacy adapter that delegates to
+// NewFailoverControllerWithCandidates. Existing tests and callers that do not
+// use primary rotation continue to work through this constructor.
+func NewFailoverController(
+	log *logrus.Logger,
+	groupName string,
+	primary *dialer.Dialer,
+	fallback *dialer.Dialer,
+	config FailoverRecoveryConfig,
+) *FailoverController {
+	return NewFailoverControllerWithCandidates(log, groupName, []*dialer.Dialer{primary}, fallback, config)
 }
 
 // SetEventCallback installs a failover event callback. It must be called
@@ -133,10 +184,33 @@ func (fc *FailoverController) SetEventCallback(cb FailoverEventCallback) {
 	fc.eventCallback = cb
 }
 
-// ActiveDialerIndex returns the index of the currently active dialer.
-// 0 = primary, 1 = fallback. This is the lock-free hot path.
+// ActiveDialer returns the currently active dialer pointer and whether the
+// fixed Fallback role is active. This is the lock-free hot path: a single
+// atomic snapshot load, no candidate traversal, no mutex, no health work.
+// The boolean is true only when the fixed Fallback is active (states
+// stateFallbackActive and stateRecovering).
+func (fc *FailoverController) ActiveDialer() (*dialer.Dialer, bool) {
+	snap := fc.snapshot.Load()
+	return snap.activeDialer, snap.usingFallback
+}
+
+// ActiveDialerIndex returns a legacy role index for test/caller adapter
+// compatibility: 0 for the current Primary, 1 for the fixed Fallback. New code
+// should prefer ActiveDialer for the dialer pointer and usingFallback flag.
 func (fc *FailoverController) ActiveDialerIndex() int {
-	return fc.snapshot.Load().activeIdx
+	snap := fc.snapshot.Load()
+	if snap.usingFallback {
+		return 1
+	}
+	return 0
+}
+
+// primaryDialer returns the current primary dialer. Must be called with mu held.
+func (fc *FailoverController) primaryDialer() *dialer.Dialer {
+	if fc.currentPrimary < 0 || fc.currentPrimary >= len(fc.primaryCandidates) {
+		return nil
+	}
+	return fc.primaryCandidates[fc.currentPrimary]
 }
 
 // State returns the current failover state (for testing).
@@ -174,7 +248,7 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 		"from":     "primary",
 		"to":       "fallback",
 		"trigger":  "tcp_unavailable",
-		"primary":  dialerName(fc.primary),
+		"primary":  dialerName(fc.primaryDialer()),
 		"fallback": dialerName(fc.fallback),
 	}).Info("failover_switch")
 
@@ -188,7 +262,7 @@ func (fc *FailoverController) onPrimaryHealthChange(networkType *dialer.NetworkT
 		Group:        fc.groupName,
 		From:         "primary",
 		To:           "fallback",
-		Primary:      dialerName(fc.primary),
+		Primary:      dialerName(fc.primaryDialer()),
 		Fallback:     dialerName(fc.fallback),
 		Trigger:      "tcp_unavailable",
 		TransitionAt: time.Now(),
@@ -264,7 +338,7 @@ func (fc *FailoverController) probePrimaryTCP(ctx context.Context) bool {
 	if err != nil && fc.log.IsLevelEnabled(logrus.DebugLevel) {
 		fc.log.WithError(err).WithFields(logrus.Fields{
 			"group":   fc.groupName,
-			"primary": dialerName(fc.primary),
+			"primary": dialerName(fc.primaryDialer()),
 		}).Debug("recovery TCP probe failed")
 	}
 	return ok && err == nil
@@ -279,7 +353,7 @@ func (fc *FailoverController) onProbeSuccessLocked() {
 		fc.stableSince = time.Now()
 		fc.log.WithFields(logrus.Fields{
 			"group":     fc.groupName,
-			"primary":   dialerName(fc.primary),
+			"primary":   dialerName(fc.primaryDialer()),
 			"successes": fc.recoverySuccesses,
 		}).Info("failback_start")
 	}
@@ -320,7 +394,7 @@ func (fc *FailoverController) onProbeSuccessLocked() {
 			Group:        fc.groupName,
 			From:         "fallback",
 			To:           "primary",
-			Primary:      dialerName(fc.primary),
+			Primary:      dialerName(fc.primaryDialer()),
 			Fallback:     dialerName(fc.fallback),
 			Successes:    successes,
 			StableFor:    stableFor,
@@ -351,7 +425,7 @@ func (fc *FailoverController) onProbeFailureLocked() {
 	if fc.log.IsLevelEnabled(logrus.DebugLevel) {
 		fc.log.WithFields(logrus.Fields{
 			"group":   fc.groupName,
-			"primary": dialerName(fc.primary),
+			"primary": dialerName(fc.primaryDialer()),
 			"next_in": fc.currentDelay,
 		}).Debug("recovery probe failed, backing off")
 	}
@@ -360,15 +434,21 @@ func (fc *FailoverController) onProbeFailureLocked() {
 	fc.scheduleProbeLocked()
 }
 
-// publishSnapshot updates the atomic snapshot for lock-free reads.
+// publishSnapshot updates the atomic snapshot for lock-free reads. Must be
+// called with mu held. The snapshot stores the active dialer pointer directly
+// so the hot path performs one atomic load and no candidate traversal.
 func (fc *FailoverController) publishSnapshot() {
-	activeIdx := 0
-	if fc.state == stateFallbackActive || fc.state == stateRecovering {
-		activeIdx = 1
+	usingFallback := fc.state == stateFallbackActive || fc.state == stateRecovering
+	var active *dialer.Dialer
+	if usingFallback {
+		active = fc.fallback
+	} else {
+		active = fc.primaryDialer()
 	}
 	fc.snapshot.Store(&failoverSnapshot{
-		state:     fc.state,
-		activeIdx: activeIdx,
+		state:         fc.state,
+		activeDialer:  active,
+		usingFallback: usingFallback,
 	})
 }
 

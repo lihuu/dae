@@ -8,6 +8,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -267,12 +268,15 @@ func TestValidateFailoverGroup_Valid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.PrimaryIdx != 0 || cfg.FallbackIdx != 1 {
-		t.Fatalf("unexpected config: primary=%d, fallback=%d", cfg.PrimaryIdx, cfg.FallbackIdx)
+	if !reflect.DeepEqual(cfg.PrimaryCandidateIdxs, []int{0}) || cfg.FallbackIdx != 1 {
+		t.Fatalf("unexpected config: primary candidates=%v, fallback=%d", cfg.PrimaryCandidateIdxs, cfg.FallbackIdx)
 	}
 }
 
-func TestValidateFailoverGroup_ThreeDialers(t *testing.T) {
+// TestValidateFailoverGroup_ThreeDialersRotated verifies that with rotation
+// enabled, three or more dialers are accepted and the priority-2+ candidates
+// are no longer rejected.
+func TestValidateFailoverGroup_ThreeDialersRotated(t *testing.T) {
 	option := &dialer.GlobalOption{
 		Log:               log,
 		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
@@ -292,13 +296,14 @@ func TestValidateFailoverGroup_ThreeDialers(t *testing.T) {
 	}
 
 	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
-		ProbeInitial: 15 * time.Second,
-		ProbeMax:     5 * time.Minute,
-		Successes:    3,
-		StableTime:   30 * time.Second,
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
 	})
-	if err == nil {
-		t.Fatal("expected error for 3 dialers")
+	if err != nil {
+		t.Fatalf("rotation-enabled group should accept priority 2+, got error: %v", err)
 	}
 }
 
@@ -426,8 +431,8 @@ func TestFailoverController_ReverseFilterOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validation failed: %v", err)
 	}
-	if cfg.PrimaryIdx != 1 || cfg.FallbackIdx != 0 {
-		t.Fatalf("unexpected indices: primary=%d fallback=%d", cfg.PrimaryIdx, cfg.FallbackIdx)
+	if !reflect.DeepEqual(cfg.PrimaryCandidateIdxs, []int{1}) || cfg.FallbackIdx != 0 {
+		t.Fatalf("unexpected indices: primary candidates=%v fallback=%d", cfg.PrimaryCandidateIdxs, cfg.FallbackIdx)
 	}
 
 	// Create DialerGroup and verify selection.
@@ -695,31 +700,227 @@ func TestFailoverController_StaleCallbackAfterClose(t *testing.T) {
 	}
 }
 
-func TestValidateFailoverGroup_UnsupportedPriority(t *testing.T) {
-	option := &dialer.GlobalOption{
-		Log:               log,
-		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
-		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
-		CheckInterval:     15 * time.Second,
-		CheckTolerance:    0,
+// TestValidateFailoverGroupRotationRoles verifies that PrimaryCandidateIdxs
+// is sorted by numeric priority (priority 0 first, then 2, then 4) and that
+// FallbackIdx points to the priority-1 dialer. Dialer slice order must not
+// determine rotation order.
+func TestValidateFailoverGroupRotationRoles(t *testing.T) {
+	option := testFailoverDialerOption()
+	dialers := []*dialer.Dialer{
+		newNamedDirectDialer(option, "fallback"),    // idx 0
+		newNamedDirectDialer(option, "candidate-4"), // idx 1
+		newNamedDirectDialer(option, "initial"),     // idx 2
+		newNamedDirectDialer(option, "candidate-2"), // idx 3
 	}
+	annotations := []*dialer.Annotation{
+		{Priority: 1}, // fallback
+		{Priority: 4}, // candidate-4
+		{Priority: 0}, // initial
+		{Priority: 2}, // candidate-2
+	}
+	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	})
+	if err != nil {
+		t.Fatalf("ValidateFailoverGroup failed: %v", err)
+	}
+	if got, want := cfg.PrimaryCandidateIdxs, []int{2, 3, 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate indices = %v, want %v", got, want)
+	}
+	if cfg.FallbackIdx != 0 {
+		t.Fatalf("fallback index = %d, want 0", cfg.FallbackIdx)
+	}
+}
+
+// TestValidateFailoverGroupRotationDisabledRejectsPriority2 verifies that
+// when rotation is disabled (the default legacy contract), priority 2+ is
+// still rejected and the group must resolve to exactly priority 0 + priority 1.
+func TestValidateFailoverGroupRotationDisabledRejectsPriority2(t *testing.T) {
+	option := testFailoverDialerOption()
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 1},
+		{Priority: 2},
+	}
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+		Successes:    3,
+		StableTime:   30 * time.Second,
+		// RotationAttempts defaults to 0 (disabled).
+	})
+	if err == nil {
+		t.Fatal("expected error for priority 2+ with rotation disabled")
+	}
+}
+
+// TestValidateFailoverGroupRotationEnabledWithoutCandidate verifies that
+// rotation enabled with only priority 0 and priority 1 (no priority 2+) is
+// rejected: rotation requires at least one standby candidate.
+func TestValidateFailoverGroupRotationEnabledWithoutCandidate(t *testing.T) {
+	option := testFailoverDialerOption()
 	dialers := []*dialer.Dialer{
 		newDirectDialer(option, false),
 		newDirectDialer(option, false),
 	}
 	annotations := []*dialer.Annotation{
 		{Priority: 0},
-		{Priority: 2}, // unsupported
+		{Priority: 1},
 	}
-
 	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
-		ProbeInitial: 15 * time.Second,
-		ProbeMax:     5 * time.Minute,
-		Successes:    3,
-		StableTime:   30 * time.Second,
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
 	})
 	if err == nil {
-		t.Fatal("expected error for unsupported priority 2")
+		t.Fatal("expected error for rotation enabled without standby candidate")
+	}
+}
+
+// TestValidateFailoverGroupRotationNegativeAttempts verifies that a negative
+// RotationAttempts is rejected at the role-resolution layer as well.
+func TestValidateFailoverGroupRotationNegativeAttempts(t *testing.T) {
+	option := testFailoverDialerOption()
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 1},
+		{Priority: 2},
+	}
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: -1,
+	})
+	if err == nil {
+		t.Fatal("expected error for negative RotationAttempts")
+	}
+}
+
+// TestValidateFailoverGroupRotationDuplicatePriority verifies that a duplicate
+// priority value across dialers is rejected even when rotation is enabled.
+func TestValidateFailoverGroupRotationDuplicatePriority(t *testing.T) {
+	option := testFailoverDialerOption()
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 1},
+		{Priority: 2},
+	}
+	// Duplicate priority 2 on a fourth dialer.
+	dialers = append(dialers, newDirectDialer(option, false))
+	annotations = append(annotations, &dialer.Annotation{Priority: 2})
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	})
+	if err == nil {
+		t.Fatal("expected error for duplicate priority")
+	}
+}
+
+// TestValidateFailoverGroupRotationMissingAnnotation verifies that an
+// unannotated dialer (PriorityNotSet) is rejected.
+func TestValidateFailoverGroupRotationMissingAnnotation(t *testing.T) {
+	option := testFailoverDialerOption()
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 1},
+		{Priority: dialer.PriorityNotSet},
+	}
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	})
+	if err == nil {
+		t.Fatal("expected error for missing priority annotation")
+	}
+}
+
+// TestValidateFailoverGroupRotationNegativePriority verifies that a negative
+// priority (other than the PriorityNotSet sentinel) is rejected.
+func TestValidateFailoverGroupRotationNegativePriority(t *testing.T) {
+	option := testFailoverDialerOption()
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 0},
+		{Priority: 1},
+		{Priority: -2},
+	}
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	})
+	if err == nil {
+		t.Fatal("expected error for negative priority")
+	}
+}
+
+// TestValidateFailoverGroupRotationDuplicateDialerPointer verifies that two
+// roles resolving to the same underlying dialer pointer are rejected.
+func TestValidateFailoverGroupRotationDuplicateDialerPointer(t *testing.T) {
+	option := testFailoverDialerOption()
+	shared := newNamedDirectDialer(option, "shared")
+	dialers := []*dialer.Dialer{
+		newNamedDirectDialer(option, "fallback"),
+		newNamedDirectDialer(option, "candidate-2"),
+		shared, // priority 0
+		shared, // priority 2 — same pointer as primary
+	}
+	annotations := []*dialer.Annotation{
+		{Priority: 1},
+		{Priority: 2},
+		{Priority: 0},
+		{Priority: 3},
+	}
+	_, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	})
+	if err == nil {
+		t.Fatal("expected error for duplicate dialer pointer across roles")
 	}
 }
 
