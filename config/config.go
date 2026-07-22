@@ -76,7 +76,7 @@ func ParseFunctionOrString(fs FunctionOrString) (*config_parser.Function, error)
 		if len(fs) == 1 {
 			return fs[0], nil
 		}
-		return nil, fmt.Errorf("expected exactly 1 function in fallback, got %d", len(fs))
+		return nil, fmt.Errorf("expected exactly 1 function, got %d", len(fs))
 	default:
 		return nil, fmt.Errorf("unsupported function-or-string value type: %T", fs)
 	}
@@ -127,6 +127,8 @@ type Group struct {
 
 	Filter           [][]*config_parser.Function `mapstructure:"filter" repeatable:""`
 	FilterAnnotation [][]*config_parser.Param    `mapstructure:"_"`
+	Primary          FunctionOrString            `mapstructure:"primary"`
+	Fallback         FunctionOrString            `mapstructure:"fallback"`
 	Policy           FunctionListOrString        `mapstructure:"policy" required:""`
 
 	TcpCheckUrl        []string      `mapstructure:"tcp_check_url"`

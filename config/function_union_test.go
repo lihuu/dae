@@ -38,8 +38,7 @@ func TestParseFunctionOrString(t *testing.T) {
 			{Name: "a"},
 			{Name: "b"},
 		})
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "expected exactly 1 function")
+		require.EqualError(t, err, "expected exactly 1 function, got 2")
 	})
 
 	t.Run("unsupported_type", func(t *testing.T) {

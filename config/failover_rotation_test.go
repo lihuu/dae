@@ -22,8 +22,8 @@ global {}
 routing { fallback: direct }
 group {
   proxy_failover {
-    filter: name(A) [priority: 0]
-    filter: name(xray_local) [priority: 1]
+    primary: name(A, B, C)
+    fallback: name(xray_local)
     policy: failover
 ` + setting + `
   }
@@ -34,6 +34,22 @@ group {
 	require.NoError(t, err)
 	require.Len(t, conf.Group, 1)
 	return conf.Group[0]
+}
+
+func TestGroupFailoverRolesDecodeNameFunctions(t *testing.T) {
+	g := decodeRotationGroup(t, "primary_rotation_attempts: 5")
+	primary, err := ParseFunctionOrString(g.Primary)
+	require.NoError(t, err)
+	fallback, err := ParseFunctionOrString(g.Fallback)
+	require.NoError(t, err)
+	require.Equal(t, "name", primary.Name)
+	require.Equal(t, []string{"A", "B", "C"}, []string{
+		primary.Params[0].Val,
+		primary.Params[1].Val,
+		primary.Params[2].Val,
+	})
+	require.Equal(t, "name", fallback.Name)
+	require.Equal(t, "xray_local", fallback.Params[0].Val)
 }
 
 func TestGroupPrimaryRotationAttemptsDefaultsToZero(t *testing.T) {

@@ -191,6 +191,9 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			return fmt.Errorf("unknown leaf array type: %v", from.Type())
 		}
 	default:
+		if from.Interface() == nil {
+			return nil
+		}
 		switch val := from.Interface().(type) {
 		case fmt.Stringer, string,
 			uint,
@@ -202,6 +205,12 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			m.writeLine(depth, key+":"+strconv.Quote(fmt.Sprintf("%v", val)))
 		case *config_parser.Function:
 			m.writeLine(depth, key+":"+val.String(true, true, false))
+		case []*config_parser.Function:
+			var vals []string
+			for i := 0; i < len(val); i++ {
+				vals = append(vals, val[i].String(true, true, false))
+			}
+			m.writeLine(depth, key+":"+strings.Join(vals, "&&"))
 		default:
 			return fmt.Errorf("unknown leaf type: %T", val)
 		}
