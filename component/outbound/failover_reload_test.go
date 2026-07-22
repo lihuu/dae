@@ -79,7 +79,7 @@ func reloadTestControllers(
 		return false, nil
 	}
 	oldFC.triggerPrimaryFailureForTest()
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 7; i++ {
 		oldSched.FireNext(t)
 	}
 
@@ -92,8 +92,8 @@ func reloadTestControllers(
 	if oldTarget != 1 {
 		t.Fatalf("old controller recoveryTarget = %d, want 1 (B)", oldTarget)
 	}
-	if oldFailed != 5 {
-		t.Fatalf("old controller failedRecoveryProbes = %d, want 5", oldFailed)
+	if oldFailed != 2 {
+		t.Fatalf("old controller failedRecoveryProbes = %d, want 2", oldFailed)
 	}
 	if !oldRotation {
 		t.Fatal("old controller rotationActive = false, want true")
@@ -158,8 +158,8 @@ func TestFailoverReloadSnapshotCompatiblePreservesRotation(t *testing.T) {
 	if !newRotation {
 		t.Fatal("new rotationActive = false, want true (preserved)")
 	}
-	if newFailed != 5 {
-		t.Fatalf("new failedRecoveryProbes = %d, want 5 (preserved)", newFailed)
+	if newFailed != 2 {
+		t.Fatalf("new failedRecoveryProbes = %d, want 2 (preserved)", newFailed)
 	}
 	if newSuccesses != 0 {
 		t.Fatalf("new recoverySuccesses = %d, want 0 (preserved)", newSuccesses)
@@ -370,13 +370,15 @@ func TestFailoverReloadIdentityMismatchLeavesOldRecoveryRunning(t *testing.T) {
 	oldSched.FireNext(t)
 	oldFC.mu.Lock()
 	continuedFailed := oldFC.failedRecoveryProbes
-	continuedTarget := oldFC.recoveryTarget
+	oldTargetAfter := oldFC.recoveryTarget
 	oldFC.mu.Unlock()
 	if continuedFailed != beforeFailed+1 {
 		t.Fatalf("old failed probes after resumed work = %d, want %d", continuedFailed, beforeFailed+1)
 	}
-	if continuedTarget != (beforeTarget+1)%len(oldFC.primaryCandidates) {
-		t.Fatalf("old recovery target after resumed work = %d, want next candidate", continuedTarget)
+	// Since we advanced to B, and B already had 2 failed probes, the next failure
+	// leaves it at 3 failed probes (does not advance).
+	if oldTargetAfter != 1 {
+		t.Fatalf("old recovery target after resumed work = %d, want 1 (B)", oldTargetAfter)
 	}
 }
 

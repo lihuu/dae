@@ -306,8 +306,7 @@ func TestFailoverRotationPromotedBFailureStartsAtC(t *testing.T) {
 		scriptedProbeResult{target: nodes.C},
 	)
 
-	// After the sixth (C) probe fails, the cursor has advanced past C to A
-	// (circular wrap). rotationActive is true and failedRecoveryProbes is 6.
+	// C probe fails once, cursor remains on C. rotationActive is true and failedRecoveryProbes is 1.
 	group.failoverController.mu.Lock()
 	currentPrimary := group.failoverController.currentPrimary
 	recoveryTarget := group.failoverController.recoveryTarget
@@ -318,14 +317,14 @@ func TestFailoverRotationPromotedBFailureStartsAtC(t *testing.T) {
 	if currentPrimary != 1 {
 		t.Fatalf("currentPrimary = %d, want 1 (B)", currentPrimary)
 	}
-	if recoveryTarget != 0 {
-		t.Fatalf("recoveryTarget = %d, want 0 (A, circular wrap after C)", recoveryTarget)
+	if recoveryTarget != 2 {
+		t.Fatalf("recoveryTarget = %d, want 2 (C)", recoveryTarget)
 	}
 	if !rotationActive {
 		t.Fatal("rotationActive = false, want true after B's five failures")
 	}
-	if failedProbes != 6 {
-		t.Fatalf("failedRecoveryProbes = %d, want 6", failedProbes)
+	if failedProbes != 1 {
+		t.Fatalf("failedRecoveryProbes = %d, want 1", failedProbes)
 	}
 }
 
@@ -450,18 +449,30 @@ func TestFailoverRotationIntegrationAtoBRecovery(t *testing.T) {
 		scriptedProbeResult{target: nodes.A},
 		scriptedProbeResult{target: nodes.A},
 		scriptedProbeResult{target: nodes.A},
-		// One failed B probe. rotationActive is already true, so a single
-		// failure advances recoveryTarget from B to C.
+		// Five failed B probes. rotationActive is already true, so five
+		// failures advance recoveryTarget from B to C.
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
+		scriptedProbeResult{target: nodes.B},
 		scriptedProbeResult{target: nodes.B},
 		// C recovery starts: the first C probe succeeds, recording
 		// stableSince and entering stateRecovering.
 		scriptedProbeResult{target: nodes.C, ok: true},
 		// C confirmation fails: the second C probe fails, clearing
-		// recoverySuccesses/stableSince and advancing recoveryTarget from
-		// C to A (circular wrap).
+		// recoverySuccesses/stableSince.
 		scriptedProbeResult{target: nodes.C},
-		// A fails after the circular wrap. rotationActive stays true, so a
-		// single failure advances recoveryTarget from A to B.
+		// Provide 4 more C failures to advance from C to A.
+		scriptedProbeResult{target: nodes.C},
+		scriptedProbeResult{target: nodes.C},
+		scriptedProbeResult{target: nodes.C},
+		scriptedProbeResult{target: nodes.C},
+		// A fails 5 times after the circular wrap. rotationActive stays true, so five
+		// failures advance recoveryTarget from A to B.
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
+		scriptedProbeResult{target: nodes.A},
 		scriptedProbeResult{target: nodes.A},
 		// B gets three successes across stable time. The first success
 		// records stableSince; confirmation probes run at the 15s initial
@@ -511,32 +522,20 @@ func TestFailoverRotationAllUnavailableStaysOnFallback(t *testing.T) {
 	triggerCandidateHealth(group, 0, TestNetworkType, false)
 	assertTCPAndUDPSelected(t, group, nodes.Fallback)
 
-	// 9 scripted failures = 3 full B/C/A wraps after the five-attempt
-	// threshold activates rotation. The cursor sequence after the threshold
-	// is B -> C -> A -> B -> C -> A -> B -> C -> A. driveProbeResults fires
-	// one timer per probe and asserts the target identity, proving the
-	// circular order.
-	driveProbeResults(t, group, scheduler,
-		// Five A failures: probe the failed current primary until the
-		// threshold activates rotation and advances to B.
-		scriptedProbeResult{target: nodes.A},
-		scriptedProbeResult{target: nodes.A},
-		scriptedProbeResult{target: nodes.A},
-		scriptedProbeResult{target: nodes.A},
-		scriptedProbeResult{target: nodes.A},
-		// Wrap 1: B -> C -> A.
-		scriptedProbeResult{target: nodes.B},
-		scriptedProbeResult{target: nodes.C},
-		scriptedProbeResult{target: nodes.A},
-		// Wrap 2: B -> C -> A.
-		scriptedProbeResult{target: nodes.B},
-		scriptedProbeResult{target: nodes.C},
-		scriptedProbeResult{target: nodes.A},
-		// Wrap 3: B -> C -> A.
-		scriptedProbeResult{target: nodes.B},
-		scriptedProbeResult{target: nodes.C},
-		scriptedProbeResult{target: nodes.A},
-	)
+	// 3 full B/C/A wraps after the five-attempt threshold activates rotation.
+	var results []scriptedProbeResult
+	addFailures := func(target *dialer.Dialer, count int) {
+		for i := 0; i < count; i++ {
+			results = append(results, scriptedProbeResult{target: target})
+		}
+	}
+	addFailures(nodes.A, 5)
+	for w := 0; w < 3; w++ {
+		addFailures(nodes.B, 5)
+		addFailures(nodes.C, 5)
+		addFailures(nodes.A, 5)
+	}
+	driveProbeResults(t, group, scheduler, results...)
 
 	// After every candidate has failed three full wraps, the fixed Fallback
 	// is still selected for new TCP and UDP traffic.
@@ -555,8 +554,8 @@ func TestFailoverRotationAllUnavailableStaysOnFallback(t *testing.T) {
 	if !rotationActive {
 		t.Fatal("rotationActive = false, want true (rotation stays active)")
 	}
-	if failedProbes != 14 {
-		t.Fatalf("failedRecoveryProbes = %d, want 14 (5 A + 9 wraps)", failedProbes)
+	if failedProbes != 0 {
+		t.Fatalf("failedRecoveryProbes = %d, want 0 (just advanced)", failedProbes)
 	}
 	if got := scheduler.PendingCount(); got != 1 {
 		t.Fatalf("pending timers = %d, want 1 (bounded scan, one timer max)", got)
@@ -789,8 +788,8 @@ func TestFailoverRotationProductionProbeTargetsRecoveryTarget(t *testing.T) {
 	recoverySuccesses := group.failoverController.recoverySuccesses
 	group.failoverController.mu.Unlock()
 
-	if failedRecoveryProbes != 5 {
-		t.Fatalf("failedRecoveryProbes = %d, want 5", failedRecoveryProbes)
+	if failedRecoveryProbes != 0 {
+		t.Fatalf("failedRecoveryProbes = %d, want 0 after advancement", failedRecoveryProbes)
 	}
 	if !rotationActive {
 		t.Fatal("rotationActive = false, want true after 5 failed probes")
@@ -826,8 +825,8 @@ func TestFailoverRotationProductionProbeTargetsRecoveryTarget(t *testing.T) {
 	if recoveryTarget != 1 {
 		t.Fatalf("recoveryTarget = %d, want 1 (B): a successful B probe must hold the cursor on B", recoveryTarget)
 	}
-	if failedRecoveryProbes != 5 {
-		t.Fatalf("failedRecoveryProbes = %d, want 5 (a successful probe must not increment the failure count)",
+	if failedRecoveryProbes != 0 {
+		t.Fatalf("failedRecoveryProbes = %d, want 0 (a successful probe resets the consecutive failure count)",
 			failedRecoveryProbes)
 	}
 }

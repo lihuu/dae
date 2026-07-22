@@ -210,8 +210,8 @@ func TestFailoverRotationFifthFailureAdvancesToB(t *testing.T) {
 	nextAt := fc.nextProbeAt
 	fc.mu.Unlock()
 
-	if failedProbes != 5 {
-		t.Fatalf("failedRecoveryProbes = %d, want 5", failedProbes)
+	if failedProbes != 0 {
+		t.Fatalf("failedRecoveryProbes = %d, want 0 after advancement", failedProbes)
 	}
 	if !rotationActive {
 		t.Fatal("rotationActive = false, want true")
@@ -266,7 +266,10 @@ func TestFailoverRotationCircularTargets(t *testing.T) {
 	// 5 probes against A (exhausting the threshold), then B -> C -> A -> B.
 	wantTargets := []string{
 		"A", "A", "A", "A", "A", // threshold window on A
-		"B", "C", "A", "B", // circular scan after rotation activates
+		"B", "B", "B", "B", "B", // 5 B failures
+		"C", "C", "C", "C", "C", // 5 C failures
+		"A", "A", "A", "A", "A", // 5 A failures
+		"B", "B", "B", "B", // 4 B failures, not enough to advance
 	}
 	for range wantTargets {
 		sched.FireNext(t)
@@ -285,14 +288,14 @@ func TestFailoverRotationCircularTargets(t *testing.T) {
 
 	// 9 total failed probes (5 + 4). After the last B probe the cursor
 	// advances to C (index 2) for the next probe.
-	if failedProbes != len(wantTargets) {
-		t.Fatalf("failedRecoveryProbes = %d, want %d", failedProbes, len(wantTargets))
+	if failedProbes != 4 {
+		t.Fatalf("failedRecoveryProbes = %d, want 4", failedProbes)
 	}
 	if !rotationActive {
 		t.Fatal("rotationActive = false, want true")
 	}
-	if recoveryTarget != 2 {
-		t.Fatalf("recoveryTarget = %d, want 2 (C is next after B)", recoveryTarget)
+	if recoveryTarget != 1 {
+		t.Fatalf("recoveryTarget = %d, want 1 (B)", recoveryTarget)
 	}
 	if currentDelay != cfg.ProbeMax {
 		t.Fatalf("currentDelay = %v, want capped at ProbeMax %v", currentDelay, cfg.ProbeMax)
@@ -358,14 +361,14 @@ func TestFailoverRotationProbeErrorMatchesFalseResult(t *testing.T) {
 	if errCase != falseCase {
 		t.Fatalf("error case %+v != false case %+v", errCase, falseCase)
 	}
-	if falseCase.failedProbes != 6 {
-		t.Fatalf("failedRecoveryProbes = %d, want 6", falseCase.failedProbes)
+	if falseCase.failedProbes != 1 {
+		t.Fatalf("failedRecoveryProbes = %d, want 1", falseCase.failedProbes)
 	}
 	if !falseCase.rotationActive {
 		t.Fatal("rotationActive = false, want true")
 	}
-	if falseCase.recoveryTarget != 2 {
-		t.Fatalf("recoveryTarget = %d, want 2 (C after B)", falseCase.recoveryTarget)
+	if falseCase.recoveryTarget != 1 {
+		t.Fatalf("recoveryTarget = %d, want 1 (B)", falseCase.recoveryTarget)
 	}
 	if falseCase.currentDelay != cfg.ProbeMax {
 		t.Fatalf("currentDelay = %v, want ProbeMax %v", falseCase.currentDelay, cfg.ProbeMax)
@@ -633,9 +636,8 @@ func TestFailoverRotationStructuredLogs(t *testing.T) {
 	}
 	fc.triggerPrimaryFailureForTest()
 
-	// Fire 7 probes: 5 against A (the fifth activates rotation and advances
-	// to B), then B, then C, then A.
-	for i := 0; i < 7; i++ {
+	// Fire 20 probes: 5 A, 5 B, 5 C, 5 A.
+	for i := 0; i < 20; i++ {
 		sched.FireNext(t)
 	}
 
@@ -649,13 +651,12 @@ func TestFailoverRotationStructuredLogs(t *testing.T) {
 	checkRotationFields(t, started[0], "A", "A", "B", 5, 5*time.Minute)
 
 	advanced := findLogEntries(hook, "recovery_target_advanced")
-	if len(advanced) != 2 {
-		t.Fatalf("recovery_target_advanced emitted %d times, want 2", len(advanced))
+	if len(advanced) != 3 {
+		t.Fatalf("recovery_target_advanced emitted %d times, want 3", len(advanced))
 	}
-	// 6th failure: B -> C, failed_attempts=6, next_probe_in=5m (capped).
-	checkRotationFields(t, advanced[0], "A", "B", "C", 6, 5*time.Minute)
-	// 7th failure: C -> A, failed_attempts=7, next_probe_in=5m (capped).
-	checkRotationFields(t, advanced[1], "A", "C", "A", 7, 5*time.Minute)
+	checkRotationFields(t, advanced[0], "A", "B", "C", 5, 5*time.Minute)
+	checkRotationFields(t, advanced[1], "A", "C", "A", 5, 5*time.Minute)
+	checkRotationFields(t, advanced[2], "A", "A", "B", 5, 5*time.Minute)
 	_ = candidates
 }
 
@@ -895,4 +896,111 @@ type panickingCallback struct {
 func (p *panickingCallback) OnFailoverEvent(ev FailoverEvent) {
 	p.inner.OnFailoverEvent(ev)
 	panic("bark dispatch failed")
+}
+
+func TestFailoverRotationUsesPerCandidateConsecutiveBudget(t *testing.T) {
+	cfg := FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 2,
+	}
+	fc, sched, candidates, _ := newRotationControllerTest(t, cfg)
+	defer fc.Close()
+	results := []struct {
+		target *dialer.Dialer
+		ok     bool
+	}{
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[1]},
+		{target: candidates[1], ok: true},
+		{target: candidates[1]},
+		{target: candidates[1]},
+	}
+	next := 0
+	fc.probeTargetTCP = func(_ context.Context, target *dialer.Dialer) (bool, error) {
+		result := results[next]
+		next++
+		if target != result.target {
+			t.Fatalf("probe target = %s, want %s", target.Property().Name, result.target.Property().Name)
+		}
+		return result.ok, nil
+	}
+	fc.triggerPrimaryFailureForTest()
+	for range results {
+		sched.FireNext(t)
+	}
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.recoveryTarget != 2 {
+		t.Fatalf("recoveryTarget = %d, want 2 (C)", fc.recoveryTarget)
+	}
+	if fc.failedRecoveryProbes != 0 {
+		t.Fatalf("failedRecoveryProbes = %d, want 0 after advancement", fc.failedRecoveryProbes)
+	}
+}
+
+func TestFailoverRotationCandidateCountAndZeroThreshold(t *testing.T) {
+	tests := []struct {
+		name         string
+		candidates   []string
+		attempts     int
+		failures     int
+		wantTarget   int
+		wantFailures int
+	}{
+		{"one candidate positive", []string{"A"}, 2, 2, 0, 0},
+		{"one candidate disabled", []string{"A"}, 0, 6, 0, 6},
+		{"three candidates disabled", []string{"A", "B", "C"}, 0, 6, 0, 6},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := FailoverRecoveryConfig{
+				ProbeInitial:     15 * time.Second,
+				ProbeMax:         5 * time.Minute,
+				Successes:        3,
+				StableTime:       30 * time.Second,
+				RotationAttempts: tt.attempts,
+			}
+
+			option := testFailoverDialerOption()
+			var candidates []*dialer.Dialer
+			for _, n := range tt.candidates {
+				candidates = append(candidates, newNamedDirectDialer(option, n))
+			}
+			fallback := newNamedDirectDialer(option, "fallback")
+
+			fc := NewFailoverControllerWithCandidates(log, "rotation-test", candidates, fallback, cfg)
+			sched := newFakeFailoverScheduler()
+			fc.scheduler = sched
+			defer fc.Close()
+
+			fc.probeTargetTCP = func(_ context.Context, target *dialer.Dialer) (bool, error) {
+				return false, nil
+			}
+
+			fc.triggerPrimaryFailureForTest()
+
+			for i := 0; i < tt.failures; i++ {
+				sched.FireNext(t)
+				if got, _ := fc.ActiveDialer(); got != fallback {
+					t.Fatalf("active dialer = %v, want fallback", got)
+				}
+			}
+
+			fc.mu.Lock()
+			defer fc.mu.Unlock()
+
+			if fc.recoveryTarget != tt.wantTarget {
+				t.Fatalf("recoveryTarget = %d, want %d", fc.recoveryTarget, tt.wantTarget)
+			}
+			if fc.failedRecoveryProbes != tt.wantFailures {
+				t.Fatalf("failedRecoveryProbes = %d, want %d", fc.failedRecoveryProbes, tt.wantFailures)
+			}
+		})
+	}
 }

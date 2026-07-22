@@ -567,6 +567,7 @@ func (fc *FailoverController) probeTarget(ctx context.Context, d *dialer.Dialer)
 // producing successes; only failed probes consume the budget. A success does
 // NOT erase earlier failures (failedRecoveryProbes is unchanged).
 func (fc *FailoverController) onProbeSuccessLocked() {
+	fc.failedRecoveryProbes = 0
 	fc.recoverySuccesses++
 
 	if fc.recoverySuccesses == 1 {
@@ -665,6 +666,7 @@ func (fc *FailoverController) promoteRecoveryTargetLocked() {
 // failures, so reaching the threshold necessarily follows a failed probe.
 func (fc *FailoverController) onProbeFailureLocked() {
 	fc.failedRecoveryProbes++
+	failedAttempts := fc.failedRecoveryProbes
 	fc.recoverySuccesses = 0
 	fc.stableSince = time.Time{}
 
@@ -675,34 +677,19 @@ func (fc *FailoverController) onProbeFailureLocked() {
 	fromTargetIdx := fc.recoveryTarget
 	fromTargetName := dialerName(fc.recoveryTargetDialer())
 
-	// Determine whether this failure advances the cursor. Rotation is only
-	// entered when RotationAttempts > 0; with RotationAttempts == 0 (legacy
-	// two-dialer contract) the target never advances and the failed primary
-	// keeps being probed.
-	rotationStarts := false
-	advances := false
-	if fc.config.RotationAttempts > 0 {
-		if fc.rotationActive {
-			advances = true
-		} else if fc.failedRecoveryProbes >= fc.config.RotationAttempts {
-			rotationStarts = true
-			advances = true
-		}
-	}
+	advances := fc.config.RotationAttempts > 0 &&
+		fc.failedRecoveryProbes >= fc.config.RotationAttempts
+	rotationStarts := advances && !fc.rotationActive
 
 	// Exponential backoff: double the delay, capped at ProbeMax. The backoff
 	// continues across failed targets and stays capped. The new currentDelay
 	// is the delay that will be used to schedule the probe of toTarget.
 	fc.currentDelay = minDuration(fc.currentDelay*2, fc.config.ProbeMax)
 
-	// Advance the recovery target.
 	if advances {
-		if rotationStarts {
-			fc.rotationActive = true
-			fc.recoveryTarget = (fc.currentPrimary + 1) % len(fc.primaryCandidates)
-		} else {
-			fc.recoveryTarget = (fc.recoveryTarget + 1) % len(fc.primaryCandidates)
-		}
+		fc.rotationActive = true
+		fc.recoveryTarget = (fc.recoveryTarget + 1) % len(fc.primaryCandidates)
+		fc.failedRecoveryProbes = 0
 	}
 
 	toTargetName := dialerName(fc.recoveryTargetDialer())
@@ -722,14 +709,14 @@ func (fc *FailoverController) onProbeFailureLocked() {
 				"failed_primary":  fc.failedPrimaryName,
 				"from_target":     fromTargetName,
 				"to_target":       toTargetName,
-				"failed_attempts": fc.failedRecoveryProbes,
+				"failed_attempts": failedAttempts,
 				"next_probe_in":   fc.currentDelay,
 			}).Debug(eventName)
 		} else {
 			fc.log.WithFields(logrus.Fields{
 				"group":           fc.groupName,
 				"primary":         dialerName(fc.recoveryTargetDialer()),
-				"failed_attempts": fc.failedRecoveryProbes,
+				"failed_attempts": failedAttempts,
 				"rotation_active": fc.rotationActive,
 				"next_in":         fc.currentDelay,
 			}).Debug("recovery probe failed, backing off")
