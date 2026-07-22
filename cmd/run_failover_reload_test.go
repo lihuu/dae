@@ -6,10 +6,13 @@
 package cmd
 
 import (
+	"context"
 	"sync"
 	"testing"
 
+	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 )
 
 // recordingReloadInheritance is a cmd-test-only reloadInheritanceTxn that
@@ -205,15 +208,35 @@ func TestReloadInheritanceTxnInterface(t *testing.T) {
 // new-generation build does not call inheritance Commit or Rollback and retains
 // the old generation reference.
 func TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched(t *testing.T) {
-	// A failed build never produces a handoff transaction, so it never
-	// calls Commit or Rollback. We mock a failure by asserting no methods
-	// on a dummy transaction are invoked when a staged reload fails before
-	// handoff construction.
+	// We mock a failure by asserting no methods on a dummy transaction are invoked
+	// when a staged reload fails before handoff construction. We pass an invalid
+	// config to newPreparedControlPlane (the command layer reload function) to
+	// trigger a build failure.
 	txn := &recordingReloadInheritance{hasOverlap: true}
 	
-	// Simulate failed build: no handoff is created, and nothing is committed
-	// or rolled back.
-	
+	ctx := context.Background()
+	log := newDiscardLogger()
+
+	invalidConf := &config.Config{
+		Routing: config.Routing{
+			Rules: []*config_parser.RoutingRule{},
+		},
+		Group: []config.Group{
+			{Name: "proxy_failover", Policy: "failover", Primary: "name(A, A)"},
+		},
+		Global: config.Global{
+			TproxyPort:            12345,
+			LogLevel:              "info",
+			FallbackResolver:      "8.8.8.8:53",
+			DisableWaitingNetwork: true,
+		},
+	}
+
+	_, err := newPreparedControlPlane(ctx, log, nil, nil, invalidConf, nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected newPreparedControlPlane to fail with invalid configuration")
+	}
+
 	txn.mu.Lock()
 	commitCalls := txn.commitCalls
 	rollbackCalls := txn.rollbackCalls
