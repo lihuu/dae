@@ -169,21 +169,8 @@ func ValidateFailoverGroup(
 	}
 
 	// Validate recovery config.
-	if recovery.ProbeInitial <= 0 {
-		return nil, fmt.Errorf("recovery_probe_initial must be positive")
-	}
-	if recovery.ProbeMax <= 0 {
-		return nil, fmt.Errorf("recovery_probe_max must be positive")
-	}
-	if recovery.ProbeInitial > recovery.ProbeMax {
-		return nil, fmt.Errorf("recovery_probe_initial (%v) must not exceed recovery_probe_max (%v)",
-			recovery.ProbeInitial, recovery.ProbeMax)
-	}
-	if recovery.Successes < 1 {
-		return nil, fmt.Errorf("recovery_successes must be at least 1")
-	}
-	if recovery.StableTime <= 0 {
-		return nil, fmt.Errorf("recovery_stable_time must be positive")
+	if err := validateFailoverRecoveryConfig(recovery); err != nil {
+		return nil, err
 	}
 
 	return &FailoverConfig{
