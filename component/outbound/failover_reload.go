@@ -216,9 +216,9 @@ func (fc *FailoverController) restoreSnapshotLocked(snap FailoverControllerSnaps
 	// remaining delay computed from the scheduler's clock. If a probe was in
 	// flight at capture time, schedule exactly one immediate probe of the same
 	// named recovery target (preserving counters, confirmation state, and
-	// currentDelay). The replacement must neither wait on a past nextProbeAt
-	// nor run both the old and new probes — the old probe was invalidated by
-	// generation at prepare time.
+	// currentDelay). The replacement must not wait on a past nextProbeAt. The
+	// old physical probe may still be returning, but it was invalidated by
+	// generation and detached from logical ownership at prepare time.
 	if fc.state == stateFallbackActive || fc.state == stateRecovering {
 		delay := computeResumeDelay(snap, fc.scheduler.Now())
 		originalDelay := fc.currentDelay
@@ -275,16 +275,43 @@ func (fc *FailoverController) recoveryTargetNameLocked() string {
 // failover_rotation_state_reset info log; the new controller stays at its
 // fresh priority-0 initial primary.
 //
-// Pause semantics: lock the old controller, capture the snapshot (including
-// whether a probe is in flight), stop the pending timer, increment generation,
-// cancel the in-flight probe, and leave the atomic active selection unchanged.
-// The old probe result (delivered later) is ignored by the generation guard
-// in runProbe and never counts as a recovery failure. Restore the new
-// controller with the remaining delay, or one immediate scheduled probe when
-// ProbeInFlight is true.
+// Compatibility is checked before the old controller is paused. An
+// incompatible replacement returns without changing the old timer, generation,
+// or in-flight probe, because a failed staged cutover may continue using that
+// old controller. On compatibility, lock the old controller, capture the
+// snapshot (including whether a probe is in flight), stop the pending timer,
+// increment generation, cancel the in-flight probe, and leave the atomic active
+// selection unchanged. The old probe result (delivered later) is ignored by the
+// generation guard in runProbe and never counts as a recovery failure. Restore
+// the new controller with the remaining delay, or one immediate scheduled probe
+// when ProbeInFlight is true.
 func (fc *FailoverController) prepareReloadTransfer(old *FailoverController) (*FailoverReloadTransfer, string) {
+	// Read the replacement identity without holding the old controller lock so
+	// the two controller mutexes are never held together.
+	fc.mu.Lock()
+	newIdentity := failoverIdentityFromController(fc)
+	newPrimaryName := dialerName(fc.primaryDialer())
+	fc.mu.Unlock()
+
 	old.mu.Lock()
 	oldIdentity := failoverIdentityFromController(old)
+	compatible, reason := compareFailoverReloadIdentity(oldIdentity, newIdentity)
+	if !compatible {
+		// Do not pause the old generation. A staged reload can still fail after
+		// this point, in which case the old control plane must retain ownership
+		// of its existing recovery timer or in-flight probe.
+		oldPrimaryName := dialerName(old.primaryDialer())
+		old.mu.Unlock()
+
+		fc.log.WithFields(logrus.Fields{
+			"group":               fc.groupName,
+			"reason":              reason,
+			"old_current_primary": oldPrimaryName,
+			"new_initial_primary": newPrimaryName,
+		}).Info("failover_rotation_state_reset")
+		return nil, reason
+	}
+
 	snapshot := old.captureSnapshotLocked()
 	// Pause the old generation: stop its pending timer, bump generation so a
 	// late probe result is ignored, and cancel any in-flight probe. Do NOT
@@ -295,29 +322,8 @@ func (fc *FailoverController) prepareReloadTransfer(old *FailoverController) (*F
 		old.recoveryTimer = nil
 	}
 	old.generation++
-	if old.probeCancel != nil {
-		old.probeCancel()
-		old.probeCancel = nil
-	}
+	old.cancelActiveProbeLocked()
 	old.mu.Unlock()
-
-	newIdentity := failoverIdentityFromController(fc)
-	compatible, reason := compareFailoverReloadIdentity(oldIdentity, newIdentity)
-	if !compatible {
-		// The new generation does NOT inherit or normalize the old rotation
-		// snapshot. Emit the info-level reset log with the deterministic reason
-		// and old/new primary names. The log must not block failover, change
-		// counters, change timers, or affect promotion.
-		oldPrimaryName := snapshot.CurrentPrimaryName
-		newPrimaryName := dialerName(fc.primaryDialer())
-		fc.log.WithFields(logrus.Fields{
-			"group":               fc.groupName,
-			"reason":              reason,
-			"old_current_primary": oldPrimaryName,
-			"new_initial_primary": newPrimaryName,
-		}).Info("failover_rotation_state_reset")
-		return nil, reason
-	}
 
 	// Restore the new generation. The new controller's mutex is acquired
 	// separately (after releasing old) so the two controllers are never
@@ -346,10 +352,7 @@ func (fc *FailoverController) cancelReloadRestore() {
 		fc.recoveryTimer.Stop()
 		fc.recoveryTimer = nil
 	}
-	if fc.probeCancel != nil {
-		fc.probeCancel()
-		fc.probeCancel = nil
-	}
+	fc.cancelActiveProbeLocked()
 }
 
 // resumeAfterReloadAbort re-schedules exactly one old-generation probe of the

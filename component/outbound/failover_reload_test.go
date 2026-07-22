@@ -313,6 +313,73 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 	}
 }
 
+// TestFailoverReloadIdentityMismatchLeavesOldRecoveryRunning proves that an
+// incompatible staged reload does not pause the old controller. The new
+// controller starts fresh and no transfer is returned, so the old generation
+// must retain ownership of its pending recovery timer in case the staged
+// cutover later rolls back to it.
+func TestFailoverReloadIdentityMismatchLeavesOldRecoveryRunning(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, _, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C", "D"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	oldFC.mu.Lock()
+	beforeGeneration := oldFC.generation
+	beforeFailed := oldFC.failedRecoveryProbes
+	beforeTarget := oldFC.recoveryTarget
+	oldFC.mu.Unlock()
+	if got := oldSched.PendingCount(); got != 1 {
+		t.Fatalf("old pending timers before incompatible reload = %d, want 1", got)
+	}
+
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	if transfer != nil {
+		t.Fatal("incompatible reload returned a transfer, want nil")
+	}
+	if reason != "primary_candidates_changed" {
+		t.Fatalf("reset reason = %q, want primary_candidates_changed", reason)
+	}
+
+	oldFC.mu.Lock()
+	afterGeneration := oldFC.generation
+	afterFailed := oldFC.failedRecoveryProbes
+	afterTarget := oldFC.recoveryTarget
+	oldFC.mu.Unlock()
+	if afterGeneration != beforeGeneration {
+		t.Fatalf("old generation changed on incompatible reload: %d -> %d", beforeGeneration, afterGeneration)
+	}
+	if afterFailed != beforeFailed {
+		t.Fatalf("old failed probes changed on incompatible reload: %d -> %d", beforeFailed, afterFailed)
+	}
+	if afterTarget != beforeTarget {
+		t.Fatalf("old recovery target changed on incompatible reload: %d -> %d", beforeTarget, afterTarget)
+	}
+	if got := oldSched.PendingCount(); got != 1 {
+		t.Fatalf("old pending timers after incompatible reload = %d, want 1", got)
+	}
+
+	// The old generation still owns the pending B probe. Firing it must execute
+	// normal recovery work: the failure count advances and the rotating cursor
+	// moves from B to C.
+	oldSched.FireNext(t)
+	oldFC.mu.Lock()
+	continuedFailed := oldFC.failedRecoveryProbes
+	continuedTarget := oldFC.recoveryTarget
+	oldFC.mu.Unlock()
+	if continuedFailed != beforeFailed+1 {
+		t.Fatalf("old failed probes after resumed work = %d, want %d", continuedFailed, beforeFailed+1)
+	}
+	if continuedTarget != (beforeTarget+1)%len(oldFC.primaryCandidates) {
+		t.Fatalf("old recovery target after resumed work = %d, want next candidate", continuedTarget)
+	}
+}
+
 // TestFailoverReloadResetReasonPrecedence proves that when multiple identity
 // categories change in one reload, the reason follows the precedence
 // fallback_changed > primary_candidates_changed > recovery_policy_changed.
@@ -838,5 +905,180 @@ func TestFailoverReloadTransferConcurrentCommitRollback(t *testing.T) {
 		}
 		oldFC.mu.Unlock()
 		oldSched.FireNext(t)
+	}
+}
+
+// TestFailoverReloadRollbackStaleProbeCannotClobberReplacement proves that a
+// rollback does not wait for the cancelled physical probe to exit. The
+// replacement probe starts immediately and becomes the controller's sole
+// logical owner; when the stale probe eventually returns, it must neither
+// clear the replacement's in-flight/cancel state nor mutate recovery state.
+func TestFailoverReloadRollbackStaleProbeCannotClobberReplacement(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, _, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	// Keep both physical probes under test control. The old probe deliberately
+	// ignores context cancellation so it can outlive rollback; this models a
+	// transport that is slow to observe cancellation.
+	probeStarted := make(chan int, 2)
+	oldProbeRelease := make(chan struct{})
+	newProbeRelease := make(chan struct{})
+	var releaseOldOnce sync.Once
+	var releaseNewOnce sync.Once
+	releaseOld := func() { releaseOldOnce.Do(func() { close(oldProbeRelease) }) }
+	releaseNew := func() { releaseNewOnce.Do(func() { close(newProbeRelease) }) }
+	defer releaseOld()
+	defer releaseNew()
+
+	var probeCallsMu sync.Mutex
+	probeCalls := 0
+
+	oldFC.mu.Lock()
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		probeCallsMu.Lock()
+		probeCalls++
+		call := probeCalls
+		probeCallsMu.Unlock()
+		probeStarted <- call
+		switch call {
+		case 1:
+			<-oldProbeRelease
+			return false, errors.New("stale probe failed after release")
+		case 2:
+			<-newProbeRelease
+			return false, errors.New("replacement probe failed after release")
+		default:
+			return false, errors.New("unexpected extra probe")
+		}
+	}
+	oldFC.mu.Unlock()
+
+	// Fire one pending fake timer asynchronously and return a completion
+	// channel for the full callback (including runProbe's completion defer).
+	fireNextAsync := func() <-chan struct{} {
+		t.Helper()
+		var pendingTimer *fakeFailoverTimer
+		var pendingAt time.Time
+		for _, c := range oldSched.pending {
+			if !c.timer.stopped {
+				pendingTimer = c.timer
+				pendingAt = c.at
+				break
+			}
+		}
+		if pendingTimer == nil {
+			t.Fatal("no pending failover timer")
+		}
+		if pendingAt.After(oldSched.now) {
+			oldSched.now = pendingAt
+		}
+		pendingTimer.stopped = true
+		done := make(chan struct{})
+		go func() {
+			pendingTimer.fn()
+			close(done)
+		}()
+		return done
+	}
+
+	oldProbeDone := fireNextAsync()
+
+	// Wait for the probe to be in flight.
+	select {
+	case call := <-probeStarted:
+		if call != 1 {
+			t.Fatalf("first probe call = %d, want 1", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old probe did not start in time")
+	}
+
+	oldFC.mu.Lock()
+	beforeFailed := oldFC.failedRecoveryProbes
+	beforeTarget := oldFC.recoveryTarget
+	oldFC.mu.Unlock()
+
+	// Prepare transfer while the probe is in flight. This bumps generation
+	// and cancels the old probe's context, but the probe goroutine is still
+	// blocked on oldProbeRelease.
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	if transfer == nil {
+		t.Fatalf("expected transfer, got nil (reason=%q)", reason)
+	}
+
+	// Rollback must schedule an immediate logical replacement even though the
+	// cancelled physical probe is still blocked above.
+	transfer.Rollback()
+
+	if got := oldSched.PendingCount(); got != 1 {
+		t.Fatalf("old pending after rollback = %d, want 1", got)
+	}
+	oldFC.mu.Lock()
+	rollbackDelay := oldFC.nextProbeAt.Sub(oldSched.Now())
+	oldFC.mu.Unlock()
+	if rollbackDelay != 0 {
+		t.Fatalf("rollback replacement delay = %v, want immediate", rollbackDelay)
+	}
+
+	newProbeDone := fireNextAsync()
+	select {
+	case call := <-probeStarted:
+		if call != 2 {
+			t.Fatalf("replacement probe call = %d, want 2", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement probe did not start while stale probe was still running")
+	}
+
+	// Capture the replacement's logical ownership, then let the stale callback
+	// finish completely. Its result and completion defer must be inert.
+	oldFC.mu.Lock()
+	replacementInFlight := oldFC.probeInFlight
+	replacementHasCancel := oldFC.probeCancel != nil
+	oldFC.mu.Unlock()
+	if !replacementHasCancel || !replacementInFlight {
+		t.Fatal("replacement probe did not own in-flight state")
+	}
+
+	releaseOld()
+	select {
+	case <-oldProbeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale probe did not finish in time")
+	}
+
+	oldFC.mu.Lock()
+	afterStaleFailed := oldFC.failedRecoveryProbes
+	afterStaleTarget := oldFC.recoveryTarget
+	afterStaleCancel := oldFC.probeCancel
+	afterStaleInFlight := oldFC.probeInFlight
+	oldFC.mu.Unlock()
+	if afterStaleFailed != beforeFailed || afterStaleTarget != beforeTarget {
+		t.Fatalf("stale probe mutated recovery state: failed %d->%d target %d->%d",
+			beforeFailed, afterStaleFailed, beforeTarget, afterStaleTarget)
+	}
+	if afterStaleCancel == nil || !afterStaleInFlight {
+		t.Fatal("stale probe completion cleared replacement ownership")
+	}
+
+	// The replacement result remains authoritative and advances recovery once.
+	releaseNew()
+	select {
+	case <-newProbeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement probe did not finish in time")
+	}
+	oldFC.mu.Lock()
+	afterReplacementFailed := oldFC.failedRecoveryProbes
+	oldFC.mu.Unlock()
+	if afterReplacementFailed != beforeFailed+1 {
+		t.Fatalf("failed probes after replacement = %d, want %d", afterReplacementFailed, beforeFailed+1)
 	}
 }

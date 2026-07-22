@@ -75,6 +75,15 @@ type failoverSnapshot struct {
 	usingFallback bool
 }
 
+// failoverProbeRun is an identity token for one physical recovery probe. A
+// cancelled probe may take time to return, so activeProbe points only to the
+// latest probe that is still allowed to mutate controller state. Late results
+// and completion defers compare pointer identity before touching shared probe
+// ownership.
+type failoverProbeRun struct {
+	_ byte // non-zero size guarantees distinct addresses for overlapping runs
+}
+
 // FailoverRecoveryConfig holds the recovery probe parameters.
 type FailoverRecoveryConfig struct {
 	ProbeInitial     time.Duration
@@ -136,6 +145,7 @@ type FailoverController struct {
 	recoveryTimer     failoverTimer
 	nextProbeAt       time.Time          // when the current recovery timer is scheduled to fire
 	probeCancel       context.CancelFunc // cancels the in-flight probe
+	activeProbe       *failoverProbeRun  // logical owner; stale physical probes may still be returning
 	generation        uint64             // incremented on close/reload to invalidate stale callbacks
 
 	// rotationActive is true once failedRecoveryProbes has reached
@@ -155,9 +165,9 @@ type FailoverController struct {
 	// the episode. It supplies the failed_primary field of the
 	// primary_rotation_started and recovery_target_advanced structured logs.
 	failedPrimaryName string
-	// probeInFlight tracks whether a recovery probe is currently running. At
-	// most one probe is in flight at any time; scheduling a new probe while
-	// one is running is prevented by the generation guard and this flag.
+	// probeInFlight tracks whether the current logical probe owner is running.
+	// A cancelled stale physical probe may overlap briefly after reload or
+	// rollback, but it no longer owns this flag or any controller state.
 	probeInFlight bool
 
 	// closed is set by Close(). After closed, onPrimaryHealthChange returns
@@ -430,6 +440,19 @@ func (fc *FailoverController) scheduleProbeLocked() {
 	})
 }
 
+// cancelActiveProbeLocked cancels the current logical probe owner and detaches
+// it immediately. Cancellation is best-effort: the physical probe may return
+// later, but its run token is no longer active and therefore cannot clear or
+// mutate a replacement probe's state. Must be called with mu held.
+func (fc *FailoverController) cancelActiveProbeLocked() {
+	if fc.probeCancel != nil {
+		fc.probeCancel()
+	}
+	fc.probeCancel = nil
+	fc.probeInFlight = false
+	fc.activeProbe = nil
+}
+
 // runProbe executes a one-shot TCP probe against the current recovery target.
 func (fc *FailoverController) runProbe(gen uint64) {
 	fc.mu.Lock()
@@ -443,8 +466,9 @@ func (fc *FailoverController) runProbe(gen uint64) {
 		fc.mu.Unlock()
 		return
 	}
-	// At most one probe in flight. If a probe is already running (which should
-	// not happen given the single pending timer), bail out.
+	// At most one current logical probe is in flight. A stale physical probe
+	// detached by reload/rollback does not hold this ownership and therefore
+	// does not block an immediate replacement.
 	if fc.probeInFlight {
 		fc.mu.Unlock()
 		return
@@ -458,18 +482,22 @@ func (fc *FailoverController) runProbe(gen uint64) {
 	if targetIdx >= 0 && targetIdx < len(fc.primaryCandidates) {
 		targetDialer = fc.primaryCandidates[targetIdx]
 	}
-	fc.probeInFlight = true
-
 	// Create a cancellable context for this probe.
 	ctx, cancel := context.WithTimeout(context.Background(), dialer.Timeout)
+	run := &failoverProbeRun{}
+	fc.activeProbe = run
+	fc.probeInFlight = true
 	fc.probeCancel = cancel
 	fc.mu.Unlock()
 
 	defer cancel()
 	defer func() {
 		fc.mu.Lock()
-		fc.probeCancel = nil
-		fc.probeInFlight = false
+		if fc.activeProbe == run {
+			fc.activeProbe = nil
+			fc.probeCancel = nil
+			fc.probeInFlight = false
+		}
 		fc.mu.Unlock()
 	}()
 
@@ -479,8 +507,10 @@ func (fc *FailoverController) runProbe(gen uint64) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
-	// Re-check generation after the network call: a close/reload happened.
-	if gen != fc.generation {
+	// Re-check both generation and run ownership after the network call. A
+	// reload/rollback can detach this run and start a replacement before the
+	// cancelled physical probe returns.
+	if gen != fc.generation || fc.activeProbe != run {
 		return
 	}
 
@@ -595,10 +625,7 @@ func (fc *FailoverController) promoteRecoveryTargetLocked() {
 		fc.recoveryTimer.Stop()
 		fc.recoveryTimer = nil
 	}
-	if fc.probeCancel != nil {
-		fc.probeCancel()
-		fc.probeCancel = nil
-	}
+	fc.cancelActiveProbeLocked()
 
 	fc.publishSnapshot()
 
@@ -795,10 +822,7 @@ func (fc *FailoverController) Close() {
 		fc.recoveryTimer.Stop()
 		fc.recoveryTimer = nil
 	}
-	if fc.probeCancel != nil {
-		fc.probeCancel()
-		fc.probeCancel = nil
-	}
+	fc.cancelActiveProbeLocked()
 }
 
 // dialerName returns the name of a dialer for logging.
