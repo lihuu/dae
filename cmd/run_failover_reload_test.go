@@ -205,15 +205,9 @@ func TestReloadInheritanceTxnInterface(t *testing.T) {
 	var _ reloadInheritanceTxn = (*control.ReloadInheritance)(nil)
 }
 // TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched proves that a failed
-// new-generation build does not call inheritance Commit or Rollback and retains
-// the old generation reference.
+// new-generation build returns an error and a nil ControlPlane, ensuring that
+// no reload inheritance transaction is created or handoff initiated.
 func TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched(t *testing.T) {
-	// We mock a failure by asserting no methods on a dummy transaction are invoked
-	// when a staged reload fails before handoff construction. We pass an invalid
-	// config to newPreparedControlPlane (the command layer reload function) to
-	// trigger a build failure.
-	txn := &recordingReloadInheritance{hasOverlap: true}
-	
 	ctx := context.Background()
 	log := newDiscardLogger()
 
@@ -232,20 +226,15 @@ func TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched(t *testing.T) {
 		},
 	}
 
-	_, err := newPreparedControlPlane(ctx, log, nil, nil, invalidConf, nil, nil, nil)
+	c, err := newPreparedControlPlane(ctx, log, nil, nil, invalidConf, nil, nil, nil)
 	if err == nil {
+		if c != nil {
+			_ = c.Close()
+		}
 		t.Fatal("expected newPreparedControlPlane to fail with invalid configuration")
 	}
-
-	txn.mu.Lock()
-	commitCalls := txn.commitCalls
-	rollbackCalls := txn.rollbackCalls
-	txn.mu.Unlock()
-	
-	if commitCalls != 0 {
-		t.Fatalf("Commit calls = %d, want 0 on failed build", commitCalls)
-	}
-	if rollbackCalls != 0 {
-		t.Fatalf("Rollback calls = %d, want 0 on failed build", rollbackCalls)
+	if c != nil {
+		t.Fatal("expected returned ControlPlane to be nil on build failure")
 	}
 }
+
