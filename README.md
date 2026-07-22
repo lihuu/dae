@@ -23,7 +23,7 @@ As a successor of [v2rayA](https://github.com/v2rayA/v2rayA), dae abandoned v2ra
 - [x] Support to split traffic by MAC address in LAN.
 - [x] Support to split traffic with invert match rules.
 - [x] Support to automatically switch nodes according to policy. That is to say, support to automatically test independent TCP/UDP/IPv4/IPv6 latencies, and then use the best nodes for corresponding traffic according to user-defined policy.
-- [x] Support event-driven priority failover groups with `policy: failover`, `priority` annotations, targeted TCP recovery probes, warm-reload state handoff, and structured `failover_switch` events.
+- [x] Support event-driven failover groups with ordered `primary: name(...)`, a fixed `fallback: name(...)`, targeted TCP recovery probes, warm-reload state handoff, and structured `failover_switch` events.
 - [x] Support advanced DNS resolution process.
 - [x] Support dae-owned DNS routing for subscription fetches, node resolution, and subscription-derived node resolution through `sub()`, `node()`, and `subnode()` request selectors.
 - [x] Support optimistic DNS cache with stale-while-revalidate behavior, configurable stale window, and optional LRU size limit.
