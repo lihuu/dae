@@ -42,7 +42,7 @@ type FailoverControllerSnapshot struct {
 	CurrentPrimaryName   string
 	RecoveryTargetName   string
 	RotationActive       bool
-	FailedRecoveryProbes int
+	FailedRecoveryProbes int // consecutive count for RecoveryTargetName
 	RecoverySuccesses    int
 	StableSince          time.Time
 	CurrentDelay         time.Duration

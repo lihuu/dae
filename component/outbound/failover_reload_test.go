@@ -15,6 +15,7 @@ import (
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
+	"github.com/stretchr/testify/require"
 )
 
 // baseReloadRecoveryConfig is the recovery configuration shared by the
@@ -72,8 +73,8 @@ func reloadTestControllers(
 	newFC.scheduler = newSched
 
 	// Drive the old controller: trigger failover against A (index 0), then
-	// fire 5 failed probes so rotation activates and the cursor advances
-	// A -> B. recoveryTarget is now B (index 1), failedRecoveryProbes=5,
+	// fire 7 failed probes so rotation activates and the cursor advances
+	// A -> B. recoveryTarget is now B (index 1), failedRecoveryProbes=2,
 	// rotationActive=true, currentDelay capped at ProbeMax.
 	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
 		return false, nil
@@ -264,6 +265,22 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 			wantReason:   "recovery_policy_changed",
 			wantNewPrime: "A",
 		},
+		{
+			name: "primary_candidates_reordered",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
+			newCands: []string{"B", "A", "C"},
+			newFallback: "fallback",
+			wantReason: "primary_candidates_changed",
+			wantNewPrime: "B",
+		},
+		{
+			name: "primary_candidate_removed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
+			newCands: []string{"A", "C"},
+			newFallback: "fallback",
+			wantReason: "primary_candidates_changed",
+			wantNewPrime: "A",
+		},
 	}
 
 	for _, tc := range cases {
@@ -292,9 +309,13 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 			rt := newFC.recoveryTarget
 			ra := newFC.rotationActive
 			fp := newFC.failedRecoveryProbes
+			newPrime := dialerName(newFC.primaryCandidates[cp])
 			newFC.mu.Unlock()
 			if cp != 0 {
 				t.Fatalf("new currentPrimary = %d, want 0 (fresh start)", cp)
+			}
+			if newPrime != tc.wantNewPrime {
+				t.Fatalf("new primary = %q, want %q", newPrime, tc.wantNewPrime)
 			}
 			if rt != 0 {
 				t.Fatalf("new recoveryTarget = %d, want 0 (fresh start)", rt)
@@ -1083,4 +1104,37 @@ func TestFailoverReloadRollbackStaleProbeCannotClobberReplacement(t *testing.T) 
 	if afterReplacementFailed != beforeFailed+1 {
 		t.Fatalf("failed probes after replacement = %d, want %d", afterReplacementFailed, beforeFailed+1)
 	}
+}
+// TestFailoverReloadInvalidConfigLeavesOldControllerActive proves that an
+// invalid role resolution error during reload does not touch old controller
+// snapshot/timer state.
+func TestFailoverReloadInvalidConfigLeavesOldControllerActive(t *testing.T) {
+	recovery := baseReloadRecoveryConfig()
+	oldFC, _, oldSched, _, _, _ := reloadTestControllers(
+		t,
+		recovery,
+		recovery,
+		[]string{"A", "B", "C"},
+		[]string{"A", "B", "C"},
+		"fallback",
+		"fallback",
+	)
+	defer oldFC.Close()
+	option := testFailoverDialerOption()
+	a := newNamedDirectDialer(option, "A")
+	b := newNamedDirectDialer(option, "B")
+	set := &DialerSet{dialers: []*dialer.Dialer{a, b}}
+	before := oldFC.CaptureSnapshot()
+	beforePending := oldSched.PendingCount()
+
+	_, _, _, err := set.ResolveFailoverRoles(
+		exactNameFunction("A", "B"),
+		exactNameFunction("A"),
+		baseReloadRecoveryConfig(),
+	)
+	require.ErrorContains(t, err, "overlaps primary")
+
+	after := oldFC.CaptureSnapshot()
+	require.Equal(t, before, after)
+	require.Equal(t, beforePending, oldSched.PendingCount())
 }

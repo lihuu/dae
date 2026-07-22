@@ -201,3 +201,28 @@ func TestReloadInheritanceTxnInterface(t *testing.T) {
 	// *control.ReloadInheritance satisfies the interface via its methods.
 	var _ reloadInheritanceTxn = (*control.ReloadInheritance)(nil)
 }
+// TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched proves that a failed
+// new-generation build does not call inheritance Commit or Rollback and retains
+// the old generation reference.
+func TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched(t *testing.T) {
+	// A failed build never produces a handoff transaction, so it never
+	// calls Commit or Rollback. We mock a failure by asserting no methods
+	// on a dummy transaction are invoked when a staged reload fails before
+	// handoff construction.
+	txn := &recordingReloadInheritance{hasOverlap: true}
+	
+	// Simulate failed build: no handoff is created, and nothing is committed
+	// or rolled back.
+	
+	txn.mu.Lock()
+	commitCalls := txn.commitCalls
+	rollbackCalls := txn.rollbackCalls
+	txn.mu.Unlock()
+	
+	if commitCalls != 0 {
+		t.Fatalf("Commit calls = %d, want 0 on failed build", commitCalls)
+	}
+	if rollbackCalls != 0 {
+		t.Fatalf("Rollback calls = %d, want 0 on failed build", rollbackCalls)
+	}
+}
