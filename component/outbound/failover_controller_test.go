@@ -241,15 +241,6 @@ func TestFailoverController_CaptureRestoreSnapshot(t *testing.T) {
 	}
 }
 
-
-
-
-
-
-
-
-
-
 func runFailoverProbeNow(t *testing.T, fc *FailoverController) {
 	t.Helper()
 
@@ -366,10 +357,10 @@ func TestFailoverGroupActivatesPrimaryConnectivityCheck(t *testing.T) {
 		PrimaryCandidateIdxs: []int{0},
 		FallbackIdx:          1,
 		Recovery: FailoverRecoveryConfig{
-		ProbeInitial: time.Hour,
-		ProbeMax:     time.Hour,
-		Successes:    3,
-		StableTime:   time.Second,
+			ProbeInitial: time.Hour,
+			ProbeMax:     time.Hour,
+			Successes:    3,
+			StableTime:   time.Second,
 		},
 	}
 	group := NewDialerGroup(

@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/stretchr/testify/require"
 )
 

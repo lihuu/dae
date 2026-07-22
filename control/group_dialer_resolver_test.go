@@ -3,16 +3,16 @@ package control
 import (
 	"testing"
 
-	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
+	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/stretchr/testify/require"
 )
 
 func exactControlNameFunction(value string) *config_parser.Function {
 	return &config_parser.Function{
-		Name: "name",
+		Name:   "name",
 		Params: []*config_parser.Param{{Val: value}},
 	}
 }

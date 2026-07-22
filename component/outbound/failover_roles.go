@@ -3,8 +3,8 @@ package outbound
 import (
 	"fmt"
 
-	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 )
 
 // exactFailoverRoleNames extracts ordered dialer names from a failover role function.

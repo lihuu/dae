@@ -70,12 +70,12 @@ func newRotationIntegrationGroup(t *testing.T) (*DialerGroup, rotationTestNodes)
 		PrimaryCandidateIdxs: []int{2, 3, 1},
 		FallbackIdx:          0,
 		Recovery: FailoverRecoveryConfig{
-		ProbeInitial:     15 * time.Second,
-		ProbeMax:         5 * time.Minute,
-		Successes:        3,
-		StableTime:       30 * time.Second,
-		RotationAttempts: 5,
-	},
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        3,
+			StableTime:       30 * time.Second,
+			RotationAttempts: 5,
+		},
 	}
 	group := NewDialerGroup(
 		option,
@@ -127,12 +127,12 @@ func TestFailoverRotationStandbyIdle(t *testing.T) {
 		PrimaryCandidateIdxs: []int{2, 3, 1},
 		FallbackIdx:          0,
 		Recovery: FailoverRecoveryConfig{
-		ProbeInitial:     time.Hour,
-		ProbeMax:         time.Hour,
-		Successes:        3,
-		StableTime:       time.Second,
-		RotationAttempts: 5,
-	},
+			ProbeInitial:     time.Hour,
+			ProbeMax:         time.Hour,
+			Successes:        3,
+			StableTime:       time.Second,
+			RotationAttempts: 5,
+		},
 	}
 	group := NewDialerGroup(
 		option,
@@ -717,12 +717,12 @@ func newRotationIntegrationGroupPerNode(t *testing.T) (*DialerGroup, rotationTes
 		PrimaryCandidateIdxs: []int{2, 3, 1},
 		FallbackIdx:          0,
 		Recovery: FailoverRecoveryConfig{
-		ProbeInitial:     15 * time.Second,
-		ProbeMax:         5 * time.Minute,
-		Successes:        3,
-		StableTime:       30 * time.Second,
-		RotationAttempts: 5,
-	},
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        3,
+			StableTime:       30 * time.Second,
+			RotationAttempts: 5,
+		},
 	}
 	group := NewDialerGroup(
 		baseOption,

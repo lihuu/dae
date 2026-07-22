@@ -67,7 +67,7 @@ func buildControlPlaneFailoverGroup(t *testing.T, log *logrus.Logger, name strin
 	cfg := &outbound.FailoverConfig{
 		PrimaryCandidateIdxs: []int{2, 3, 1},
 		FallbackIdx:          0,
-		Recovery: controlFailoverRecoveryConfig(),
+		Recovery:             controlFailoverRecoveryConfig(),
 	}
 	group := outbound.NewDialerGroup(
 		option,

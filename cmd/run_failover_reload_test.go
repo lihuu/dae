@@ -204,6 +204,7 @@ func TestReloadInheritanceTxnInterface(t *testing.T) {
 	// *control.ReloadInheritance satisfies the interface via its methods.
 	var _ reloadInheritanceTxn = (*control.ReloadInheritance)(nil)
 }
+
 // TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched proves that a failed
 // new-generation build returns an error and a nil ControlPlane, ensuring that
 // no reload inheritance transaction is created or handoff initiated.
@@ -237,4 +238,3 @@ func TestFailedNewGenerationBuildLeavesOldControlPlaneUntouched(t *testing.T) {
 		t.Fatal("expected returned ControlPlane to be nil on build failure")
 	}
 }
-

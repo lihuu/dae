@@ -266,19 +266,19 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 			wantNewPrime: "A",
 		},
 		{
-			name: "primary_candidates_reordered",
-			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
-			newCands: []string{"B", "A", "C"},
-			newFallback: "fallback",
-			wantReason: "primary_candidates_changed",
+			name:         "primary_candidates_reordered",
+			modifyNew:    func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
+			newCands:     []string{"B", "A", "C"},
+			newFallback:  "fallback",
+			wantReason:   "primary_candidates_changed",
 			wantNewPrime: "B",
 		},
 		{
-			name: "primary_candidate_removed",
-			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
-			newCands: []string{"A", "C"},
-			newFallback: "fallback",
-			wantReason: "primary_candidates_changed",
+			name:         "primary_candidate_removed",
+			modifyNew:    func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
+			newCands:     []string{"A", "C"},
+			newFallback:  "fallback",
+			wantReason:   "primary_candidates_changed",
 			wantNewPrime: "A",
 		},
 	}
@@ -1105,6 +1105,7 @@ func TestFailoverReloadRollbackStaleProbeCannotClobberReplacement(t *testing.T) 
 		t.Fatalf("failed probes after replacement = %d, want %d", afterReplacementFailed, beforeFailed+1)
 	}
 }
+
 // TestFailoverReloadInvalidConfigLeavesOldControllerActive proves that an
 // invalid role resolution error during reload does not touch old controller
 // snapshot/timer state.
