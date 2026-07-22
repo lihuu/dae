@@ -15,6 +15,7 @@ import (
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
+	"github.com/stretchr/testify/require"
 )
 
 // fakeFailoverTimer is a fake failoverTimer produced by fakeFailoverScheduler.
@@ -174,7 +175,7 @@ func TestFailoverRotationFifthFailureAdvancesToB(t *testing.T) {
 		return false, nil
 	}
 
-	// Force the failure transition inline (Packet 4 wires real callbacks).
+	// Force the failure transition inline through the deterministic test seam.
 	fc.triggerPrimaryFailureForTest()
 
 	want := []struct {
@@ -306,9 +307,9 @@ func TestFailoverRotationCircularTargets(t *testing.T) {
 }
 
 // TestFailoverRotationProbeErrorMatchesFalseResult verifies that a non-cancellation
-// probe error is treated exactly like ok=false: it consumes one attempt from
-// the episode budget, clears confirmation state, advances the cursor, and
-// produces the same backoff as a plain false result.
+// probe error is treated exactly like ok=false: it consumes one consecutive
+// attempt for the current target, clears confirmation state, and produces the
+// same cursor and backoff result as a plain false result.
 func TestFailoverRotationProbeErrorMatchesFalseResult(t *testing.T) {
 	cfg := FailoverRecoveryConfig{
 		ProbeInitial:     15 * time.Second,
@@ -613,8 +614,9 @@ func findLogEntries(hook *logrustest.Hook, messages ...string) []*logrus.Entry {
 // primary_rotation_started and recovery_target_advanced logs. Both are
 // debug-level and carry group, failed_primary, from_target, to_target,
 // failed_attempts, and next_probe_in. failed_primary stays A across the whole
-// episode; failed_attempts increases monotonically; from_target/to_target
-// report the cursor edge; next_probe_in is the actual scheduled delay.
+// episode; failed_attempts is the exhausted per-target consecutive budget;
+// from_target/to_target report the cursor edge; next_probe_in is the actual
+// scheduled delay.
 func TestFailoverRotationStructuredLogs(t *testing.T) {
 	logger, hook := logrustest.NewNullLogger()
 	logger.SetLevel(logrus.DebugLevel)
@@ -943,6 +945,73 @@ func TestFailoverRotationUsesPerCandidateConsecutiveBudget(t *testing.T) {
 	}
 }
 
+func TestFailoverRotationFiveConsecutiveFailuresPerCandidate(t *testing.T) {
+	cfg := FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+	fc, sched, candidates, fallback := newRotationControllerTest(t, cfg)
+	defer fc.Close()
+
+	type probeResult struct {
+		target *dialer.Dialer
+		ok     bool
+	}
+	results := []probeResult{
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[0], ok: true},
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[0]},
+		{target: candidates[1]},
+		{target: candidates[1]},
+		{target: candidates[1]},
+		{target: candidates[1]},
+		{target: candidates[1]},
+	}
+	wantTargets := []string{
+		"A", "A", "A", "A", "A",
+		"A", "A", "A", "A", "B",
+		"B", "B", "B", "B", "C",
+	}
+	wantFailures := []int{
+		1, 2, 3, 4, 0,
+		1, 2, 3, 4, 0,
+		1, 2, 3, 4, 0,
+	}
+
+	next := 0
+	fc.probeTargetTCP = func(_ context.Context, target *dialer.Dialer) (bool, error) {
+		result := results[next]
+		next++
+		require.Same(t, result.target, target)
+		return result.ok, nil
+	}
+	fc.triggerPrimaryFailureForTest()
+
+	for i := range results {
+		sched.FireNext(t)
+		fc.mu.Lock()
+		target := fc.recoveryTargetNameLocked()
+		failures := fc.failedRecoveryProbes
+		fc.mu.Unlock()
+		require.Equalf(t, wantTargets[i], target, "probe %d recovery target", i+1)
+		require.Equalf(t, wantFailures[i], failures, "probe %d consecutive failures", i+1)
+		active, usingFallback := fc.ActiveDialer()
+		require.Same(t, fallback, active)
+		require.True(t, usingFallback)
+	}
+	require.Equal(t, len(results), next)
+}
+
 func TestFailoverRotationCandidateCountAndZeroThreshold(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1001,6 +1070,90 @@ func TestFailoverRotationCandidateCountAndZeroThreshold(t *testing.T) {
 			if fc.failedRecoveryProbes != tt.wantFailures {
 				t.Fatalf("failedRecoveryProbes = %d, want %d", fc.failedRecoveryProbes, tt.wantFailures)
 			}
+		})
+	}
+}
+
+func TestFailoverRotationZeroThresholdStillRecovers(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+	}{
+		{name: "one candidate", candidates: []string{"A"}},
+		{name: "three candidates", candidates: []string{"A", "B", "C"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := FailoverRecoveryConfig{
+				ProbeInitial:     15 * time.Second,
+				ProbeMax:         5 * time.Minute,
+				Successes:        2,
+				StableTime:       15 * time.Second,
+				RotationAttempts: 0,
+			}
+			option := testFailoverDialerOption()
+			primaryCandidates := make([]*dialer.Dialer, 0, len(tt.candidates))
+			for _, name := range tt.candidates {
+				primaryCandidates = append(primaryCandidates, newNamedDirectDialer(option, name))
+			}
+			fallback := newNamedDirectDialer(option, "fallback")
+			fc := NewFailoverControllerWithCandidates(log, "zero-threshold", primaryCandidates, fallback, cfg)
+			sched := newFakeFailoverScheduler()
+			fc.scheduler = sched
+			defer fc.Close()
+
+			results := []bool{false, false, false, false, false, false, true, true}
+			next := 0
+			fc.probeTargetTCP = func(_ context.Context, target *dialer.Dialer) (bool, error) {
+				require.Same(t, primaryCandidates[0], target)
+				result := results[next]
+				next++
+				return result, nil
+			}
+			fc.triggerPrimaryFailureForTest()
+
+			for range 6 {
+				sched.FireNext(t)
+				fc.mu.Lock()
+				recoveryTarget := fc.recoveryTarget
+				fc.mu.Unlock()
+				require.Zero(t, recoveryTarget)
+				active, usingFallback := fc.ActiveDialer()
+				require.Same(t, fallback, active)
+				require.True(t, usingFallback)
+				require.Equal(t, 1, sched.PendingCount())
+			}
+			require.Len(t, sched.history, 7)
+			wantFailureSchedule := []time.Duration{
+				15 * time.Second,
+				30 * time.Second,
+				1 * time.Minute,
+				2 * time.Minute,
+				4 * time.Minute,
+				5 * time.Minute,
+				5 * time.Minute,
+			}
+			previous := time.Unix(0, 0)
+			for i, deadline := range sched.history {
+				require.Equalf(t, wantFailureSchedule[i], deadline.Sub(previous), "scheduled delay %d", i+1)
+				previous = deadline
+			}
+
+			sched.FireNext(t)
+			active, usingFallback := fc.ActiveDialer()
+			require.Same(t, fallback, active, "partial confirmation must keep fallback active")
+			require.True(t, usingFallback)
+			require.Equal(t, 1, sched.PendingCount())
+			require.Len(t, sched.history, 8)
+			require.Equal(t, cfg.ProbeInitial, sched.history[7].Sub(sched.history[6]))
+
+			sched.FireNext(t)
+			active, usingFallback = fc.ActiveDialer()
+			require.Same(t, primaryCandidates[0], active)
+			require.False(t, usingFallback)
+			require.Equal(t, len(results), next)
+			require.Zero(t, sched.PendingCount())
 		})
 	}
 }

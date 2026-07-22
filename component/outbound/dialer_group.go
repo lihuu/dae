@@ -57,8 +57,8 @@ type DialerGroup struct {
 
 	// failoverController is non-nil only for failover policy groups.
 	failoverController *FailoverController
-	// failoverCfg maps role indices (0=primary, 1=fallback) to actual dialer
-	// indices. Non-nil only for failover policy groups.
+	// failoverCfg maps the ordered Primary candidates and fixed Fallback role to
+	// actual dialer indices. Non-nil only for failover policy groups.
 	failoverCfg *FailoverConfig
 }
 
@@ -94,7 +94,7 @@ func NewDialerGroup(
 	if p.Policy == consts.DialerSelectionPolicy_Failover && failoverCfg != nil {
 		// Failover policy: use the failover controller instead of AliveDialerSet.
 		group.failoverCfg = failoverCfg
-		// Map PrimaryCandidateIdxs to dialer pointers in sorted-priority order.
+		// Map PrimaryCandidateIdxs to dialer pointers in configured role order.
 		primaryCandidates := make([]*dialer.Dialer, 0, len(failoverCfg.PrimaryCandidateIdxs))
 		for _, idx := range failoverCfg.PrimaryCandidateIdxs {
 			primaryCandidates = append(primaryCandidates, dialers[idx])
@@ -199,7 +199,7 @@ func (g *DialerGroup) RestoreFailoverSnapshot(snap *FailoverControllerSnapshot) 
 // state; the reason string is empty. On incompatibility the returned transfer
 // is nil and the reason is the deterministic reset reason
 // (fallback_changed > primary_candidates_changed > recovery_policy_changed);
-// this group's controller stays at its fresh priority-0 initial primary and
+// this group's controller stays at its fresh primary[0] initial candidate and
 // the info-level failover_rotation_state_reset log has already been emitted by
 // the controller.
 //
@@ -497,8 +497,8 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 		if excluded != nil && d == excluded {
 			if !usingFallback {
 				// Active primary is excluded — fall through to the fixed
-				// fallback. Rotation to a standby candidate is a recovery
-				// concern (Packet 3) and must not happen on the hot path.
+				// fallback. Rotation to another Primary is a recovery concern
+				// and must not happen on the hot path.
 				fallback := g.Dialers[g.failoverCfg.FallbackIdx]
 				if fallback != nil && fallback != excluded {
 					return fallback, 0, preferAlternateSelectionNetworkType(fallback, networkType), nil

@@ -273,7 +273,7 @@ func (fc *FailoverController) recoveryTargetNameLocked() string {
 // generation. On incompatibility it returns (nil, reason) and the caller
 // (DialerGroup.PrepareFailoverReloadFrom / ControlPlane) emits the
 // failover_rotation_state_reset info log; the new controller stays at its
-// fresh priority-0 initial primary.
+// fresh primary[0] initial candidate.
 //
 // Compatibility is checked before the old controller is paused. An
 // incompatible replacement returns without changing the old timer, generation,

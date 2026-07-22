@@ -403,6 +403,110 @@ func TestFailoverReloadIdentityMismatchLeavesOldRecoveryRunning(t *testing.T) {
 	}
 }
 
+// TestFailoverReloadIdentityMismatchLeavesOldInFlightProbeOwned proves the
+// stronger incompatible-reload boundary: if the old controller is already
+// probing when identity comparison runs, the comparison neither cancels nor
+// detaches that probe. Its eventual result remains authoritative for the old
+// generation, and normal recovery scheduling continues from it.
+func TestFailoverReloadIdentityMismatchLeavesOldInFlightProbeOwned(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	newRecovery := baseReloadRecoveryConfig()
+	oldFC, newFC, oldSched, newSched, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C", "D"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+	probeDone := make(chan struct{})
+
+	oldFC.mu.Lock()
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		close(probeStarted)
+		select {
+		case <-probeRelease:
+			return false, errors.New("expected probe failure")
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+
+	var pendingTimer *fakeFailoverTimer
+	var pendingAt time.Time
+	for _, call := range oldSched.pending {
+		if !call.timer.stopped {
+			pendingTimer = call.timer
+			pendingAt = call.at
+			break
+		}
+	}
+	if pendingTimer == nil {
+		oldFC.mu.Unlock()
+		t.Fatal("no pending failover timer to drive probe into flight")
+	}
+	if pendingAt.After(oldSched.now) {
+		oldSched.now = pendingAt
+	}
+	pendingTimer.stopped = true
+	beforeGeneration := oldFC.generation
+	oldFC.mu.Unlock()
+
+	go func() {
+		pendingTimer.fn()
+		close(probeDone)
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old probe did not start in time")
+	}
+
+	oldFC.mu.Lock()
+	beforeFailed := oldFC.failedRecoveryProbes
+	beforeTarget := oldFC.recoveryTarget
+	beforeRun := oldFC.activeProbe
+	beforeInFlight := oldFC.probeInFlight
+	beforeHasCancel := oldFC.probeCancel != nil
+	oldFC.mu.Unlock()
+	require.True(t, beforeInFlight)
+	require.True(t, beforeHasCancel)
+	require.NotNil(t, beforeRun)
+
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	require.Nil(t, transfer)
+	require.Equal(t, "primary_candidates_changed", reason)
+
+	oldFC.mu.Lock()
+	require.Equal(t, beforeGeneration, oldFC.generation)
+	require.Equal(t, beforeFailed, oldFC.failedRecoveryProbes)
+	require.Equal(t, beforeTarget, oldFC.recoveryTarget)
+	require.Same(t, beforeRun, oldFC.activeProbe)
+	require.True(t, oldFC.probeInFlight)
+	require.NotNil(t, oldFC.probeCancel)
+	oldFC.mu.Unlock()
+	require.Equal(t, 0, newSched.PendingCount(), "incompatible replacement must stay fresh")
+
+	close(probeRelease)
+	select {
+	case <-probeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old in-flight probe did not finish in time")
+	}
+
+	oldFC.mu.Lock()
+	require.Equal(t, beforeFailed+1, oldFC.failedRecoveryProbes)
+	require.Equal(t, beforeTarget, oldFC.recoveryTarget)
+	require.False(t, oldFC.probeInFlight)
+	require.Nil(t, oldFC.activeProbe)
+	require.Nil(t, oldFC.probeCancel)
+	oldFC.mu.Unlock()
+	require.Equal(t, 1, oldSched.PendingCount(), "old controller must schedule its next probe")
+}
+
 // TestFailoverReloadResetReasonPrecedence proves that when multiple identity
 // categories change in one reload, the reason follows the precedence
 // fallback_changed > primary_candidates_changed > recovery_policy_changed.
@@ -698,11 +802,11 @@ func TestFailoverReloadRollbackResumesOldProbe(t *testing.T) {
 	oldSched.FireNext(t)
 }
 
-// TestFailoverReloadFreshRestartStartsAtPriorityZero proves that a fresh
+// TestFailoverReloadFreshRestartStartsAtFirstPrimary proves that a fresh
 // controller built from the same configuration WITHOUT a snapshot starts at
-// index 0 (A) with zero failure count, no rotation, and that no file/config
+// primary[0] (A) with zero failure count, no rotation, and that no file/config
 // write occurs. This covers the process-restart non-persistence requirement.
-func TestFailoverReloadFreshRestartStartsAtPriorityZero(t *testing.T) {
+func TestFailoverReloadFreshRestartStartsAtFirstPrimary(t *testing.T) {
 	oldRecovery := baseReloadRecoveryConfig()
 	newRecovery := baseReloadRecoveryConfig()
 	option := testFailoverDialerOption()
@@ -1138,4 +1242,13 @@ func TestFailoverReloadInvalidConfigLeavesOldControllerActive(t *testing.T) {
 	after := oldFC.CaptureSnapshot()
 	require.Equal(t, before, after)
 	require.Equal(t, beforePending, oldSched.PendingCount())
+
+	// The invalid replacement never entered transfer preparation, so the old
+	// controller must still own and execute its timer, not merely retain a
+	// snapshot that looks unchanged.
+	oldSched.FireNext(t)
+	continued := oldFC.CaptureSnapshot()
+	require.Equal(t, before.FailedRecoveryProbes+1, continued.FailedRecoveryProbes)
+	require.Equal(t, before.RecoveryTargetName, continued.RecoveryTargetName)
+	require.Equal(t, 1, oldSched.PendingCount())
 }

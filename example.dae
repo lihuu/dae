@@ -487,7 +487,7 @@ routing {
     # DNS-layer reject in dns.routing.request is independent from this outbound.
     # domain(full: blocked.example.com) -> reject
 
-    # Example main-routing rule for the priority failover group above.
+    # Example main-routing rule for the explicit-role failover group above.
     # If dns.fakeip is enabled, pair this with:
     #   dns.routing.request: routing_outbound(proxy_failover) -> fakeip
     # domain(suffix: example.com) -> proxy_failover

@@ -1554,7 +1554,7 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) *ReloadIn
 		// Inherit failover rotation state through the transactional transfer.
 		// On a compatible reload the transfer pauses the old generation and
 		// restores this group's controller; on an incompatible reload the new
-		// controller stays at its fresh priority-0 initial primary and the
+		// controller stays at its fresh primary[0] initial candidate and the
 		// info-level failover_rotation_state_reset log has already been emitted
 		// by the controller. The transfer is aggregated so the cmd reload path
 		// can Commit/Rollback all groups together.

@@ -94,24 +94,23 @@ type FailoverRecoveryConfig struct {
 }
 
 // FailoverController manages the failover state machine for a DialerGroup.
-// It observes the primary dialer's TCP health transitions and drives recovery
-// probing with exponential backoff.
+// It observes each configured Primary's TCP health transitions and drives
+// recovery probing with exponential backoff.
 type FailoverController struct {
 	log       *logrus.Logger
 	groupName string
 
-	// primaryCandidates is the ordered list of primary candidates, sorted by
-	// numeric priority ascending. Index 0 is the initial current primary.
+	// primaryCandidates is the ordered list of exact Primary names from the
+	// configuration. Index 0 is the initial current Primary.
 	primaryCandidates []*dialer.Dialer
 	// currentPrimary is the index into primaryCandidates of the dialer that
 	// serves new traffic during normal operation. Initialized to 0 on a fresh
-	// controller. Rotation advances this index (Packet 3).
+	// controller. A confirmed recovery promotion advances this index.
 	currentPrimary int
 	// recoveryTarget is the index into primaryCandidates of the dialer the
 	// recovery probe is currently targeting. Before rotation activates it is
 	// the failed current primary; after rotation it advances through the
-	// candidates. Initialized to 0 on a fresh controller (Packet 3 drives the
-	// actual advancement).
+	// candidates. Initialized to 0 on a fresh controller.
 	recoveryTarget int
 	fallback       *dialer.Dialer
 	config         FailoverRecoveryConfig
@@ -148,16 +147,12 @@ type FailoverController struct {
 	activeProbe       *failoverProbeRun  // logical owner; stale physical probes may still be returning
 	generation        uint64             // incremented on close/reload to invalidate stale callbacks
 
-	// rotationActive is true once failedRecoveryProbes has reached
-	// config.RotationAttempts and the recoveryTarget has begun advancing
-	// through the ordered primary candidates. Before that, failed probes
-	// keep targeting the failed current primary.
+	// rotationActive is true once the current recovery target has exhausted its
+	// consecutive-failure budget and recoveryTarget has begun advancing through
+	// the ordered Primary candidates.
 	rotationActive bool
-	// failedRecoveryProbes is the monotonically increasing total failed
-	// recovery-probe count during the current failover episode. A successful
-	// probe does NOT reset it. It resets only when a candidate completes
-	// stable recovery and is promoted, or on a fresh controller without an
-	// inherited snapshot.
+	// failedRecoveryProbes counts consecutive failed recovery probes for the
+	// current recoveryTarget. A successful probe or target advancement resets it.
 	failedRecoveryProbes int
 	// failedPrimaryName is the name of the primary that triggered the current
 	// failover episode. It is recorded when startFailureTransitionLocked runs
@@ -187,12 +182,9 @@ type FailoverController struct {
 // NewFailoverControllerWithCandidates creates a failover controller with an
 // ordered list of primary candidates and a fixed fallback. The first candidate
 // (primaryCandidates[0]) is the initial current primary. The remaining
-// candidates are standby primaries reserved for rotation (Packet 3).
+// candidates are standby Primaries reserved for rotation.
 //
-// This constructor stores the structural fields only; it does not wire rotation
-// state-machine logic or standby health callbacks. The current Primary's TCP
-// health transition callback is registered so the existing failover transition
-// continues to fire.
+// The same controller and state machine handle both one and many candidates.
 func NewFailoverControllerWithCandidates(
 	log *logrus.Logger,
 	groupName string,
@@ -372,8 +364,8 @@ func (fc *FailoverController) onCandidateHealthChange(candidate int, networkType
 // primary: selects the fixed fallback for new traffic, sets recoveryTarget to
 // the failed current primary, resets rotationActive and failedRecoveryProbes,
 // resets the backoff, schedules the first probe, and emits failover_switch.
-// Must hold mu. Called from the production health callback (Packet 4 wires
-// that to candidate transitions) and the test seam triggerPrimaryFailureForTest.
+// Must hold mu. Called from the production candidate health callback and the
+// deterministic test seam triggerPrimaryFailureForTest.
 func (fc *FailoverController) startFailureTransitionLocked(trigger string) {
 	fc.failedPrimaryName = dialerName(fc.primaryDialer())
 
@@ -411,9 +403,8 @@ func (fc *FailoverController) startFailureTransitionLocked(trigger string) {
 
 // triggerPrimaryFailureForTest is a test-only seam that performs the Failure
 // Transition inline against the current primary without going through the
-// alive-transition callback machinery. Packet 4 wires the real health
-// callbacks; this method exists so the rotation state machine (Packet 3) can
-// be exercised deterministically before that wiring exists. Do NOT call from
+// alive-transition callback machinery. It exists so the complete rotation
+// state machine can be exercised deterministically. Do NOT call from
 // production code.
 func (fc *FailoverController) triggerPrimaryFailureForTest() {
 	fc.mu.Lock()
@@ -564,8 +555,8 @@ func (fc *FailoverController) probeTarget(ctx context.Context, d *dialer.Dialer)
 // recovery_probe_initial (NOT doubled). Promotion requires both
 // recovery_successes consecutive successes AND recovery_stable_time elapsed
 // since the first success. The attempt threshold never interrupts a target
-// producing successes; only failed probes consume the budget. A success does
-// NOT erase earlier failures (failedRecoveryProbes is unchanged).
+// producing successes; only failed probes consume the budget. A success resets
+// the current target's consecutive failure count.
 func (fc *FailoverController) onProbeSuccessLocked() {
 	fc.failedRecoveryProbes = 0
 	fc.recoverySuccesses++
@@ -654,16 +645,13 @@ func (fc *FailoverController) promoteRecoveryTargetLocked() {
 // onProbeFailureLocked handles a failed recovery probe for the current
 // recoveryTarget. Must hold mu.
 //
-// A failed probe (ok=false or a non-cancellation error) consumes one attempt
-// from the episode budget: it increments failedRecoveryProbes, clears the
-// current target's successes and stableSince, doubles the backoff (capped at
-// ProbeMax), and — if rotation is already active — advances recoveryTarget to
-// the next candidate circularly. If rotation is not yet active and the
-// configured RotationAttempts threshold has been reached, rotation activates
-// and recoveryTarget advances to the next candidate after currentPrimary; in
-// that case primary_rotation_started is emitted. On every later cursor edge
-// recovery_target_advanced is emitted. A success never erased earlier
-// failures, so reaching the threshold necessarily follows a failed probe.
+// A failed probe (ok=false or a non-cancellation error) increments the current
+// target's consecutive failure count, clears confirmation state, and doubles
+// the backoff (capped at ProbeMax). When a positive RotationAttempts threshold
+// is reached, recoveryTarget advances circularly and the consecutive count is
+// reset. The first advance emits primary_rotation_started; later advances emit
+// recovery_target_advanced. A success resets the consecutive count without
+// promoting the target until recovery confirmation completes.
 func (fc *FailoverController) onProbeFailureLocked() {
 	fc.failedRecoveryProbes++
 	failedAttempts := fc.failedRecoveryProbes
@@ -672,8 +660,8 @@ func (fc *FailoverController) onProbeFailureLocked() {
 
 	// Capture the cursor edge for the structured rotation logs. fromTarget is
 	// the target whose probe just failed; toTarget is the next target the
-	// cursor will advance to. For the threshold transition, fromTarget is the
-	// failed current primary and toTarget is the first standby candidate.
+	// cursor will advance to. For the first threshold transition, fromTarget is
+	// the failed current Primary and toTarget is the next configured Primary.
 	fromTargetIdx := fc.recoveryTarget
 	fromTargetName := dialerName(fc.recoveryTargetDialer())
 

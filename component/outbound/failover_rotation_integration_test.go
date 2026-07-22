@@ -50,11 +50,11 @@ func newNamedDirectDialer(option *dialer.GlobalOption, name string) *dialer.Dial
 	return d
 }
 
-// newRotationIntegrationGroup builds a rotation-enabled DialerGroup with
-// dialers shuffled into the order [fallback, C, A, B] and priorities
-// [1, 3, 0, 2]. This verifies that PrimaryCandidateIdxs is sorted by numeric
-// priority (A=0, B=2, C=3) and that the fallback (fallback) is independent
-// of slice position.
+// newRotationIntegrationGroup builds a rotation-enabled DialerGroup with the
+// dialer pool shuffled into [fallback, C, A, B] while the explicit Primary
+// candidate indexes preserve the configured order [A, B, C]. This verifies
+// that role order is independent of dialer-pool position and that Fallback is
+// a separate fixed role.
 func newRotationIntegrationGroup(t *testing.T) (*DialerGroup, rotationTestNodes) {
 	t.Helper()
 	option := testFailoverDialerOption()
@@ -177,9 +177,8 @@ func installRotationTestScheduler(group *DialerGroup) *fakeFailoverScheduler {
 	return scheduler
 }
 
-// triggerCandidateHealth dispatches a candidate alive-transition callback as
-// if the candidate's TCP health had changed. It is the identity-aware entry
-// point added in Packet 4.
+// triggerCandidateHealth dispatches the production candidate-aware callback
+// as if the candidate's TCP health had changed.
 func triggerCandidateHealth(group *DialerGroup, candidate int, networkType *dialer.NetworkType, alive bool) {
 	group.failoverController.onCandidateHealthChange(candidate, networkType, alive)
 }
@@ -233,8 +232,8 @@ func TestFailoverRotationPromotedBIsSticky(t *testing.T) {
 	group, nodes := newRotationIntegrationGroup(t)
 	scheduler := installRotationTestScheduler(group)
 
-	// A's TCP transition to unavailable triggers failover. B is the first
-	// standby candidate; five failed A probes activate rotation and advance
+	// A's TCP transition to unavailable triggers failover. B is the next
+	// configured Primary; five failed A probes activate rotation and advance
 	// the cursor to B, then three B successes at 15s cadence promote B.
 	triggerCandidateHealth(group, 0, TestNetworkType, false)
 	driveProbeResults(t, group, scheduler,
@@ -492,7 +491,7 @@ func TestFailoverRotationIntegrationAtoBRecovery(t *testing.T) {
 	assertTCPAndUDPSelected(t, group, nodes.B)
 
 	// B future failure immediately selects the same fixed Fallback. The
-	// controller does not scan standby candidates on the hot path; it
+	// controller does not scan other Primaries on the hot path; it
 	// selects the fixed Fallback and begins a fresh recovery episode.
 	triggerCandidateHealth(group, 1, TestNetworkType, false)
 	assertTCPAndUDPSelected(t, group, nodes.Fallback)
