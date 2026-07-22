@@ -63,15 +63,11 @@ func buildControlPlaneFailoverGroup(t *testing.T, log *logrus.Logger, name strin
 	c := controlPlaneFailoverReloadTestDialer(log, "C")
 	fallback := controlPlaneFailoverReloadTestDialer(log, "fallback")
 	dialers := []*dialer.Dialer{fallback, c, a, b}
-	annotations := []*dialer.Annotation{
-		{Priority: 1},
-		{Priority: 3},
-		{Priority: 0},
-		{Priority: 2},
-	}
-	cfg, err := outbound.ValidateFailoverGroup(dialers, annotations, controlFailoverRecoveryConfig())
-	if err != nil {
-		t.Fatalf("ValidateFailoverGroup failed: %v", err)
+	annotations := []*dialer.Annotation{{}, {}, {}, {}}
+	cfg := &outbound.FailoverConfig{
+		PrimaryCandidateIdxs: []int{2, 3, 1},
+		FallbackIdx:          0,
+		Recovery: controlFailoverRecoveryConfig(),
 	}
 	group := outbound.NewDialerGroup(
 		option,

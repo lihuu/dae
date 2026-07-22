@@ -64,8 +64,8 @@ routing {
 }
 group {
   proxy_failover {
-    filter: name(node1) [priority: 0]
-    filter: name(node2) [priority: 1]
+    primary: name(node1)
+    fallback: name(node2)
     policy: failover
     failover_notify: webhook
   }
@@ -87,8 +87,8 @@ routing {
 }
 group {
   proxy_failover {
-    filter: name(node1) [priority: 0]
-    filter: name(node2) [priority: 1]
+    primary: name(node1)
+    fallback: name(node2)
     policy: failover
     failover_notify: bark
     failover_notify_bark_url: "https://api.day.app/TOKEN/"
@@ -108,8 +108,8 @@ routing {
 }
 group {
   proxy_failover {
-    filter: name(node1) [priority: 0]
-    filter: name(node2) [priority: 1]
+    primary: name(node1)
+    fallback: name(node2)
     policy: failover
   }
 }

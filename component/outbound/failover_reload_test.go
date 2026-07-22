@@ -181,7 +181,7 @@ func TestFailoverReloadSnapshotCompatiblePreservesRotation(t *testing.T) {
 
 // TestFailoverReloadSnapshotResetsOnIdentityChange table-tests each
 // one-at-a-time identity change and asserts the deterministic reset reason and
-// that the new controller starts fresh at priority 0 (A) with no rotation.
+// that the new controller starts fresh at index 0 (A) with no rotation.
 func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 	type changeCase struct {
 		name         string
@@ -286,7 +286,7 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 				t.Fatalf("reset reason = %q, want %q", reason, tc.wantReason)
 			}
 
-			// The new controller must start fresh at priority 0 (A), no rotation.
+			// The new controller must start fresh at index 0 (A), no rotation.
 			newFC.mu.Lock()
 			cp := newFC.currentPrimary
 			rt := newFC.recoveryTarget
@@ -677,7 +677,7 @@ func TestFailoverReloadRollbackResumesOldProbe(t *testing.T) {
 
 // TestFailoverReloadFreshRestartStartsAtPriorityZero proves that a fresh
 // controller built from the same configuration WITHOUT a snapshot starts at
-// priority 0 (A) with zero failure count, no rotation, and that no file/config
+// index 0 (A) with zero failure count, no rotation, and that no file/config
 // write occurs. This covers the process-restart non-persistence requirement.
 func TestFailoverReloadFreshRestartStartsAtPriorityZero(t *testing.T) {
 	oldRecovery := baseReloadRecoveryConfig()
@@ -731,7 +731,7 @@ func TestFailoverReloadFreshRestartStartsAtPriorityZero(t *testing.T) {
 	}
 
 	// Build a fresh new controller WITHOUT calling prepareReloadTransfer
-	// (simulating a process restart). It must start at A (priority 0).
+	// (simulating a process restart). It must start at A (index 0).
 	newFC.mu.Lock()
 	freshCurrentPrimary := newFC.currentPrimary
 	freshFailed := newFC.failedRecoveryProbes

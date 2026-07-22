@@ -767,10 +767,10 @@ func newControlPlaneWithContextOptions(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create group %v: %w", group.Name, err)
 		}
-		// Filter nodes with user given filters.
-		dialers, annos, err := dialerSet.FilterAndAnnotate(group.Filter, group.FilterAnnotation)
+		// Resolve dialers and failover config if applicable.
+		dialers, annos, failoverCfg, err := resolveConfiguredGroupDialers(dialerSet, group, *policy)
 		if err != nil {
-			return nil, fmt.Errorf(`failed to create group "%v": %w`, group.Name, err)
+			return nil, err
 		}
 		// Convert node links to dialers.
 		if log.IsLevelEnabled(logrus.DebugLevel) {
@@ -797,21 +797,9 @@ func newControlPlaneWithContextOptions(
 			finalOption = groupOption
 		}
 		// Create dialer group and append it to outbounds.
-		var failoverCfg *outbound.FailoverConfig
 		var eventCb outbound.FailoverEventCallback
 		var eventCbClose func()
 		if policy.Policy == consts.DialerSelectionPolicy_Failover {
-			recovery := outbound.FailoverRecoveryConfig{
-				ProbeInitial:     group.RecoveryProbeInitial,
-				ProbeMax:         group.RecoveryProbeMax,
-				Successes:        group.RecoverySuccesses,
-				StableTime:       group.RecoveryStableTime,
-				RotationAttempts: group.PrimaryRotationAttempts,
-			}
-			failoverCfg, err = outbound.ValidateFailoverGroup(dialers, annos, recovery)
-			if err != nil {
-				return nil, fmt.Errorf(`failed to create group "%v": %w`, group.Name, err)
-			}
 			// Build the failover event callback (Bark notifier + dispatcher).
 			// Returns (nil, nil) when notifications are disabled; in that case
 			// nothing is registered and DAE continues normally.

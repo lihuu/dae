@@ -53,7 +53,7 @@ func newNamedDirectDialer(option *dialer.GlobalOption, name string) *dialer.Dial
 // newRotationIntegrationGroup builds a rotation-enabled DialerGroup with
 // dialers shuffled into the order [fallback, C, A, B] and priorities
 // [1, 3, 0, 2]. This verifies that PrimaryCandidateIdxs is sorted by numeric
-// priority (A=0, B=2, C=3) and that the fallback (priority 1) is independent
+// priority (A=0, B=2, C=3) and that the fallback (fallback) is independent
 // of slice position.
 func newRotationIntegrationGroup(t *testing.T) (*DialerGroup, rotationTestNodes) {
 	t.Helper()
@@ -65,21 +65,17 @@ func newRotationIntegrationGroup(t *testing.T) (*DialerGroup, rotationTestNodes)
 		Fallback: newNamedDirectDialer(option, "fallback"),
 	}
 	dialers := []*dialer.Dialer{nodes.Fallback, nodes.C, nodes.A, nodes.B}
-	annotations := []*dialer.Annotation{
-		{Priority: 1}, // Fallback
-		{Priority: 3}, // C
-		{Priority: 0}, // A
-		{Priority: 2}, // B
-	}
-	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+	annotations := []*dialer.Annotation{{}, {}, {}, {}}
+	cfg := &FailoverConfig{
+		PrimaryCandidateIdxs: []int{2, 3, 1},
+		FallbackIdx:          0,
+		Recovery: FailoverRecoveryConfig{
 		ProbeInitial:     15 * time.Second,
 		ProbeMax:         5 * time.Minute,
 		Successes:        3,
 		StableTime:       30 * time.Second,
 		RotationAttempts: 5,
-	})
-	if err != nil {
-		t.Fatalf("ValidateFailoverGroup failed: %v", err)
+	},
 	}
 	group := NewDialerGroup(
 		option,
@@ -95,7 +91,7 @@ func newRotationIntegrationGroup(t *testing.T) (*DialerGroup, rotationTestNodes)
 }
 
 // TestFailoverRotationInitialSelectionAndExclusion verifies the atomic hot
-// path selects the initial current Primary (A, priority 0) and that excluding
+// path selects the initial current Primary (A, index 0) and that excluding
 // the active primary falls through to the fixed fallback (not another
 // candidate — rotation is a recovery concern, not a hot-path concern).
 func TestFailoverRotationInitialSelectionAndExclusion(t *testing.T) {
@@ -126,21 +122,17 @@ func TestFailoverRotationStandbyIdle(t *testing.T) {
 		Fallback: newNamedDirectDialer(option, "fallback"),
 	}
 	dialers := []*dialer.Dialer{nodes.Fallback, nodes.C, nodes.A, nodes.B}
-	annotations := []*dialer.Annotation{
-		{Priority: 1},
-		{Priority: 3},
-		{Priority: 0},
-		{Priority: 2},
-	}
-	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+	annotations := []*dialer.Annotation{{}, {}, {}, {}}
+	cfg := &FailoverConfig{
+		PrimaryCandidateIdxs: []int{2, 3, 1},
+		FallbackIdx:          0,
+		Recovery: FailoverRecoveryConfig{
 		ProbeInitial:     time.Hour,
 		ProbeMax:         time.Hour,
 		Successes:        3,
 		StableTime:       time.Second,
 		RotationAttempts: 5,
-	})
-	if err != nil {
-		t.Fatalf("ValidateFailoverGroup failed: %v", err)
+	},
 	}
 	group := NewDialerGroup(
 		option,
@@ -436,7 +428,7 @@ func TestFailoverRotationIntegrationAtoBRecovery(t *testing.T) {
 	group, nodes := newRotationIntegrationGroup(t)
 	scheduler := installRotationTestScheduler(group)
 
-	// Initial state: A (priority 0) is the current primary.
+	// Initial state: A (index 0) is the current primary.
 	assertTCPAndUDPSelected(t, group, nodes.A)
 
 	// A TCP unavailable triggers the failure transition. The fixed Fallback
@@ -721,21 +713,17 @@ func newRotationIntegrationGroupPerNode(t *testing.T) (*DialerGroup, rotationTes
 		Fallback: newNamedDirectDialerWithCheck(baseOption, "fallback", srvFallback.URL),
 	}
 	dialers := []*dialer.Dialer{nodes.Fallback, nodes.C, nodes.A, nodes.B}
-	annotations := []*dialer.Annotation{
-		{Priority: 1}, // Fallback
-		{Priority: 3}, // C
-		{Priority: 0}, // A
-		{Priority: 2}, // B
-	}
-	cfg, err := ValidateFailoverGroup(dialers, annotations, FailoverRecoveryConfig{
+	annotations := []*dialer.Annotation{{}, {}, {}, {}}
+	cfg := &FailoverConfig{
+		PrimaryCandidateIdxs: []int{2, 3, 1},
+		FallbackIdx:          0,
+		Recovery: FailoverRecoveryConfig{
 		ProbeInitial:     15 * time.Second,
 		ProbeMax:         5 * time.Minute,
 		Successes:        3,
 		StableTime:       30 * time.Second,
 		RotationAttempts: 5,
-	})
-	if err != nil {
-		t.Fatalf("ValidateFailoverGroup failed: %v", err)
+	},
 	}
 	group := NewDialerGroup(
 		baseOption,

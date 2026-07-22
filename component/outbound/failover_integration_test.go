@@ -134,10 +134,7 @@ func newIntegrationGroup(t *testing.T) *integrationGroup {
 	fallbackProp.Name = "fallback-node"
 	fallback := dialer.NewDialer(fallbackUnderlay, option, dialer.InstanceOption{DisableCheck: true}, fallbackProp)
 
-	annotations := []*dialer.Annotation{
-		{Priority: 0}, // primary
-		{Priority: 1}, // fallback
-	}
+	annotations := []*dialer.Annotation{{}, {}}
 
 	recoveryConfig := FailoverRecoveryConfig{
 		ProbeInitial: 50 * time.Millisecond,
@@ -521,10 +518,7 @@ func TestIntegration_Failover_WarmReload_PreservesState(t *testing.T) {
 	fallbackProp.Name = "fallback-node"
 	fallback := dialer.NewDialer(fallbackUnderlay, option, dialer.InstanceOption{DisableCheck: true}, fallbackProp)
 
-	annotations := []*dialer.Annotation{
-		{Priority: 0},
-		{Priority: 1},
-	}
+	annotations := []*dialer.Annotation{{}, {}}
 
 	recoveryConfig := FailoverRecoveryConfig{
 		ProbeInitial: 50 * time.Millisecond,
@@ -592,10 +586,7 @@ func TestIntegration_Failover_Reload_IdentityChanged_ResetsToPrimary(t *testing.
 	newFallbackProp.Name = "new-fallback-node"
 	newFallback := dialer.NewDialer(newFallbackUnderlay, option, dialer.InstanceOption{DisableCheck: true}, newFallbackProp)
 
-	annotations := []*dialer.Annotation{
-		{Priority: 0},
-		{Priority: 1},
-	}
+	annotations := []*dialer.Annotation{{}, {}}
 
 	recoveryConfig := FailoverRecoveryConfig{
 		ProbeInitial: 50 * time.Millisecond,

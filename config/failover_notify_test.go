@@ -20,8 +20,8 @@ routing {
 }
 group {
   proxy_failover {
-    filter: name(node1) [priority: 0]
-    filter: name(node2) [priority: 1]
+    primary: name(node1)
+    fallback: name(node2)
     policy: failover
     recovery_probe_initial: 15s
     recovery_probe_max: 5m
@@ -93,8 +93,8 @@ routing {
 }
 group {
   proxy_failover {
-    filter: name(node1) [priority: 0]
-    filter: name(node2) [priority: 1]
+    primary: name(node1)
+    fallback: name(node2)
     policy: failover
     failover_notify: webhook
   }

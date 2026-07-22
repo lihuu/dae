@@ -119,10 +119,7 @@ func TestFailoverGroupInitializesAllBPFConnectivitySlots(t *testing.T) {
 		newNoopDialer(option),
 		newNoopDialer(option),
 	}
-	annotations := []*dialer.Annotation{
-		{Priority: 0},
-		{Priority: 1},
-	}
+	annotations := []*dialer.Annotation{{}, {}}
 	failoverCfg := &FailoverConfig{
 		PrimaryCandidateIdxs: []int{0},
 		FallbackIdx:          1,
