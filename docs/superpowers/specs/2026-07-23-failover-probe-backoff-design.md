@@ -14,7 +14,6 @@ proxy_failover {
 
     recovery_probe_backoff: fixed
     recovery_probe_initial: 15s
-    recovery_probe_max: 5m
     primary_rotation_attempts: 5
 }
 ```
