@@ -200,3 +200,60 @@ func TestResolveFailoverRolesExactnessAndUniqueness(t *testing.T) {
 		require.ErrorContains(t, err, "fallback dialer \"X\" matches 2 dialers")
 	})
 }
+
+func TestParseFailoverProbeBackoff(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    FailoverProbeBackoff
+		wantErr string
+	}{
+		{raw: "exponential", want: FailoverProbeBackoffExponential},
+		{raw: "fixed", want: FailoverProbeBackoffFixed},
+		{raw: "", wantErr: `recovery_probe_backoff ""`},
+		{raw: "Fixed", wantErr: `recovery_probe_backoff "Fixed"`},
+		{raw: "linear", wantErr: `recovery_probe_backoff "linear"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			got, err := ParseFailoverProbeBackoff(tt.raw)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.ErrorContains(t, err, "exponential, fixed")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidateFailoverRecoveryConfigBackoffModes(t *testing.T) {
+	base := FailoverRecoveryConfig{
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+	for _, max := range []time.Duration{5 * time.Minute, 0, -time.Second} {
+		fixed := base
+		fixed.Backoff = FailoverProbeBackoffFixed
+		fixed.ProbeMax = max
+		require.NoError(t, validateFailoverRecoveryConfig(fixed))
+	}
+	exponential := base
+	exponential.ProbeMax = 0
+	require.ErrorContains(t, validateFailoverRecoveryConfig(exponential), "recovery_probe_max must be positive")
+	exponential.ProbeMax = time.Second
+	require.ErrorContains(t, validateFailoverRecoveryConfig(exponential), "must not exceed")
+
+	for _, mode := range []FailoverProbeBackoff{FailoverProbeBackoffExponential, FailoverProbeBackoffFixed} {
+		invalidInitial := base
+		invalidInitial.Backoff = mode
+		invalidInitial.ProbeInitial = 0
+		require.ErrorContains(t, validateFailoverRecoveryConfig(invalidInitial), "recovery_probe_initial must be positive")
+		invalidInitial.ProbeInitial = -time.Second
+		require.ErrorContains(t, validateFailoverRecoveryConfig(invalidInitial), "recovery_probe_initial must be positive")
+	}
+}
+

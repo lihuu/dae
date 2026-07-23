@@ -86,6 +86,7 @@ type failoverProbeRun struct {
 
 // FailoverRecoveryConfig holds the recovery probe parameters.
 type FailoverRecoveryConfig struct {
+	Backoff          FailoverProbeBackoff
 	ProbeInitial     time.Duration
 	ProbeMax         time.Duration
 	Successes        int

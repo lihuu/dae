@@ -26,7 +26,12 @@ func resolveConfiguredGroupDialers(
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("group %q fallback: %w", group.Name, err)
 		}
+		backoff, err := outbound.ParseFailoverProbeBackoff(group.RecoveryProbeBackoff)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("group %q: %w", group.Name, err)
+		}
 		recovery := outbound.FailoverRecoveryConfig{
+			Backoff:          backoff,
 			ProbeInitial:     group.RecoveryProbeInitial,
 			ProbeMax:         group.RecoveryProbeMax,
 			Successes:        group.RecoverySuccesses,

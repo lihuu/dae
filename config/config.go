@@ -138,6 +138,7 @@ type Group struct {
 	CheckTolerance     time.Duration `mapstructure:"check_tolerance"`
 
 	// Failover recovery settings (only used when policy: failover).
+	RecoveryProbeBackoff string        `mapstructure:"recovery_probe_backoff" default:"exponential"`
 	RecoveryProbeInitial time.Duration `mapstructure:"recovery_probe_initial" default:"15s"`
 	RecoveryProbeMax     time.Duration `mapstructure:"recovery_probe_max" default:"5m"`
 	RecoverySuccesses    int           `mapstructure:"recovery_successes" default:"3"`

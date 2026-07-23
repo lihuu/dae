@@ -63,12 +63,22 @@ func validateFailoverRecoveryConfig(recovery FailoverRecoveryConfig) error {
 	if recovery.ProbeInitial <= 0 {
 		return fmt.Errorf("recovery_probe_initial must be positive")
 	}
-	if recovery.ProbeMax <= 0 {
-		return fmt.Errorf("recovery_probe_max must be positive")
-	}
-	if recovery.ProbeInitial > recovery.ProbeMax {
-		return fmt.Errorf("recovery_probe_initial (%v) must not exceed recovery_probe_max (%v)",
-			recovery.ProbeInitial, recovery.ProbeMax)
+	switch recovery.Backoff {
+	case FailoverProbeBackoffFixed:
+		// ProbeMax is syntactically decoded by config but semantically unused.
+	case FailoverProbeBackoffExponential:
+		if recovery.ProbeMax <= 0 {
+			return fmt.Errorf("recovery_probe_max must be positive")
+		}
+		if recovery.ProbeInitial > recovery.ProbeMax {
+			return fmt.Errorf(
+				"recovery_probe_initial (%v) must not exceed recovery_probe_max (%v)",
+				recovery.ProbeInitial,
+				recovery.ProbeMax,
+			)
+		}
+	default:
+		return fmt.Errorf("invalid failover recovery backoff enum: %d", recovery.Backoff)
 	}
 	if recovery.Successes < 1 {
 		return fmt.Errorf("recovery_successes must be at least 1")

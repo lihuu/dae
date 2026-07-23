@@ -20,6 +20,7 @@ func exactControlNameFunction(values ...string) *config_parser.Function {
 }
 
 func withValidFailoverRecovery(group config.Group) config.Group {
+	group.RecoveryProbeBackoff = "exponential"
 	group.RecoveryProbeInitial = 15 * time.Second
 	group.RecoveryProbeMax = 5 * time.Minute
 	group.RecoverySuccesses = 3
@@ -272,3 +273,34 @@ func TestFailoverRoleErrorsIdentifyGroupRoleCauseAndValue(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidFailoverBackoffFailsBeforeDialerGroupConstruction(t *testing.T) {
+	baseGroup := withValidFailoverRecovery(config.Group{
+		Name:     "backoff_test",
+		Primary:  []*config_parser.Function{exactControlNameFunction("A")},
+		Fallback: []*config_parser.Function{exactControlNameFunction("X")},
+	})
+
+	tests := []struct {
+		name    string
+		mode    string
+		wantErr string
+	}{
+		{name: "empty", mode: "", wantErr: `recovery_probe_backoff ""`},
+		{name: "misspelled", mode: "Fixed", wantErr: `recovery_probe_backoff "Fixed"`},
+		{name: "unknown", mode: "linear", wantErr: `recovery_probe_backoff "linear"`},
+	}
+
+	policy := outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := baseGroup
+			g.RecoveryProbeBackoff = tt.mode
+			_, _, _, err := resolveConfiguredGroupDialers(nil, g, policy)
+			require.ErrorContains(t, err, `group "backoff_test"`)
+			require.ErrorContains(t, err, tt.wantErr)
+			require.ErrorContains(t, err, "accepted values are exponential, fixed")
+		})
+	}
+}
+

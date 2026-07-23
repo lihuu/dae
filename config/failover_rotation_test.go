@@ -61,3 +61,33 @@ func TestGroupPrimaryRotationAttemptsDecodesExplicitValue(t *testing.T) {
 	g := decodeRotationGroup(t, "primary_rotation_attempts: 5")
 	require.Equal(t, 5, g.PrimaryRotationAttempts)
 }
+
+func TestGroupRecoveryProbeBackoffDefaultsToExponential(t *testing.T) {
+	g := decodeRotationGroup(t, "")
+	require.Equal(t, "exponential", g.RecoveryProbeBackoff)
+}
+
+func TestGroupRecoveryProbeBackoffDecodesExplicitValue(t *testing.T) {
+	g := decodeRotationGroup(t, "recovery_probe_backoff: fixed")
+	require.Equal(t, "fixed", g.RecoveryProbeBackoff)
+}
+
+func TestGroupFixedBackoffStillRejectsMalformedMaxDuration(t *testing.T) {
+	raw := `
+global {}
+routing { fallback: direct }
+group {
+  proxy_failover {
+    primary: name(A)
+    fallback: name(X)
+    policy: failover
+    recovery_probe_backoff: fixed
+    recovery_probe_max: definitely-not-a-duration
+  }
+}`
+	sections, err := config_parser.Parse(raw)
+	require.NoError(t, err)
+	_, err = New(sections)
+	require.Error(t, err)
+}
+
