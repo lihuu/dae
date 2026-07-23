@@ -256,4 +256,3 @@ func TestValidateFailoverRecoveryConfigBackoffModes(t *testing.T) {
 		require.ErrorContains(t, validateFailoverRecoveryConfig(invalidInitial), "recovery_probe_initial must be positive")
 	}
 }
-

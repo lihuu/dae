@@ -408,8 +408,11 @@ group {
     #    policy: failover
     #    primary_rotation_attempts: 0
     #
-    #    # Recovery probes are targeted TCP probes used after failover to decide
-    #    # when it is safe to switch back to the primary.
+    #    # Recovery probe backoff strategy: exponential (default) or fixed.
+    #    # Exponential doubles same-candidate failure delays up to recovery_probe_max.
+    #    # Fixed probes at recovery_probe_initial interval and ignores recovery_probe_max.
+    #    # Both modes reset delay to recovery_probe_initial after candidate advancement.
+    #    recovery_probe_backoff: exponential
     #    recovery_probe_initial: 15s
     #    recovery_probe_max: 5m
     #    recovery_successes: 3
@@ -443,16 +446,18 @@ group {
     #    failover_notify_failback_body: "{group}: {fallback} -> {primary}; stable_for={stable_for}; at={transition_at}"
     #}
 
-    # Ordered Primary rotation. Each candidate receives five consecutive failed
-    # recovery probes before the cursor advances; Fallback carries traffic until
-    # one candidate completes recovery confirmation.
+    # Ordered Primary rotation with fixed backoff interval. Each candidate
+    # receives five consecutive failed recovery probes every 15 seconds before
+    # the cursor advances; Fallback carries traffic until one candidate
+    # completes recovery confirmation. Fixed mode reuses recovery_probe_initial
+    # and does not use recovery_probe_max.
     #proxy_failover_rotating {
     #    primary: name(node_A, node_B, node_C)
     #    fallback: name(xray_local)
     #    policy: failover
-    #    primary_rotation_attempts: 5
+    #    recovery_probe_backoff: fixed
     #    recovery_probe_initial: 15s
-    #    recovery_probe_max: 5m
+    #    primary_rotation_attempts: 5
     #    recovery_successes: 3
     #    recovery_stable_time: 30s
     #}

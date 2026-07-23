@@ -243,7 +243,7 @@ func TestFailoverRotationFifthFailureAdvancesToB(t *testing.T) {
 // TestFailoverRotationCircularTargets verifies that after the threshold is
 // reached, further failures advance recoveryTarget circularly through the
 // ordered primary candidates B -> C -> A -> B (and would continue). The fixed
-// fallback stays active throughout. Backoff stays capped at ProbeMax.
+// fallback stays active throughout.
 func TestFailoverRotationCircularTargets(t *testing.T) {
 	cfg := FailoverRecoveryConfig{
 		ProbeInitial:     15 * time.Second,

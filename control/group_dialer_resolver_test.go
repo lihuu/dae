@@ -303,4 +303,3 @@ func TestInvalidFailoverBackoffFailsBeforeDialerGroupConstruction(t *testing.T) 
 		})
 	}
 }
-

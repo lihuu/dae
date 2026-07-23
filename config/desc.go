@@ -106,11 +106,12 @@ min: Select node by the latency of last check.
 min_avg10: Select node by the average of latencies of last 10 checks.
 min_moving_avg: Select node by the moving average of latencies of checks, which means more recent latencies have higher weight.
 failover: Select the current primary dialer; fall back to a fixed fallback dialer when the primary's TCP health transitions to unavailable. Explicit primary: name(...) and fallback: name(...) declarations are required. Optional additional primary names are standby candidates used when primary_rotation_attempts is set. A warm reload preserves compatible in-memory failover state; a process restart resets to the first primary.`,
-	"recovery_probe_initial":    "Targeted TCP recovery probe initial backoff after failover (failover policy only). Default 15s. Failed probes double this delay, capped by recovery_probe_max. Confirmation probes after a successful probe run at this initial interval.",
-	"recovery_probe_max":        "Maximum backoff between recovery probes (failover policy only). Default 5m. Failed-probe exponential backoff is capped at this value and stays capped across rotation targets.",
+	"recovery_probe_backoff":    "Recovery probe delay strategy (failover policy only): exponential or fixed. Default exponential. Both modes reset to recovery_probe_initial after candidate advancement; fixed always uses the initial interval.",
+	"recovery_probe_initial":    "Delay before the first targeted recovery probe and confirmation probes (failover policy only). Default 15s. Fixed mode uses this for every probe; exponential mode doubles same-candidate failures from this value.",
+	"recovery_probe_max":        "Maximum same-candidate delay in exponential recovery_probe_backoff mode (failover policy only). Default 5m. Ignored by fixed mode and never causes candidate advancement.",
 	"recovery_successes":        "Consecutive successful recovery probes required before promoting a recovery target back to current primary (failover policy only). Default 3.",
 	"recovery_stable_time":      "Minimum elapsed time since the first successful recovery probe before promotion (failover policy only). Default 30s. Promotion requires both recovery_successes consecutive successes and this stable time.",
-	"primary_rotation_attempts": `Consecutive failed recovery probes allowed for each current recovery target before advancing. 0 disables advancement. Candidate count does not restrict the value.`,
+	"primary_rotation_attempts": `Consecutive failed recovery probes allowed for each current recovery target before advancing. 0 disables advancement. Delay strategy and recovery_probe_max do not change this threshold.`,
 	"tcp_check_url":             "Override global config.",
 	"tcp_check_http_method":     "Override global config.",
 	"udp_check_dns":             "Override global config.",

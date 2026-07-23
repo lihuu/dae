@@ -90,4 +90,3 @@ group {
 	_, err = New(sections)
 	require.Error(t, err)
 }
-
