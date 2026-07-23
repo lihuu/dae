@@ -506,7 +506,7 @@ func TestFailoverReloadIdentityMismatchLeavesOldInFlightProbeOwned(t *testing.T)
 	var pendingTimer *fakeFailoverTimer
 	var pendingAt time.Time
 	for _, call := range oldSched.pending {
-		if !call.timer.stopped {
+		if !call.timer.IsStopped() {
 			pendingTimer = call.timer
 			pendingAt = call.at
 			break
@@ -519,7 +519,7 @@ func TestFailoverReloadIdentityMismatchLeavesOldInFlightProbeOwned(t *testing.T)
 	if pendingAt.After(oldSched.now) {
 		oldSched.now = pendingAt
 	}
-	pendingTimer.stopped = true
+	pendingTimer.Stop()
 	beforeGeneration := oldFC.generation
 	oldFC.mu.Unlock()
 
@@ -670,7 +670,7 @@ func TestFailoverReloadInFlightProbeOwnership(t *testing.T) {
 	var pendingTimer *fakeFailoverTimer
 	var pendingAt time.Time
 	for _, c := range oldSched.pending {
-		if !c.timer.stopped {
+		if !c.timer.IsStopped() {
 			pendingTimer = c.timer
 			pendingAt = c.at
 			break
@@ -684,7 +684,7 @@ func TestFailoverReloadInFlightProbeOwnership(t *testing.T) {
 		if pendingAt.After(oldSched.now) {
 			oldSched.now = pendingAt
 		}
-		pendingTimer.stopped = true
+		pendingTimer.Stop()
 		pendingTimer.fn()
 	}()
 	oldFC.mu.Unlock()
@@ -1163,7 +1163,7 @@ func TestFailoverReloadRollbackStaleProbeCannotClobberReplacement(t *testing.T) 
 		var pendingTimer *fakeFailoverTimer
 		var pendingAt time.Time
 		for _, c := range oldSched.pending {
-			if !c.timer.stopped {
+			if !c.timer.IsStopped() {
 				pendingTimer = c.timer
 				pendingAt = c.at
 				break
@@ -1175,7 +1175,7 @@ func TestFailoverReloadRollbackStaleProbeCannotClobberReplacement(t *testing.T) 
 		if pendingAt.After(oldSched.now) {
 			oldSched.now = pendingAt
 		}
-		pendingTimer.stopped = true
+		pendingTimer.Stop()
 		done := make(chan struct{})
 		go func() {
 			pendingTimer.fn()
@@ -1340,4 +1340,86 @@ func TestFailoverReloadInvalidConfigLeavesOldControllerActive(t *testing.T) {
 			require.Equal(t, 1, oldSched.PendingCount())
 		})
 	}
+}
+
+func TestEndToEndStagedReloadInvalidConfigLeavesActiveControllerAndInFlightProbeUntouched(t *testing.T) {
+	recovery := baseReloadRecoveryConfig()
+	oldFC, _, oldSched, _, _, _ := reloadTestControllers(
+		t, recovery, recovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+	oldFC.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		close(probeStarted)
+		<-probeRelease
+		return false, nil
+	}
+
+	// Fire the timer so an in-flight probe goroutine is active
+	go oldSched.FireNext(t)
+	<-probeStarted
+
+	beforeSnapshot := oldFC.CaptureSnapshot()
+
+	// Attempt staged reloads with various invalid configurations
+	option := testFailoverDialerOption()
+	a := newNamedDirectDialer(option, "A")
+	b := newNamedDirectDialer(option, "B")
+	x := newNamedDirectDialer(option, "X")
+	set := &DialerSet{dialers: []*dialer.Dialer{a, b, x}}
+
+	invalidConfigs := []struct {
+		name      string
+		mutate    func(*FailoverRecoveryConfig)
+		wantError string
+	}{
+		{"role overlap", func(c *FailoverRecoveryConfig) {}, "overlaps primary"},
+		{"invalid enum", func(c *FailoverRecoveryConfig) { c.Backoff = 255 }, "backoff enum"},
+		{"exponential zero max", func(c *FailoverRecoveryConfig) { c.ProbeMax = 0 }, "must be positive"},
+		{"exponential initial above max", func(c *FailoverRecoveryConfig) { c.ProbeInitial = 10 * time.Minute }, "must not exceed"},
+		{"invalid initial duration", func(c *FailoverRecoveryConfig) { c.ProbeInitial = 0 }, "must be positive"},
+	}
+
+	for _, tt := range invalidConfigs {
+		t.Run(tt.name, func(t *testing.T) {
+			badRecovery := baseReloadRecoveryConfig()
+			if tt.name == "role overlap" {
+				_, _, _, err := set.ResolveFailoverRoles(
+					exactNameFunction("A", "B"),
+					exactNameFunction("A"),
+					badRecovery,
+				)
+				require.ErrorContains(t, err, tt.wantError)
+			} else {
+				tt.mutate(&badRecovery)
+				_, _, _, err := set.ResolveFailoverRoles(
+					exactNameFunction("A", "B"),
+					exactNameFunction("X"),
+					badRecovery,
+				)
+				require.ErrorContains(t, err, tt.wantError)
+			}
+		})
+	}
+
+	// Verify old controller snapshot is untouched while probe is still in-flight
+	midSnapshot := oldFC.CaptureSnapshot()
+	require.Equal(t, beforeSnapshot.FailedRecoveryProbes, midSnapshot.FailedRecoveryProbes)
+	require.Equal(t, beforeSnapshot.RecoveryTargetName, midSnapshot.RecoveryTargetName)
+
+	// Release in-flight probe goroutine
+	close(probeRelease)
+
+	// Wait for the probe goroutine to finish updating oldFC
+	require.Eventually(t, func() bool {
+		return oldSched.PendingCount() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	afterSnapshot := oldFC.CaptureSnapshot()
+	require.Equal(t, beforeSnapshot.FailedRecoveryProbes+1, afterSnapshot.FailedRecoveryProbes)
+	require.Equal(t, beforeSnapshot.RecoveryTargetName, afterSnapshot.RecoveryTargetName)
 }

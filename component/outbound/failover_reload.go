@@ -18,8 +18,8 @@ import (
 // Identity fields are dialer NAMES (not slice indexes or pointers) so the new
 // controller can remap candidates by name even when the dialer slice order or
 // underlying dialer pointers differ. The Recovery config carries every
-// state-interpreting policy field: primary_rotation_attempts and the four
-// recovery parameters.
+// state-interpreting policy field: primary_rotation_attempts and recovery probe
+// policy parameters (backoff mode, initial delay, max delay, successes, stable time).
 type FailoverReloadIdentity struct {
 	PrimaryCandidates []string
 	Fallback          string

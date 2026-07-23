@@ -303,3 +303,125 @@ func TestInvalidFailoverBackoffFailsBeforeDialerGroupConstruction(t *testing.T) 
 		})
 	}
 }
+
+func parseRawTestConfig(t *testing.T, rawConfig string) *config.Config {
+	sections, err := config_parser.Parse(rawConfig)
+	require.NoError(t, err)
+	conf, err := config.New(sections)
+	require.NoError(t, err)
+	return conf
+}
+
+func TestGroupDialerResolverRawConfigDecodingBoundary(t *testing.T) {
+	rawBase := `
+global {
+	tproxy_port: 12345
+}
+routing {
+	fallback: direct
+}
+`
+	policy := outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover}
+
+	t.Run("absent mode defaults to exponential", func(t *testing.T) {
+		raw := rawBase + `
+group {
+	proxy_failover {
+		primary: name(node_A)
+		fallback: name(xray_local)
+		policy: failover
+	}
+}
+`
+		conf := parseRawTestConfig(t, raw)
+		require.Len(t, conf.Group, 1)
+		require.Equal(t, "exponential", conf.Group[0].RecoveryProbeBackoff)
+		require.Equal(t, 15*time.Second, conf.Group[0].RecoveryProbeInitial)
+		require.Equal(t, 5*time.Minute, conf.Group[0].RecoveryProbeMax)
+	})
+
+	t.Run("explicit fixed decodes correctly", func(t *testing.T) {
+		raw := rawBase + `
+group {
+	proxy_failover {
+		primary: name(node_A)
+		fallback: name(xray_local)
+		policy: failover
+		recovery_probe_backoff: fixed
+		recovery_probe_initial: 10s
+	}
+}
+`
+		conf := parseRawTestConfig(t, raw)
+		require.Equal(t, "fixed", conf.Group[0].RecoveryProbeBackoff)
+		require.Equal(t, 10*time.Second, conf.Group[0].RecoveryProbeInitial)
+	})
+
+	t.Run("explicit exponential decodes correctly", func(t *testing.T) {
+		raw := rawBase + `
+group {
+	proxy_failover {
+		primary: name(node_A)
+		fallback: name(xray_local)
+		policy: failover
+		recovery_probe_backoff: exponential
+		recovery_probe_initial: 20s
+		recovery_probe_max: 10m
+	}
+}
+`
+		conf := parseRawTestConfig(t, raw)
+		require.Equal(t, "exponential", conf.Group[0].RecoveryProbeBackoff)
+		require.Equal(t, 20*time.Second, conf.Group[0].RecoveryProbeInitial)
+		require.Equal(t, 10*time.Minute, conf.Group[0].RecoveryProbeMax)
+	})
+
+	t.Run("invalid raw mode linear rejected at resolver boundary", func(t *testing.T) {
+		raw := rawBase + `
+group {
+	proxy_failover {
+		primary: name(node_A)
+		fallback: name(xray_local)
+		policy: failover
+		recovery_probe_backoff: linear
+	}
+}
+`
+		conf := parseRawTestConfig(t, raw)
+		_, _, _, err := resolveConfiguredGroupDialers(nil, conf.Group[0], policy)
+		require.ErrorContains(t, err, "invalid recovery_probe_backoff \"linear\"")
+	})
+
+	t.Run("zero initial duration rejected at resolver boundary", func(t *testing.T) {
+		raw := rawBase + `
+group {
+	proxy_failover {
+		primary: name(node_A)
+		fallback: name(xray_local)
+		policy: failover
+		recovery_probe_initial: 0s
+	}
+}
+`
+		conf := parseRawTestConfig(t, raw)
+		_, _, _, err := resolveConfiguredGroupDialers(nil, conf.Group[0], policy)
+		require.ErrorContains(t, err, "recovery_probe_initial must be positive")
+	})
+
+	t.Run("negative initial duration in fixed mode rejected at resolver boundary", func(t *testing.T) {
+		raw := rawBase + `
+group {
+	proxy_failover {
+		primary: name(node_A)
+		fallback: name(xray_local)
+		policy: failover
+		recovery_probe_backoff: fixed
+		recovery_probe_initial: -5s
+	}
+}
+`
+		conf := parseRawTestConfig(t, raw)
+		_, _, _, err := resolveConfiguredGroupDialers(nil, conf.Group[0], policy)
+		require.ErrorContains(t, err, "recovery_probe_initial must be positive")
+	})
+}

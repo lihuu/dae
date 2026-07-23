@@ -96,7 +96,7 @@ type FailoverRecoveryConfig struct {
 
 // FailoverController manages the failover state machine for a DialerGroup.
 // It observes each configured Primary's TCP health transitions and drives
-// recovery probing with exponential backoff.
+// recovery probing with configured probe backoff (exponential or fixed).
 type FailoverController struct {
 	log       *logrus.Logger
 	groupName string
@@ -647,12 +647,14 @@ func (fc *FailoverController) promoteRecoveryTargetLocked() {
 // recoveryTarget. Must hold mu.
 //
 // A failed probe (ok=false or a non-cancellation error) increments the current
-// target's consecutive failure count, clears confirmation state, and doubles
-// the backoff (capped at ProbeMax). When a positive RotationAttempts threshold
-// is reached, recoveryTarget advances circularly and the consecutive count is
-// reset. The first advance emits primary_rotation_started; later advances emit
-// recovery_target_advanced. A success resets the consecutive count without
-// promoting the target until recovery confirmation completes.
+// target's consecutive failure count, clears confirmation state, and calculates
+// the next probe delay via nextRecoveryProbeDelay (fixed interval or exponential
+// capped at ProbeMax; candidate advancement resets delay to ProbeInitial). When
+// a positive RotationAttempts threshold is reached, recoveryTarget advances
+// circularly and the consecutive count is reset. The first advance emits
+// primary_rotation_started; later advances emit recovery_target_advanced. A
+// success resets the consecutive count without promoting the target until
+// recovery confirmation completes.
 func (fc *FailoverController) onProbeFailureLocked() {
 	fc.failedRecoveryProbes++
 	failedAttempts := fc.failedRecoveryProbes

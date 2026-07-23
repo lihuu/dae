@@ -8,7 +8,10 @@ package outbound
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,16 +25,16 @@ import (
 // It records whether Stop was called and exposes the scheduled callback so
 // the scheduler can fire it at the right logical time.
 type fakeFailoverTimer struct {
-	stopped bool
+	stopped atomic.Bool
 	fn      func()
 }
 
 func (t *fakeFailoverTimer) Stop() bool {
-	if t.stopped {
-		return false
-	}
-	t.stopped = true
-	return true
+	return t.stopped.CompareAndSwap(false, true)
+}
+
+func (t *fakeFailoverTimer) IsStopped() bool {
+	return t.stopped.Load()
 }
 
 // scheduledFailoverCall records one AfterFunc invocation's absolute deadline
@@ -47,6 +50,7 @@ type scheduledFailoverCall struct {
 // logical deadline ever requested so tests can assert the full schedule
 // even after a timer is stopped (stopped timers remain in history).
 type fakeFailoverScheduler struct {
+	mu      sync.Mutex
 	now     time.Time
 	pending []scheduledFailoverCall
 	history []time.Time
@@ -56,9 +60,15 @@ func newFakeFailoverScheduler() *fakeFailoverScheduler {
 	return &fakeFailoverScheduler{now: time.Unix(0, 0)}
 }
 
-func (s *fakeFailoverScheduler) Now() time.Time { return s.now }
+func (s *fakeFailoverScheduler) Now() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.now
+}
 
 func (s *fakeFailoverScheduler) AfterFunc(d time.Duration, fn func()) failoverTimer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	timer := &fakeFailoverTimer{fn: fn}
 	at := s.now.Add(d)
 	s.pending = append(s.pending, scheduledFailoverCall{at: at, timer: timer})
@@ -67,34 +77,43 @@ func (s *fakeFailoverScheduler) AfterFunc(d time.Duration, fn func()) failoverTi
 }
 
 // Advance moves the logical clock forward by d. It does NOT fire timers.
-func (s *fakeFailoverScheduler) Advance(d time.Duration) { s.now = s.now.Add(d) }
+func (s *fakeFailoverScheduler) Advance(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = s.now.Add(d)
+}
 
 // FireNext fires the earliest pending timer, skipping any that were stopped.
 // It advances the logical clock to the timer's scheduled deadline if the
 // clock is behind. It fails the test if no pending timer exists.
 func (s *fakeFailoverScheduler) FireNext(t *testing.T) {
 	t.Helper()
+	s.mu.Lock()
 	for len(s.pending) > 0 {
 		call := s.pending[0]
 		s.pending = s.pending[1:]
-		if call.timer.stopped {
+		if call.timer.stopped.Load() {
 			continue
 		}
 		if call.at.After(s.now) {
 			s.now = call.at
 		}
-		call.timer.stopped = true
+		call.timer.stopped.Store(true)
+		s.mu.Unlock()
 		call.timer.fn()
 		return
 	}
+	s.mu.Unlock()
 	t.Fatal("no pending failover timer")
 }
 
 // PendingCount returns the number of currently pending (not-yet-fired) timers.
 func (s *fakeFailoverScheduler) PendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	n := 0
 	for _, c := range s.pending {
-		if !c.timer.stopped {
+		if !c.timer.stopped.Load() {
 			n++
 		}
 	}
@@ -1300,4 +1319,193 @@ func TestFailoverRotationZeroThresholdStillRecovers(t *testing.T) {
 			require.Zero(t, sched.PendingCount())
 		})
 	}
+}
+
+func TestFailoverFixedModeProbeMaxMatrix(t *testing.T) {
+	probeMaxes := []time.Duration{10 * time.Minute, 0, -1 * time.Minute}
+	for _, maxVal := range probeMaxes {
+		t.Run(fmt.Sprintf("probeMax_%v", maxVal), func(t *testing.T) {
+			cfg := FailoverRecoveryConfig{
+				Backoff:          FailoverProbeBackoffFixed,
+				ProbeInitial:     15 * time.Second,
+				ProbeMax:         maxVal,
+				Successes:        3,
+				StableTime:       30 * time.Second,
+				RotationAttempts: 5,
+			}
+			fc, sched, _, fallback := newRotationControllerTest(t, cfg)
+			defer fc.Close()
+
+			var probeTimes []time.Duration
+			fc.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+				probeTimes = append(probeTimes, sched.Now().Sub(time.Unix(0, 0)))
+				return false, nil
+			}
+
+			fc.triggerPrimaryFailureForTest()
+
+			for i := 0; i < 4; i++ {
+				sched.FireNext(t)
+			}
+
+			require.Len(t, probeTimes, 4)
+			for i := 1; i < len(probeTimes); i++ {
+				delta := probeTimes[i] - probeTimes[i-1]
+				require.Equal(t, 15*time.Second, delta, "probe %d delta", i)
+			}
+
+			active, usingFallback := fc.ActiveDialer()
+			require.Same(t, fallback, active)
+			require.True(t, usingFallback)
+		})
+	}
+}
+
+func TestFailoverFixedModeCircularRotationAndSingleCandidate(t *testing.T) {
+	t.Run("circular rotation 3 candidates", func(t *testing.T) {
+		cfg := FailoverRecoveryConfig{
+			Backoff:          FailoverProbeBackoffFixed,
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        3,
+			StableTime:       30 * time.Second,
+			RotationAttempts: 2,
+		}
+		fc, sched, _, _ := newRotationControllerTest(t, cfg)
+		defer fc.Close()
+
+		var probedNames []string
+		fc.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+			probedNames = append(probedNames, d.Property().Name)
+			return false, nil
+		}
+
+		fc.triggerPrimaryFailureForTest()
+
+		for i := 0; i < 8; i++ {
+			sched.FireNext(t)
+		}
+
+		want := []string{"A", "A", "B", "B", "C", "C", "A", "A"}
+		require.Equal(t, want, probedNames)
+	})
+
+	t.Run("single candidate fixed pacing", func(t *testing.T) {
+		cfg := FailoverRecoveryConfig{
+			Backoff:          FailoverProbeBackoffFixed,
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        3,
+			StableTime:       30 * time.Second,
+			RotationAttempts: 2,
+		}
+		option := testFailoverDialerOption()
+		candidateA := newNamedDirectDialer(option, "A")
+		fallback := newNamedDirectDialer(option, "fallback")
+		fc := NewFailoverControllerWithCandidates(log, "single-cand-fixed", []*dialer.Dialer{candidateA}, fallback, cfg)
+		sched := newFakeFailoverScheduler()
+		fc.scheduler = sched
+		defer fc.Close()
+
+		var probeCount int
+		fc.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+			probeCount++
+			require.Same(t, candidateA, d)
+			return false, nil
+		}
+
+		fc.triggerPrimaryFailureForTest()
+
+		for i := 0; i < 6; i++ {
+			sched.FireNext(t)
+		}
+
+		require.Equal(t, 6, probeCount)
+		fc.mu.Lock()
+		require.Equal(t, 0, fc.recoveryTarget)
+		fc.mu.Unlock()
+	})
+}
+
+func TestFailoverZeroAttemptsRotationDisabledModeMatrix(t *testing.T) {
+	t.Run("fixed mode zero attempts", func(t *testing.T) {
+		cfg := FailoverRecoveryConfig{
+			Backoff:          FailoverProbeBackoffFixed,
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        2,
+			StableTime:       15 * time.Second,
+			RotationAttempts: 0,
+		}
+		fc, sched, candidates, _ := newRotationControllerTest(t, cfg)
+		defer fc.Close()
+
+		fc.probeTargetTCP = func(_ context.Context, d *dialer.Dialer) (bool, error) {
+			require.Same(t, candidates[0], d)
+			return false, nil
+		}
+		fc.triggerPrimaryFailureForTest()
+
+		for i := 0; i < 5; i++ {
+			sched.FireNext(t)
+		}
+
+		previous := time.Unix(0, 0)
+		for i, deadline := range sched.history {
+			delta := deadline.Sub(previous)
+			require.Equalf(t, 15*time.Second, delta, "probe %d delta", i+1)
+			previous = deadline
+		}
+	})
+}
+
+func TestFailoverFixedModeFullRecoveryPromotionAndNotificationUniqueness(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	cfg := FailoverRecoveryConfig{
+		Backoff:          FailoverProbeBackoffFixed,
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+	fc, sched, candidates, fallback := newRotationControllerWithLogger(t, logger, cfg)
+	defer fc.Close()
+
+	cb := &recordingCallback{}
+	fc.SetEventCallback(cb)
+
+	fc.probeTargetTCP = func(_ context.Context, d *dialer.Dialer) (bool, error) {
+		switch d.Property().Name {
+		case "A":
+			return false, nil
+		case "B":
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+	fc.triggerPrimaryFailureForTest()
+
+	for i := 0; i < 5; i++ {
+		sched.FireNext(t)
+	}
+
+	for i := 0; i < 3; i++ {
+		sched.FireNext(t)
+	}
+
+	events := cb.snapshot()
+	require.Len(t, events, 2, "must emit exactly 2 events (switch + failback)")
+	require.Equal(t, FailoverEventSwitch, events[0].Type)
+	require.Equal(t, "A", events[0].Primary)
+	require.Equal(t, FailoverEventFailbackComplete, events[1].Type)
+	require.Equal(t, "B", events[1].Primary)
+
+	active, usingFallback := fc.ActiveDialer()
+	require.Same(t, candidates[1], active)
+	require.False(t, usingFallback)
+	_ = fallback
 }
