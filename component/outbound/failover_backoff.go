@@ -1,6 +1,9 @@
 package outbound
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type FailoverProbeBackoff uint8
 
@@ -21,4 +24,18 @@ func ParseFailoverProbeBackoff(raw string) (FailoverProbeBackoff, error) {
 			raw,
 		)
 	}
+}
+
+func nextRecoveryProbeDelay(
+	current time.Duration,
+	cfg FailoverRecoveryConfig,
+	candidateAdvanced bool,
+) time.Duration {
+	if candidateAdvanced || cfg.Backoff == FailoverProbeBackoffFixed {
+		return cfg.ProbeInitial
+	}
+	if current >= cfg.ProbeMax || current > cfg.ProbeMax/2 {
+		return cfg.ProbeMax
+	}
+	return current * 2
 }

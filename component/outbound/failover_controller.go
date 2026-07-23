@@ -670,16 +670,13 @@ func (fc *FailoverController) onProbeFailureLocked() {
 		fc.failedRecoveryProbes >= fc.config.RotationAttempts
 	rotationStarts := advances && !fc.rotationActive
 
-	// Exponential backoff: double the delay, capped at ProbeMax. The backoff
-	// continues across failed targets and stays capped. The new currentDelay
-	// is the delay that will be used to schedule the probe of toTarget.
-	fc.currentDelay = minDuration(fc.currentDelay*2, fc.config.ProbeMax)
-
 	if advances {
 		fc.rotationActive = true
 		fc.recoveryTarget = (fc.recoveryTarget + 1) % len(fc.primaryCandidates)
 		fc.failedRecoveryProbes = 0
 	}
+
+	fc.currentDelay = nextRecoveryProbeDelay(fc.currentDelay, fc.config, advances)
 
 	toTargetName := dialerName(fc.recoveryTargetDialer())
 

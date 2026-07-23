@@ -229,10 +229,10 @@ func TestFailoverRotationFifthFailureAdvancesToB(t *testing.T) {
 	if maxInFlight != 1 {
 		t.Fatalf("max in-flight probes = %d, want 1", maxInFlight)
 	}
-	// The next probe is scheduled against B at 12:45 (765s) after the original
-	// failover. The backoff (5m, capped) was preserved across the threshold.
-	if got := nextAt.Sub(time.Unix(0, 0)); got != 765*time.Second {
-		t.Fatalf("next probe deadline = %v, want 765s (B at 12:45)", got)
+	// The next probe is scheduled against B after ProbeInitial (15s) following
+	// advancement. The backoff resets to initial on target advance.
+	if got := nextAt.Sub(time.Unix(0, 0)); got != 480*time.Second {
+		t.Fatalf("next probe deadline = %v, want 480s (B after reset initial)", got)
 	}
 	if got := sched.PendingCount(); got != 1 {
 		t.Fatalf("pending timers after fifth failure = %d, want 1", got)
@@ -298,8 +298,8 @@ func TestFailoverRotationCircularTargets(t *testing.T) {
 	if recoveryTarget != 1 {
 		t.Fatalf("recoveryTarget = %d, want 1 (B)", recoveryTarget)
 	}
-	if currentDelay != cfg.ProbeMax {
-		t.Fatalf("currentDelay = %v, want capped at ProbeMax %v", currentDelay, cfg.ProbeMax)
+	if currentDelay != 4*time.Minute {
+		t.Fatalf("currentDelay = %v, want 4m (after 4 failures on B)", currentDelay)
 	}
 	if got, _ := fc.ActiveDialer(); got != fallback {
 		t.Fatalf("active dialer = %v, want fixed fallback", got)
@@ -371,8 +371,8 @@ func TestFailoverRotationProbeErrorMatchesFalseResult(t *testing.T) {
 	if falseCase.recoveryTarget != 1 {
 		t.Fatalf("recoveryTarget = %d, want 1 (B)", falseCase.recoveryTarget)
 	}
-	if falseCase.currentDelay != cfg.ProbeMax {
-		t.Fatalf("currentDelay = %v, want ProbeMax %v", falseCase.currentDelay, cfg.ProbeMax)
+	if falseCase.currentDelay != 30*time.Second {
+		t.Fatalf("currentDelay = %v, want 30s (1st failure on B doubles from initial 15s)", falseCase.currentDelay)
 	}
 }
 
@@ -650,16 +650,160 @@ func TestFailoverRotationStructuredLogs(t *testing.T) {
 	if started[0].Level != logrus.DebugLevel {
 		t.Fatalf("primary_rotation_started level = %v, want Debug", started[0].Level)
 	}
-	checkRotationFields(t, started[0], "A", "A", "B", 5, 5*time.Minute)
+	checkRotationFields(t, started[0], "A", "A", "B", 5, 15*time.Second)
 
 	advanced := findLogEntries(hook, "recovery_target_advanced")
 	if len(advanced) != 3 {
 		t.Fatalf("recovery_target_advanced emitted %d times, want 3", len(advanced))
 	}
-	checkRotationFields(t, advanced[0], "A", "B", "C", 5, 5*time.Minute)
-	checkRotationFields(t, advanced[1], "A", "C", "A", 5, 5*time.Minute)
-	checkRotationFields(t, advanced[2], "A", "A", "B", 5, 5*time.Minute)
+	checkRotationFields(t, advanced[0], "A", "B", "C", 5, 15*time.Second)
+	checkRotationFields(t, advanced[1], "A", "C", "A", 5, 15*time.Second)
+	checkRotationFields(t, advanced[2], "A", "A", "B", 5, 15*time.Second)
 	_ = candidates
+}
+
+func TestNextRecoveryProbeDelay(t *testing.T) {
+	base := FailoverRecoveryConfig{
+		ProbeInitial: 15 * time.Second,
+		ProbeMax:     5 * time.Minute,
+	}
+	tests := []struct {
+		name     string
+		backoff  FailoverProbeBackoff
+		current  time.Duration
+		advanced bool
+		want     time.Duration
+	}{
+		{"fixed same target", FailoverProbeBackoffFixed, 4 * time.Minute, false, 15 * time.Second},
+		{"fixed advanced", FailoverProbeBackoffFixed, 4 * time.Minute, true, 15 * time.Second},
+		{"exponential growth", FailoverProbeBackoffExponential, time.Minute, false, 2 * time.Minute},
+		{"exponential cap crossing", FailoverProbeBackoffExponential, 4 * time.Minute, false, 5 * time.Minute},
+		{"exponential remains capped", FailoverProbeBackoffExponential, 5 * time.Minute, false, 5 * time.Minute},
+		{"exponential advanced", FailoverProbeBackoffExponential, 5 * time.Minute, true, 15 * time.Second},
+		{"overflow safe", FailoverProbeBackoffExponential, time.Duration(1<<63 - 2), false, 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			cfg.Backoff = tt.backoff
+			require.Equal(t, tt.want, nextRecoveryProbeDelay(tt.current, cfg, tt.advanced))
+		})
+	}
+}
+
+func TestFailoverRotationFixedModePacingAndConfirmation(t *testing.T) {
+	cfg := FailoverRecoveryConfig{
+		Backoff:          FailoverProbeBackoffFixed,
+		ProbeInitial:     15 * time.Second,
+		ProbeMax:         5 * time.Minute,
+		Successes:        3,
+		StableTime:       30 * time.Second,
+		RotationAttempts: 5,
+	}
+	fc, sched, _, fallback := newRotationControllerTest(t, cfg)
+	defer fc.Close()
+
+	var probeCalls []string
+	var probeTimes []time.Duration
+	fc.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+		probeCalls = append(probeCalls, d.Property().Name)
+		probeTimes = append(probeTimes, sched.Now().Sub(time.Unix(0, 0)))
+		return false, nil
+	}
+
+	fc.triggerPrimaryFailureForTest()
+
+	// Drive 10 failures: 5 on A, 5 on B.
+	for i := 0; i < 10; i++ {
+		sched.FireNext(t)
+	}
+
+	wantTargets := []string{
+		"A", "A", "A", "A", "A",
+		"B", "B", "B", "B", "B",
+	}
+	require.Equal(t, wantTargets, probeCalls)
+
+	// Assert every delta in scheduler history is 15 seconds.
+	for i := 1; i < len(probeTimes); i++ {
+		delta := probeTimes[i] - probeTimes[i-1]
+		require.Equal(t, 15*time.Second, delta, "probe %d delta", i)
+	}
+
+	require.Equal(t, 1, sched.PendingCount())
+	got, _ := fc.ActiveDialer()
+	require.Equal(t, fallback, got)
+}
+
+func TestFailoverRotationConfirmationFailurePacing(t *testing.T) {
+	t.Run("fixed mode confirmation failure", func(t *testing.T) {
+		cfg := FailoverRecoveryConfig{
+			Backoff:          FailoverProbeBackoffFixed,
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        3,
+			StableTime:       30 * time.Second,
+			RotationAttempts: 5,
+		}
+		fc, sched, _, _ := newRotationControllerTest(t, cfg)
+		defer fc.Close()
+
+		var returnSuccess bool
+		fc.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+			return returnSuccess, nil
+		}
+		fc.triggerPrimaryFailureForTest()
+
+		// First probe succeeds: enters confirmation
+		returnSuccess = true
+		sched.FireNext(t)
+
+		fc.mu.Lock()
+		require.Equal(t, 1, fc.recoverySuccesses)
+		require.Equal(t, 15*time.Second, fc.currentDelay)
+		fc.mu.Unlock()
+
+		// Next probe (confirmation probe) fails: clears confirmation, stays at 15s in fixed mode
+		returnSuccess = false
+		sched.FireNext(t)
+
+		fc.mu.Lock()
+		require.Equal(t, 0, fc.recoverySuccesses)
+		require.Equal(t, 15*time.Second, fc.currentDelay)
+		fc.mu.Unlock()
+	})
+
+	t.Run("exponential mode confirmation failure", func(t *testing.T) {
+		cfg := FailoverRecoveryConfig{
+			Backoff:          FailoverProbeBackoffExponential,
+			ProbeInitial:     15 * time.Second,
+			ProbeMax:         5 * time.Minute,
+			Successes:        3,
+			StableTime:       30 * time.Second,
+			RotationAttempts: 5,
+		}
+		fc, sched, _, _ := newRotationControllerTest(t, cfg)
+		defer fc.Close()
+
+		var returnSuccess bool
+		fc.probeTargetTCP = func(ctx context.Context, d *dialer.Dialer) (bool, error) {
+			return returnSuccess, nil
+		}
+		fc.triggerPrimaryFailureForTest()
+
+		// First probe succeeds: enters confirmation, currentDelay reset to ProbeInitial (15s)
+		returnSuccess = true
+		sched.FireNext(t)
+
+		// Next probe (confirmation probe) fails: clears confirmation, doubles delay to 30s
+		returnSuccess = false
+		sched.FireNext(t)
+
+		fc.mu.Lock()
+		require.Equal(t, 0, fc.recoverySuccesses)
+		require.Equal(t, 30*time.Second, fc.currentDelay)
+		fc.mu.Unlock()
+	})
 }
 
 // checkRotationFields asserts the structured rotation log fields.
