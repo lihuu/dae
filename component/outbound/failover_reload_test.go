@@ -274,6 +274,17 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 			wantNewPrime: "B",
 		},
 		{
+			name: "recovery_probe_backoff_changed",
+			modifyNew: func(c FailoverRecoveryConfig) FailoverRecoveryConfig {
+				c.Backoff = FailoverProbeBackoffFixed
+				return c
+			},
+			newCands:     []string{"A", "B", "C"},
+			newFallback:  "fallback",
+			wantReason:   "recovery_policy_changed",
+			wantNewPrime: "A",
+		},
+		{
 			name:         "primary_candidate_removed",
 			modifyNew:    func(c FailoverRecoveryConfig) FailoverRecoveryConfig { return c },
 			newCands:     []string{"A", "C"},
@@ -332,6 +343,64 @@ func TestFailoverReloadSnapshotResetsOnIdentityChange(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEqualFailoverRecoveryConfigUsesEffectiveSemantics(t *testing.T) {
+	base := baseReloadRecoveryConfig()
+	tests := []struct {
+		name   string
+		modify func(*FailoverRecoveryConfig)
+		want   bool
+	}{
+		{"identical exponential", func(*FailoverRecoveryConfig) {}, true},
+		{"mode changed", func(c *FailoverRecoveryConfig) { c.Backoff = FailoverProbeBackoffFixed }, false},
+		{"exponential max changed", func(c *FailoverRecoveryConfig) { c.ProbeMax *= 2 }, false},
+		{"initial changed", func(c *FailoverRecoveryConfig) { c.ProbeInitial *= 2 }, false},
+		{"successes changed", func(c *FailoverRecoveryConfig) { c.Successes++ }, false},
+		{"stable time changed", func(c *FailoverRecoveryConfig) { c.StableTime *= 2 }, false},
+		{"attempts changed", func(c *FailoverRecoveryConfig) { c.RotationAttempts++ }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			next := base
+			tt.modify(&next)
+			require.Equal(t, tt.want, equalFailoverRecoveryConfig(base, next))
+		})
+	}
+
+	oldFixed := base
+	oldFixed.Backoff = FailoverProbeBackoffFixed
+	newFixed := oldFixed
+	newFixed.ProbeMax = -time.Second
+	require.True(t, equalFailoverRecoveryConfig(oldFixed, newFixed))
+}
+
+func TestFailoverReloadFixedMaxOnlyChangeIsCompatible(t *testing.T) {
+	oldRecovery := baseReloadRecoveryConfig()
+	oldRecovery.Backoff = FailoverProbeBackoffFixed
+	newRecovery := oldRecovery
+	newRecovery.ProbeMax = 10 * time.Minute // unused in fixed mode
+
+	oldFC, newFC, oldSched, _, _, _ := reloadTestControllers(
+		t, oldRecovery, newRecovery,
+		[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+		"fallback", "fallback",
+	)
+	defer oldFC.Close()
+	defer newFC.Close()
+
+	transfer, reason := newFC.prepareReloadTransfer(oldFC)
+	require.NotNil(t, transfer)
+	require.Empty(t, reason)
+	defer transfer.Commit()
+
+	require.Equal(t, 0, oldSched.PendingCount())
+
+	newFC.mu.Lock()
+	defer newFC.mu.Unlock()
+	require.Equal(t, 1, newFC.recoveryTarget)
+	require.Equal(t, 2, newFC.failedRecoveryProbes)
+	require.True(t, newFC.rotationActive)
 }
 
 // TestFailoverReloadIdentityMismatchLeavesOldRecoveryRunning proves that an
@@ -1210,45 +1279,65 @@ func TestFailoverReloadRollbackStaleProbeCannotClobberReplacement(t *testing.T) 
 	}
 }
 
-// TestFailoverReloadInvalidConfigLeavesOldControllerActive proves that an
-// invalid role resolution error during reload does not touch old controller
-// snapshot/timer state.
 func TestFailoverReloadInvalidConfigLeavesOldControllerActive(t *testing.T) {
-	recovery := baseReloadRecoveryConfig()
-	oldFC, _, oldSched, _, _, _ := reloadTestControllers(
-		t,
-		recovery,
-		recovery,
-		[]string{"A", "B", "C"},
-		[]string{"A", "B", "C"},
-		"fallback",
-		"fallback",
-	)
-	defer oldFC.Close()
-	option := testFailoverDialerOption()
-	a := newNamedDirectDialer(option, "A")
-	b := newNamedDirectDialer(option, "B")
-	set := &DialerSet{dialers: []*dialer.Dialer{a, b}}
-	before := oldFC.CaptureSnapshot()
-	beforePending := oldSched.PendingCount()
+	invalidCases := []struct {
+		name      string
+		mutate    func(*FailoverRecoveryConfig)
+		wantError string
+	}{
+		{"role overlap", func(c *FailoverRecoveryConfig) {}, "overlaps primary"},
+		{"invalid enum", func(c *FailoverRecoveryConfig) { c.Backoff = 255 }, "backoff enum"},
+		{"exponential zero max", func(c *FailoverRecoveryConfig) { c.ProbeMax = 0 }, "must be positive"},
+		{"exponential initial above max", func(c *FailoverRecoveryConfig) { c.ProbeInitial = 10 * time.Minute }, "must not exceed"},
+		{"invalid initial duration", func(c *FailoverRecoveryConfig) { c.ProbeInitial = 0 }, "must be positive"},
+	}
 
-	_, _, _, err := set.ResolveFailoverRoles(
-		exactNameFunction("A", "B"),
-		exactNameFunction("A"),
-		baseReloadRecoveryConfig(),
-	)
-	require.ErrorContains(t, err, "overlaps primary")
+	for _, tt := range invalidCases {
+		t.Run(tt.name, func(t *testing.T) {
+			recovery := baseReloadRecoveryConfig()
+			oldFC, _, oldSched, _, _, _ := reloadTestControllers(
+				t, recovery, recovery,
+				[]string{"A", "B", "C"}, []string{"A", "B", "C"},
+				"fallback", "fallback",
+			)
+			defer oldFC.Close()
 
-	after := oldFC.CaptureSnapshot()
-	require.Equal(t, before, after)
-	require.Equal(t, beforePending, oldSched.PendingCount())
+			option := testFailoverDialerOption()
+			a := newNamedDirectDialer(option, "A")
+			b := newNamedDirectDialer(option, "B")
+			x := newNamedDirectDialer(option, "X")
+			set := &DialerSet{dialers: []*dialer.Dialer{a, b, x}}
 
-	// The invalid replacement never entered transfer preparation, so the old
-	// controller must still own and execute its timer, not merely retain a
-	// snapshot that looks unchanged.
-	oldSched.FireNext(t)
-	continued := oldFC.CaptureSnapshot()
-	require.Equal(t, before.FailedRecoveryProbes+1, continued.FailedRecoveryProbes)
-	require.Equal(t, before.RecoveryTargetName, continued.RecoveryTargetName)
-	require.Equal(t, 1, oldSched.PendingCount())
+			before := oldFC.CaptureSnapshot()
+			beforePending := oldSched.PendingCount()
+
+			badRecovery := baseReloadRecoveryConfig()
+			if tt.name == "role overlap" {
+				_, _, _, err := set.ResolveFailoverRoles(
+					exactNameFunction("A", "B"),
+					exactNameFunction("A"),
+					badRecovery,
+				)
+				require.ErrorContains(t, err, tt.wantError)
+			} else {
+				tt.mutate(&badRecovery)
+				_, _, _, err := set.ResolveFailoverRoles(
+					exactNameFunction("A", "B"),
+					exactNameFunction("X"),
+					badRecovery,
+				)
+				require.ErrorContains(t, err, tt.wantError)
+			}
+
+			after := oldFC.CaptureSnapshot()
+			require.Equal(t, before, after)
+			require.Equal(t, beforePending, oldSched.PendingCount())
+
+			oldSched.FireNext(t)
+			continued := oldFC.CaptureSnapshot()
+			require.Equal(t, before.FailedRecoveryProbes+1, continued.FailedRecoveryProbes)
+			require.Equal(t, before.RecoveryTargetName, continued.RecoveryTargetName)
+			require.Equal(t, 1, oldSched.PendingCount())
+		})
+	}
 }

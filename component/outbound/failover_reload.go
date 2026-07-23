@@ -111,6 +111,28 @@ func (t *FailoverReloadTransfer) Rollback() {
 //
 // The precedence is fixed so a single reload that changes multiple categories
 // produces a stable reason regardless of evaluation order.
+func equalFailoverRecoveryConfig(old, next FailoverRecoveryConfig) bool {
+	if old.Backoff != next.Backoff ||
+		old.ProbeInitial != next.ProbeInitial ||
+		old.Successes != next.Successes ||
+		old.StableTime != next.StableTime ||
+		old.RotationAttempts != next.RotationAttempts {
+		return false
+	}
+	if old.Backoff == FailoverProbeBackoffExponential && old.ProbeMax != next.ProbeMax {
+		return false
+	}
+	return true
+}
+
+// compareFailoverReloadIdentity returns (true, "") when the two identities are
+// compatible for warm-reload inheritance. Otherwise it returns (false, reason)
+// where reason follows the deterministic precedence:
+//
+//	fallback_changed > primary_candidates_changed > recovery_policy_changed
+//
+// The precedence is fixed so a single reload that changes multiple categories
+// produces a stable reason regardless of evaluation order.
 func compareFailoverReloadIdentity(old, next FailoverReloadIdentity) (bool, string) {
 	if old.Fallback != next.Fallback {
 		return false, "fallback_changed"
@@ -118,7 +140,7 @@ func compareFailoverReloadIdentity(old, next FailoverReloadIdentity) (bool, stri
 	if !slices.Equal(old.PrimaryCandidates, next.PrimaryCandidates) {
 		return false, "primary_candidates_changed"
 	}
-	if old.Recovery != next.Recovery {
+	if !equalFailoverRecoveryConfig(old.Recovery, next.Recovery) {
 		return false, "recovery_policy_changed"
 	}
 	return true, ""
