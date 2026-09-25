@@ -96,18 +96,19 @@ func validateRoutingRules(log *logrus.Logger, conf *config.Config, externGeoData
 		return fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
 	}
 
-	// Same outbound namespace the control plane builds: the implicit direct
-	// and block groups plus every configured group name.
+	// Same outbound namespace the control plane builds: the implicit direct,
+	// block, and reject groups plus every configured group name.
 	outboundNames := map[string]struct{}{
 		consts.OutboundDirect.String(): {},
 		consts.OutboundBlock.String():  {},
+		consts.OutboundReject.String(): {},
 	}
 	for _, group := range conf.Group {
 		outboundNames[group.Name] = struct{}{}
 	}
 	resolveOutbound := func(name string) error {
 		switch name {
-		case consts.OutboundDirect.String(), consts.OutboundBlock.String(),
+		case consts.OutboundDirect.String(), consts.OutboundBlock.String(), consts.OutboundReject.String(),
 			consts.OutboundLogicalOr.String(), consts.OutboundLogicalAnd.String(),
 			consts.OutboundMustRules.String(), consts.OutboundControlPlaneRouting.String():
 			return nil
