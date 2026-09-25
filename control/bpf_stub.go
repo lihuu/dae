@@ -241,7 +241,6 @@ type bpfMapSpecs struct {
 	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.MapSpec `ebpf:"wan_egress_route_scratch_map"`
 	PktScratchMap            *ebpf.MapSpec `ebpf:"pkt_scratch_map"`
-	FakeipTestOverrideMap    *ebpf.MapSpec `ebpf:"fakeip_test_override_map"`
 }
 
 type bpfVariableSpecs struct {
@@ -286,7 +285,6 @@ type bpfMaps struct {
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`
 	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
-	FakeipTestOverrideMap    *ebpf.Map `ebpf:"fakeip_test_override_map"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -315,7 +313,6 @@ func (m *bpfMaps) Close() error {
 		m.UnusedLpmType,
 		m.WanEgressRouteScratchMap,
 		m.PktScratchMap,
-		m.FakeipTestOverrideMap,
 	)
 }
 

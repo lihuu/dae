@@ -52,6 +52,10 @@ func loadABRegressionObjectsWithMark(t *testing.T, soMark uint32) *bpftestObject
 		hasBpfGetCurrentTask uint8
 		datapathGeneration   uint16
 		daeSocketMark        uint32
+		fakeipV4Network      uint32
+		fakeipV4Mask         uint32
+		fakeipEnabled        uint8
+		fakeipPadding        [3]uint8
 	}{
 		datapathGeneration: 41,
 		daeSocketMark:      soMark,

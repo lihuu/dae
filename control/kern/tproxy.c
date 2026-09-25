@@ -238,53 +238,20 @@ struct dae_param {
  * can be rewritten from userspace via RewriteConstants. */
 const volatile struct dae_param PARAM = {};
 
-/* Test-only override for FakeIP parameters. When this map exists and entry 0
- * is populated, it takes precedence over PARAM for FakeIP checks. This allows
- * BPF tests to enable FakeIP without rewriting .rodata constants.
- * Always compiled in (the map is zero-cost when not populated). */
-struct fakeip_test_override {
-	__u32 network;
-	__u32 mask;
-	__u8 enabled;
-	__u8 padding[3];
-};
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u32);
-	__type(value, struct fakeip_test_override);
-	__uint(max_entries, 1);
-} fakeip_test_override_map SEC(".maps");
-
 /* is_fakeip_v4_destination checks whether the destination IPv4 address falls
  * within the configured FakeIP prefix. Works on IPv4-mapped IPv6 addresses
  * where the IPv4 portion is in u6_addr32[3]. */
 static __always_inline bool is_fakeip_v4_addr(const __be32 dip[4])
 {
+	if (!PARAM.fakeip_enabled)
+		return false;
+
 	if (dip[0] != 0 || dip[1] != 0 ||
 	    dip[2] != bpf_htonl(0x0000ffff)) {
 		return false;
 	}
 
-	__u32 network, mask;
-	__u8 enabled;
-
-	__u32 zero = 0;
-	struct fakeip_test_override *ov =
-		bpf_map_lookup_elem(&fakeip_test_override_map, &zero);
-	if (ov) {
-		enabled = ov->enabled;
-		network = ov->network;
-		mask = ov->mask;
-	} else {
-		enabled = PARAM.fakeip_enabled;
-		network = PARAM.fakeip_v4_network;
-		mask = PARAM.fakeip_v4_mask;
-	}
-
-	if (!enabled)
-		return false;
-	__be32 dst = dip[3];
-	return (dst & mask) == network;
+	return (dip[3] & PARAM.fakeip_v4_mask) == PARAM.fakeip_v4_network;
 }
 
 static __always_inline bool
@@ -3096,6 +3063,7 @@ rewrite_lan_ingress_tcp_reset(struct __sk_buff *skb, __u32 link_h_len)
 	ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
 	ip->check = 0;
 	__u16 ip_csum = csum_fold_region(ip, sizeof(struct iphdr), 0);
+
 	ip->check = (__be16)~ip_csum;
 
 	__u32 pseudo[3] = {0};
@@ -3107,6 +3075,7 @@ rewrite_lan_ingress_tcp_reset(struct __sk_buff *skb, __u32 link_h_len)
 	tcp->check = 0;
 	__u16 pseudo_sum = csum_fold_region(&pseudo[0], sizeof(pseudo), 0);
 	__u16 tcp_sum = csum_fold_region(tcp, sizeof(struct tcphdr), pseudo_sum);
+
 	tcp->check = (__be16)~tcp_sum;
 
 	return bpf_redirect(skb->ifindex, 0);

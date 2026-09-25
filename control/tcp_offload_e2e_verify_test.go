@@ -28,6 +28,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -184,6 +185,9 @@ func runTCPOffloadSentAccountE2E(t *testing.T, address string, destination bool)
 		fl, hook, attachErr = attachTCPOffloadAccount(coll.Programs["tcp_offload_sent_account"], coll.Programs["tcp_offload_sent_account_kprobe"])
 	}
 	if attachErr != nil {
+		if !tcpOffloadKprobeFallbackSupported(runtime.GOARCH) {
+			t.Skipf("skipping on %s: accounting hook unsupported: %v", runtime.GOARCH, attachErr)
+		}
 		t.Fatalf("L1 FAIL: accounting attach: %v", attachErr)
 	}
 	defer func() { _ = fl.Close() }()
