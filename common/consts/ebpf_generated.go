@@ -26,13 +26,14 @@ type OutboundIndex uint8
 const (
 	OutboundDirect              OutboundIndex = 0x0
 	OutboundBlock               OutboundIndex = 0x1
+	OutboundReject              OutboundIndex = 0x2
 	OutboundMustRules           OutboundIndex = 0xFC
 	OutboundControlPlaneRouting OutboundIndex = 0xFD
 	OutboundLogicalOr           OutboundIndex = 0xFE
 	OutboundLogicalAnd          OutboundIndex = 0xFF
 	OutboundLogicalMask         OutboundIndex = 0xFE
-	OutboundUserDefinedMin      OutboundIndex = OutboundBlock + 1
-	OutboundUserDefinedMax                    = OutboundMustRules - 1
+	OutboundUserDefinedMin      OutboundIndex = 0x3
+	OutboundUserDefinedMax                    = 0xFB
 )
 
 type L4ProtoType uint8

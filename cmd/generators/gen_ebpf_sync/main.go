@@ -118,8 +118,9 @@ func writeGo(path string, spec syncSpec) error {
 	for _, nv := range spec.Outbound {
 		fmt.Fprintf(&b, "\t%s OutboundIndex = 0x%X\n", goOutboundName(nv.Name), nv.Value)
 	}
-	b.WriteString("\tOutboundUserDefinedMin OutboundIndex = OutboundBlock + 1\n")
-	b.WriteString("\tOutboundUserDefinedMax               = OutboundMustRules - 1\n")
+	userMin, userMax := userDefinedBounds(spec.Outbound)
+	fmt.Fprintf(&b, "\tOutboundUserDefinedMin OutboundIndex = 0x%X\n", userMin)
+	fmt.Fprintf(&b, "\tOutboundUserDefinedMax               = 0x%X\n", userMax)
 	b.WriteString(")\n\n")
 
 	b.WriteString("type L4ProtoType uint8\n\n")
@@ -154,6 +155,9 @@ func writeHeader(path string, spec syncSpec) error {
 	for _, nv := range spec.Outbound {
 		fmt.Fprintf(&b, "#define OUTBOUND_%s 0x%X\n", nv.Name, nv.Value)
 	}
+	userMinH, userMaxH := userDefinedBounds(spec.Outbound)
+	fmt.Fprintf(&b, "#define OUTBOUND_USER_DEFINED_MIN 0x%X\n", userMinH)
+	fmt.Fprintf(&b, "#define OUTBOUND_USER_DEFINED_MAX 0x%X\n", userMaxH)
 	b.WriteString("\n")
 
 	b.WriteString("enum __attribute__((packed)) MatchType {\n")
@@ -184,6 +188,8 @@ func goOutboundName(cName string) string {
 		return "OutboundDirect"
 	case "BLOCK":
 		return "OutboundBlock"
+	case "REJECT":
+		return "OutboundReject"
 	case "MUST_RULES":
 		return "OutboundMustRules"
 	case "CONTROL_PLANE_ROUTING":
@@ -197,6 +203,27 @@ func goOutboundName(cName string) string {
 	default:
 		return "Outbound" + toCamel(strings.ToLower(cName))
 	}
+}
+
+// userDefinedBounds derives the user-defined outbound index range from the spec.
+// Low reserved built-ins (value < 128) sit below the user range; the high
+// reserved range (LOGICAL_*/MUST_RULES/CONTROL_PLANE_ROUTING, value >= 128)
+// sits above it. The user range is [maxLow+1, minHigh-1].
+func userDefinedBounds(outbound []namedValue) (uint32, uint32) {
+	var maxLow uint32 = 0
+	var minHigh uint32 = 0xFF
+	for _, nv := range outbound {
+		if nv.Value < 128 {
+			if nv.Value > maxLow {
+				maxLow = nv.Value
+			}
+		} else {
+			if nv.Value < minHigh {
+				minHigh = nv.Value
+			}
+		}
+	}
+	return maxLow + 1, minHigh - 1
 }
 
 func goL4Name(name string) string {

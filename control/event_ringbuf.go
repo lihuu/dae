@@ -53,6 +53,8 @@ const (
 	// handoff that let a connection drain: the connection is not cut, and the
 	// next SYN moves it onto the current rules.
 	daeEventSynRebindRerouted
+	// daeEventRejected: connection rejected by routing rule (OUTBOUND_REJECT).
+	daeEventRejected
 )
 
 // daeEvent mirrors struct dae_event in control/kern/tproxy.c. The kernel writes
@@ -171,6 +173,8 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 			reportDatapathAnomaly(target, &ev, "pure SYN refused rewrite of a live flow's routing metadata")
 		case daeEventSynRebindRerouted:
 			reportDatapathFlowEvent(target, &ev, "pure SYN moved a live flow that outlived a rules change onto the current routing epoch")
+		case daeEventRejected:
+			reportDatapathFlowEvent(target, &ev, "connection rejected by routing rule")
 		case daeEventReservedStatelessTcpPassthrough, daeEventReservedFragTailPassed:
 			// Both types are reserved and never emitted; see the type table
 			// above. The matching bpf_stats_map counters reach the operator

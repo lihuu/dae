@@ -689,6 +689,8 @@ enum dae_event_type {
 	// A pure SYN on a live flow was re-routed because the flow's cached
 	// routing belonged to a different routing epoch or datapath generation.
 	DAE_EVENT_SYN_REBIND_REROUTED = 9,
+	// Connection rejected by routing rule (OUTBOUND_REJECT, LAN ingress TCP reset).
+	DAE_EVENT_REJECTED = 10,
 };
 
 struct dae_event {
@@ -2893,6 +2895,154 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 	return redirect_to_control_plane_ingress();
 }
 
+// ---------------------------------------------------------------------------
+// TCP RST injection for OUTBOUND_REJECT.
+// Rewrites the incoming LAN ingress TCP packet into an RFC 9293-compliant RST
+// and redirects it back out the ingress interface (bpf_redirect egress). IPv4
+// only; IPv6 falls back to drop.
+// ---------------------------------------------------------------------------
+
+// Swap 6-byte Ethernet source/destination addresses in place.
+static __always_inline void swap_eth_addrs(struct ethhdr *eth)
+{
+	__u8 tmp[6];
+
+	__builtin_memcpy(tmp, eth->h_source, 6);
+	__builtin_memcpy(eth->h_source, eth->h_dest, 6);
+	__builtin_memcpy(eth->h_dest, tmp, 6);
+}
+
+// Swap IPv4 source/destination addresses in place.
+static __always_inline void swap_ipv4_addrs(struct iphdr *ip)
+{
+	__be32 tmp = ip->saddr;
+
+	ip->saddr = ip->daddr;
+	ip->daddr = tmp;
+}
+
+// Swap TCP source/destination ports in place.
+static __always_inline void swap_tcp_ports(struct tcphdr *tcp)
+{
+	__be16 tmp = tcp->source;
+
+	tcp->source = tcp->dest;
+	tcp->dest = tmp;
+}
+
+// csum_fold_region computes the ones-complement sum of a bounded, even-length
+// region via a fully unrolled loop, then folds it to 16 bits. It returns the
+// RAW folded sum (NOT negated); callers combine partial sums through `seed` and
+// negate (~) once at the end to obtain the final Internet checksum value.
+static __always_inline __u16 csum_fold_region(const void *data, __u32 len,
+					      __u32 seed)
+{
+	__u32 sum = seed;
+	const __u16 *p = data;
+	__u32 i;
+
+#pragma unroll
+	for (i = 0; i < 20; i++) {
+		if (i * 2 + 1 >= len)
+			break;
+		sum += p[i];
+	}
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return (__u16)sum;
+}
+
+// set_tcp_reset_seqack fills the outgoing seq/ack per RFC 9293 for a TCP RST:
+//  - incoming SYN without ACK: ack = incoming seq + 1, seq = 0, set RST|ACK.
+//  - otherwise (ACK set): seq = incoming ack, set RST.
+static __always_inline void set_tcp_reset_seqack(struct tcphdr *tcp)
+{
+	__be32 in_seq = tcp->seq;
+	__be32 in_ack = tcp->ack_seq;
+	__u8 *raw_tcp = (__u8 *)tcp;
+	__u8 in_flags = tcph_flags(tcp);
+	__u8 out_flags;
+
+	if (!(in_flags & TCPH_ACK)) {
+		tcp->ack_seq = bpf_htonl(bpf_ntohl(in_seq) + 1);
+		tcp->seq = 0;
+		out_flags = TCPH_RST | TCPH_ACK;
+	} else {
+		tcp->seq = in_ack;
+		out_flags = TCPH_RST;
+	}
+	raw_tcp[12] = 5 << 4; /* data offset = 5 (20 bytes), res1 = 0 */
+	raw_tcp[13] = out_flags;
+}
+
+// rewrite_lan_ingress_tcp_reset rewrites the current LAN ingress TCP skb in
+// place into a TCP RST aimed back at the LAN client, then redirects it back out
+// the ingress interface via bpf_redirect (egress of skb->ifindex). Returns
+// TC_ACT_SHOT on any failure so reject degrades to drop, never to leak.
+static __always_inline int
+rewrite_lan_ingress_tcp_reset(struct __sk_buff *skb, __u32 link_h_len)
+{
+	__u32 hdr_len = link_h_len + sizeof(struct iphdr) + sizeof(struct tcphdr);
+
+	if (link_h_len == 0)
+		hdr_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
+
+	if (bpf_skb_change_tail(skb, hdr_len, 0))
+		return TC_ACT_SHOT;
+	if (bpf_skb_pull_data(skb, hdr_len))
+		return TC_ACT_SHOT;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = NULL;
+	void *l3 = data;
+
+	if (link_h_len) {
+		eth = data;
+		if ((void *)(eth + 1) > data_end)
+			return TC_ACT_SHOT;
+		l3 = (void *)(eth + 1);
+	}
+
+	struct iphdr *ip = l3;
+
+	if ((void *)(ip + 1) > data_end)
+		return TC_ACT_SHOT;
+	if (iphdr_version(ip) != 4)
+		return TC_ACT_SHOT;
+	if (iphdr_ihl(ip) != 5)
+		return TC_ACT_SHOT;
+
+	struct tcphdr *tcp = (void *)(ip + 1);
+
+	if ((void *)(tcp + 1) > data_end)
+		return TC_ACT_SHOT;
+
+	if (eth)
+		swap_eth_addrs(eth);
+	swap_ipv4_addrs(ip);
+	swap_tcp_ports(tcp);
+	set_tcp_reset_seqack(tcp);
+
+	ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+	ip->check = 0;
+	__u16 ip_csum = csum_fold_region(ip, sizeof(struct iphdr), 0);
+	ip->check = (__be16)~ip_csum;
+
+	__u32 pseudo[3] = {0};
+	__u16 tcp_len_be = bpf_htons((__u16)sizeof(struct tcphdr));
+
+	pseudo[0] = ip->saddr;
+	pseudo[1] = ip->daddr;
+	pseudo[2] = bpf_htons((__u16)IPPROTO_TCP) | ((__u32)tcp_len_be << 16);
+	tcp->check = 0;
+	__u16 pseudo_sum = csum_fold_region(&pseudo[0], sizeof(pseudo), 0);
+	__u16 tcp_sum = csum_fold_region(tcp, sizeof(struct tcphdr), pseudo_sum);
+	tcp->check = (__be16)~tcp_sum;
+
+	return bpf_redirect(skb->ifindex, 0);
+}
+
 /* LAN-ingress role body. Takes the packet already parsed by the middle layer
  * so that a dual-role attachment (wan_lan_ingress) parses exactly once. Kept
  * inline so the role's locals live in whichever middle-layer frame drives it
@@ -2958,6 +3108,13 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		}
 		if (unlikely(outbound == OUTBOUND_BLOCK))
 			return TC_ACT_SHOT;
+		if (unlikely(outbound == OUTBOUND_REJECT)) {
+			send_dae_event(DAE_EVENT_REJECTED, 0, NULL, false, outbound,
+				       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+				       pkt->tuples.five.dip.u6_addr32,
+				       pkt->tuples.five.sport, pkt->tuples.five.dport);
+			return rewrite_lan_ingress_tcp_reset(skb, link_h_len);
+		}
 		pkt->datapath_generation = tcp_state->datapath_generation;
 		return redirect_lan_packet_to_control_plane(
 			skb, link_h_len, pkt, tcp_state->meta.raw,
@@ -3134,6 +3291,13 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		else
 			bpf_printk("tcp(lan): SHOT - MAP FULL, PROXY CONNECTION DROPPED");
 #endif
+		if (unlikely(outbound == OUTBOUND_REJECT)) {
+			send_dae_event(DAE_EVENT_REJECTED, 0, NULL, false, outbound,
+				       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+				       pkt->tuples.five.dip.u6_addr32,
+				       pkt->tuples.five.sport, pkt->tuples.five.dport);
+			return rewrite_lan_ingress_tcp_reset(skb, link_h_len);
+		}
 		goto block;
 	}
 
@@ -3163,6 +3327,17 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 				   pkt->tuples.five.sip.u6_addr32,
 				   pkt->tuples.five.dip.u6_addr32,
 				   pkt->tuples.five.sport, pkt->tuples.five.dport);
+		goto block;
+	} else if (unlikely(outbound == OUTBOUND_REJECT)) {
+		send_dae_event(DAE_EVENT_REJECTED, 0, NULL, false, outbound,
+			       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
+			       pkt->tuples.five.dip.u6_addr32,
+			       pkt->tuples.five.sport, pkt->tuples.five.dport);
+		if (pkt->l4proto == IPPROTO_TCP) {
+			if (tcp_state)
+				bpf_map_delete_elem(&conn_state_map, &pkt->tuples.five);
+			return rewrite_lan_ingress_tcp_reset(skb, link_h_len);
+		}
 		goto block;
 	}
 
