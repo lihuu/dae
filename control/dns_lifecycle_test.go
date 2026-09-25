@@ -109,6 +109,8 @@ func (c *fakeEarlyConnection) ReceiveDatagram(context.Context) ([]byte, error) {
 	return nil, stderrors.New("unexpected ReceiveDatagram")
 }
 
+func (c *fakeEarlyConnection) ReleaseDatagram([]byte) {}
+
 func (c *fakeEarlyConnection) SetCongestionControl(congestion.CongestionControl) {}
 
 func (c *fakeEarlyConnection) HandshakeComplete() <-chan struct{} {

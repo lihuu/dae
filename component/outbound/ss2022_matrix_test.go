@@ -143,10 +143,11 @@ func TestSS2022_NewFromLink_Matrix(t *testing.T) {
 			},
 		},
 		{
-			name: "chacha20_multi_psk_valid_userinfo",
+			name: "chacha20_multi_psk_rejected",
 			buildLink: func() string {
 				return buildSSLinkUserInfo("2022-blake3-chacha20-poly1305", strings.Join([]string{psk32A, psk32B}, ":"), "n7")
 			},
+			wantErrMatch: "multi-PSK EIH requires an AES cipher",
 		},
 		{
 			name: "unsupported_ss2022_cipher",
