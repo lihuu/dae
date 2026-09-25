@@ -7,6 +7,7 @@ package control
 
 import (
 	"context"
+	"encoding/binary"
 	stderrors "errors"
 	"fmt"
 	"net"
@@ -112,7 +113,11 @@ type ControlPlane struct {
 	mptcp                  bool
 	udpRouteScopeSensitive bool
 	controlPlaneUDPRuntime
-	lastConnectionErrorLogTime     atomic.Int64
+	fakeIPStore                *FakeIPStore
+	directUpstreamName         string
+	dnsFakeIPTTL               int
+	lastUnknownFakeIPLogTime   atomic.Int64
+	lastConnectionErrorLogTime atomic.Int64
 	lastDnsFastPathErrorLogTime    atomic.Int64
 	lastDnsFastPathServfailLogTime atomic.Int64
 	lastHandlePktEpochWarnTime     atomic.Int64
@@ -179,6 +184,7 @@ type ControlPlaneBuildOptions struct {
 	TrieCache             *domain_matcher.TrieCache
 	SourceHash            []byte
 	RulesLoadObserver     rulesload.Observer
+	ReuseFakeIPStore      *FakeIPStore
 }
 
 var (
@@ -223,6 +229,7 @@ var (
 	routingHandoffSteadyInterval = 5 * time.Second
 	dnsFastPathErrorLogInterval  = 5 * time.Second
 	handlePktEpochWarnInterval   = 5 * time.Second
+	unknownFakeIPLogInterval     = 5 * time.Second
 
 	// Test seams: injected in tests to avoid external DNS dependency.
 	resolveIp46ForBootstrap       = netutils.ResolveIp46
@@ -500,11 +507,48 @@ func NewControlPlaneWithContextOptions(
 	} else {
 		bpf = new(bpfObjects)
 		datapathGeneration := nextDatapathGeneration()
+		// Parse FakeIP prefix for BPF constants. The prefix is converted to
+		// network-byte-order network/mask values that the eBPF program uses
+		// to test destination addresses via byte-level bitwise AND.
+		var fakeIPV4Network, fakeIPV4Mask uint32
+		fakeIPEnabled := false
+		if dnsConfig.FakeIP.Enabled {
+			fakeIPEnabled = true
+			prefix, err := netip.ParsePrefix(dnsConfig.FakeIP.Inet4Range)
+			if err != nil {
+				return nil, fmt.Errorf("parse fakeip inet4_range: %w", err)
+			}
+			masked := prefix.Masked()
+			// Network address bytes (network byte order, big-endian).
+			addrBytes := masked.Addr().As4()
+			// Build mask bytes in network order.
+			var maskBytes [4]byte
+			bits := masked.Bits()
+			for i := 0; i < 4; i++ {
+				if bits >= 8 {
+					maskBytes[i] = 0xFF
+					bits -= 8
+				} else if bits > 0 {
+					maskBytes[i] = ^uint8(0xFF >> bits)
+					bits = 0
+				} else {
+					maskBytes[i] = 0
+				}
+			}
+			// Reinterpret the network-order bytes as a little-endian uint32 so
+			// that when written to BPF .rodata on LE targets the byte layout
+			// matches the packet's network-order bytes for bitwise AND.
+			fakeIPV4Network = binary.LittleEndian.Uint32(addrBytes[:])
+			fakeIPV4Mask = binary.LittleEndian.Uint32(maskBytes[:])
+		}
 		if err = fullLoadBpfObjects(log, bpf, &loadBpfOptions{
 			PinPath:                pinPath,
 			CollectionOptions:      collectionOpts,
 			ConnStateMapMaxEntries: connStateMapMaxEntries,
 			DatapathGeneration:     datapathGeneration,
+			FakeIPEnabled:          fakeIPEnabled,
+			FakeIPV4Network:        fakeIPV4Network,
+			FakeIPV4Mask:           fakeIPV4Mask,
 		}, global.SoMarkFromDae); err != nil {
 			if log.Level == logrus.PanicLevel {
 				log.Panicln(err)
@@ -983,6 +1027,33 @@ func NewControlPlaneWithContextOptions(
 	plane.dnsOptimisticStaleReplyTtl = dnsConfig.OptimisticStaleReplyTtl
 	plane.dnsMaxCacheSize = dnsConfig.MaxCacheSize
 	plane.dnsIpVersionPrefer = dnsConfig.IpVersionPrefer
+	if dnsConfig.FakeIP.Enabled {
+		if buildOpts.ReuseFakeIPStore != nil {
+			plane.fakeIPStore = buildOpts.ReuseFakeIPStore
+		} else if plane.fakeIPStore == nil {
+			fakeIPPrefix, err := netip.ParsePrefix(dnsConfig.FakeIP.Inet4Range)
+			if err != nil {
+				return nil, fmt.Errorf("parse fakeip inet4_range: %w", err)
+			}
+			store, err := OpenFakeIPStore(dnsConfig.FakeIP.Store, fakeIPPrefix, log)
+			if err != nil {
+				return nil, fmt.Errorf("open fakeip store: %w", err)
+			}
+			plane.fakeIPStore = store
+			stats := store.Stats()
+			log.WithFields(logrus.Fields{
+				"prefix":        stats.Prefix.String(),
+				"store":         stats.StorePath,
+				"allocated":     stats.Allocated,
+				"capacity":      stats.Capacity,
+				"remaining":     stats.Remaining,
+				"next":          stats.Next.String(),
+				"recovered_dbs": stats.RecoveredDBs,
+			}).Info("FakeIP store opened")
+		}
+		plane.dnsFakeIPTTL = dnsConfig.FakeIP.TTL
+		plane.directUpstreamName = dnsConfig.FakeIP.DirectUpstream
+	}
 	plane.dnsController, err = NewDnsController(dnsUpstream, plane.dnsControllerOption())
 	if err != nil {
 		return nil, err
@@ -1436,6 +1507,16 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 		OptimisticStaleReplyTtl: c.dnsOptimisticStaleReplyTtl,
 		MaxCacheSize:            c.dnsMaxCacheSize,
 		IpVersionPrefer:         c.dnsIpVersionPrefer,
+		FakeIPEnabled:           c.fakeIPStore != nil,
+		FakeIPTTL:               c.dnsFakeIPTTL,
+		FakeIPStore:             c.fakeIPStore,
+		FakeIPBitmapPublisher: func(domain string, addr netip.Addr) error {
+			if c.routingMatcher == nil || c.routingMatcher.domainMatcher == nil || c.core == nil {
+				return nil
+			}
+			bitmap := c.routingMatcher.domainMatcher.MatchDomainBitmap(domain)
+			return c.core.UpdateDomainRoutingForAddr(addr, bitmap)
+		},
 	}
 }
 
@@ -3392,4 +3473,159 @@ func (c *ControlPlane) StartPreparedDNSListener() error {
 		return nil
 	}
 	return c.startPreparedDNSListener(c.ctx, &c.deferFuncs, c.stopOwnedDNSListener)
+}
+
+func (c *ControlPlane) allowUnknownFakeIPLog(now time.Time) bool {
+	nowNano := now.UnixNano()
+	for {
+		last := c.lastUnknownFakeIPLogTime.Load()
+		if nowNano-last < int64(unknownFakeIPLogInterval) {
+			return false
+		}
+		if c.lastUnknownFakeIPLogTime.CompareAndSwap(last, nowNano) {
+			return true
+		}
+	}
+}
+
+// ReuseFakeIPStoreFrom inherits the persistent FakeIP store from a retiring
+// control plane generation. This ensures the BoltDB handle is not opened twice
+// concurrently: the new generation takes ownership of the same store pointer,
+// and the old generation's Close will no longer close it (because only the
+// dnsControllerStore.closeOnce drives the actual Close, and on reload that
+// closeOnce is preserved via DNS controller reuse).
+//
+// Returns true if a store was inherited.
+func (c *ControlPlane) ReuseFakeIPStoreFrom(previous *ControlPlane) bool {
+	if c == nil || previous == nil {
+		return false
+	}
+	if previous.fakeIPStore == nil {
+		return false
+	}
+	c.fakeIPStore = previous.fakeIPStore
+	return true
+}
+
+// FakeIPStore returns the persistent FakeIP store owned by this control plane,
+// or nil if FakeIP is not enabled.
+func (c *ControlPlane) FakeIPStore() *FakeIPStore {
+	if c == nil {
+		return nil
+	}
+	return c.fakeIPStore
+}
+
+// lookupFakeIPDestination reverses a synthetic FakeIP destination to its
+// authoritative domain. Returns:
+//   - domain, true, nil: known FakeIP mapping
+//   - "", false, nil: address is not a FakeIP destination
+//   - "", false, err: address is inside the FakeIP prefix but has no mapping
+//     (indicates an unknown/stale synthetic address; caller should reject)
+func (c *ControlPlane) lookupFakeIPDestination(addr netip.Addr) (domain string, isFakeIP bool, err error) {
+	store := c.fakeIPStore
+	if store == nil {
+		return "", false, nil
+	}
+	prefix := store.Stats().Prefix
+	if !prefix.Contains(addr) {
+		return "", false, nil
+	}
+	d, ok := store.LookupDomain(addr)
+	if !ok {
+		return "", true, ErrUnknownFakeIP
+	}
+	return d, true, nil
+}
+
+// resolveFakeIPDirect resolves a FakeIP destination's domain via the configured
+// direct_upstream when business routing selected direct outbound. This bypasses
+// the FakeIP DNS synthesis and returns the real IP, allowing the direct dialer
+// to reach the actual destination instead of looping back through the FakeIP
+// DNS controller.
+//
+// Returns (zero, nil) when direct resolution is not applicable (FakeIP not
+// enabled, authoritativeDomain false, outbound not direct, or no direct_upstream
+// configured). Returns (addr, nil) on successful resolution, or (zero, err) on
+// resolution failure.
+func (c *ControlPlane) resolveFakeIPDirect(
+	ctx context.Context,
+	domain string,
+	authoritativeDomain bool,
+	outbound consts.OutboundIndex,
+	src netip.AddrPort,
+	routingResult *bpfRoutingResult,
+) (netip.Addr, error) {
+	if !authoritativeDomain || domain == "" {
+		return netip.Addr{}, nil
+	}
+	if outbound != consts.OutboundDirect {
+		return netip.Addr{}, nil
+	}
+	upstreamName := c.directUpstreamName
+	if upstreamName == "" {
+		return netip.Addr{}, nil
+	}
+	dnsCtrl := c.dnsController
+	if dnsCtrl == nil {
+		return netip.Addr{}, nil
+	}
+	req := &udpRequest{
+		realSrc:       src,
+		routingResult: routingResult,
+	}
+	addrs, err := dnsCtrl.ResolveAWithUpstream(ctx, domain, upstreamName, req)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("resolve %q via direct_upstream %q: %w", domain, upstreamName, err)
+	}
+	if len(addrs) == 0 {
+		return netip.Addr{}, fmt.Errorf("direct_upstream %q returned no A records for %q", upstreamName, domain)
+	}
+	return addrs[0], nil
+}
+
+// FakeIPStats returns a snapshot of the FakeIP store statistics, or (zero, false)
+// if FakeIP is not enabled.
+func (c *ControlPlane) FakeIPStats() (FakeIPStats, bool) {
+	if c == nil || c.fakeIPStore == nil {
+		return FakeIPStats{}, false
+	}
+	return c.fakeIPStore.Stats(), true
+}
+
+// replayFakeIPMappings re-publishes every persistent FakeIP domain->IP mapping
+// to the eBPF domain_routing_map with the current generation's domain bitmaps.
+// This is called after clearReloadDomainRoutingMap wipes the map so that the
+// kernel-space routing table is repopulated for all synthetic FakeIP addresses.
+// Unlike ordinary DNS cache replay, this does not depend on the DNS cache.
+func (c *ControlPlane) replayFakeIPMappings() {
+	if c == nil || c.dnsController == nil || c.routingMatcher == nil {
+		return
+	}
+	if c.routingMatcher.domainMatcher == nil {
+		return
+	}
+	if c.core == nil {
+		return
+	}
+	publishFn := func(domain string, addr netip.Addr, domainBitmap []uint32) error {
+		return c.core.UpdateDomainRoutingForAddr(addr, domainBitmap)
+	}
+	count, failed, rangeErr := c.dnsController.replayFakeIPMappings(c.routingMatcher.domainMatcher.MatchDomainBitmap, publishFn)
+	if c.fakeIPStore != nil {
+		stats := c.fakeIPStore.Stats()
+		switch {
+		case rangeErr != nil:
+			c.logFakeIPReloadFailed("reload_replay_failed", rangeErr)
+		case failed > 0:
+			c.logFakeIPReloadFailed("reload_replay_failed", fmt.Errorf("%d of %d mappings failed to publish", failed, count+failed))
+		default:
+			c.logFakeIPReloadOK(count, stats.StorePath, stats.Prefix.String())
+		}
+	}
+	if count > 0 {
+		if c.log != nil {
+			c.log.Infof("Replayed %d FakeIP domain routing mappings", count)
+		}
+	}
 }

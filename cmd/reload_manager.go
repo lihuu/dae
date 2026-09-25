@@ -670,5 +670,45 @@ func dnsConfigFingerprint(dns config.Dns) string {
 	b.WriteString("bind=")
 	b.WriteString(strconv.Quote(dns.Bind))
 	b.WriteByte(';')
+	b.WriteString("fakeip.enabled=")
+	b.WriteString(strconv.FormatBool(dns.FakeIP.Enabled))
+	b.WriteByte(';')
+	b.WriteString("fakeip.inet4_range=")
+	b.WriteString(strconv.Quote(dns.FakeIP.Inet4Range))
+	b.WriteByte(';')
+	b.WriteString("fakeip.ttl=")
+	b.WriteString(strconv.Itoa(dns.FakeIP.TTL))
+	b.WriteByte(';')
+	b.WriteString("fakeip.store=")
+	b.WriteString(strconv.Quote(dns.FakeIP.Store))
+	b.WriteByte(';')
+	b.WriteString("fakeip.direct_upstream=")
+	b.WriteString(strconv.Quote(dns.FakeIP.DirectUpstream))
+	b.WriteByte(';')
 	return b.String()
+}
+
+// fakeIPStoreIdentity returns a stable identity for FakeIP store compatibility
+// across reloads. Changes to enabled, inet4_range, or store require a full restart.
+func fakeIPStoreIdentity(dns config.Dns) string {
+	return dns.FakeIP.StoreIdentity()
+}
+
+// validateFakeIPReloadCompatibility checks whether the FakeIP store identity
+// (enabled, inet4_range, store path) has changed between the old and new
+// configurations. If the identity differs, the persistent BoltDB-backed FakeIP
+// store cannot be shared across reload, and a full dae restart is required.
+//
+// TTL and direct_upstream changes are reload-compatible (they only affect
+// generation-local runtime state, not the store identity).
+//
+// Returns nil if either config is nil (first start or reload-from-nothing).
+func validateFakeIPReloadCompatibility(oldConf, newConf *config.Config) error {
+	if oldConf == nil || newConf == nil {
+		return nil
+	}
+	if fakeIPStoreIdentity(oldConf.Dns) != fakeIPStoreIdentity(newConf.Dns) {
+		return fmt.Errorf("dns.fakeip inet4_range/store changes require a full dae restart")
+	}
+	return nil
 }

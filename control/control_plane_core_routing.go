@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 
+	"github.com/daeuniverse/dae/common"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -167,4 +168,39 @@ func (c *controlPlaneCore) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error 
 	}
 	_, err := BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
 	return err
+}
+
+// UpdateDomainRoutingForAddr publishes a single IP/bitmap pair to the BPF
+// domain_routing_map through the domain routing tracker. This dedicated helper
+// is used by FakeIP replay to republish each synthetic address without
+// constructing a full DnsCache.
+func (c *controlPlaneCore) UpdateDomainRoutingForAddr(addr netip.Addr, domainBitmap []uint32) error {
+	if c == nil {
+		return nil
+	}
+	if len(domainBitmap) != len(bpfDomainRouting{}.Bitmap) {
+		return fmt.Errorf("domain bitmap length not sync with kern program")
+	}
+	var snapshot domainRoutingOwnerSnapshot
+	copy(snapshot.bitmap.Bitmap[:], domainBitmap)
+	ip6 := addr.As16()
+	snapshot.ips = map[[4]uint32]struct{}{
+		common.Ipv6ByteSliceToUint32Array(ip6[:]): {},
+	}
+	bpf := c.PeekBpf()
+	if bpf == nil {
+		return nil
+	}
+	slot := c.RoutingEpochSlot()
+	if !validRoutingEpochSlot(slot) {
+		return fmt.Errorf("invalid domain routing epoch slot %d", slot)
+	}
+	c.domainRoutingProjectionMu[slot].RLock()
+	defer c.domainRoutingProjectionMu[slot].RUnlock()
+	tracker := c.domainRoutingTrackerForSlot(slot)
+	if tracker == nil {
+		return fmt.Errorf("domain routing tracker slot %d is unavailable", slot)
+	}
+	ownerKey := "fakeip:" + addr.String()
+	return tracker.syncOwnerForSlot(bpf.DomainRoutingMap, slot, ownerKey, snapshot)
 }

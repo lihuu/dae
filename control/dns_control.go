@@ -92,9 +92,22 @@ type DnsControllerOption struct {
 	// answers (RFC 8767); 0 keeps the previously packed TTL.
 	OptimisticStaleReplyTtl int
 	MaxCacheSize            int // maximum number of cache entries (0 = unlimited)
+	FakeIPEnabled           bool
+	FakeIPTTL               int
+	FakeIPStore             *FakeIPStore
+	// FakeIPBitmapPublisher publishes a persistent IP/bitmap pair to the eBPF
+	// domain_routing_map using a stable owner key (e.g. "fakeip:<addr>") that
+	// survives DNS cache eviction. It is called whenever FakeIP synthesizes an
+	// allocated FakeIP address; it is responsible for computing the domain
+	// routing bitmap and inserting it with is_dynamic=false.
+	FakeIPBitmapPublisher   func(domain string, addr netip.Addr) error
 }
 
 type dnsControllerStore struct {
+	// fakeIPStore is the long-lived persistent FakeIP domain->IP store.
+	// Opened once when FakeIP is first enabled and shared across reloads
+	// via the dnsControllerStore. Closed inside closeOnce on final shutdown.
+	fakeIPStore *FakeIPStore
 	// dnsCache uses sync.Map for lock-free concurrent access
 	dnsCache     sync.Map // map[string]*DnsCache
 	dnsCacheSize atomic.Int64
@@ -311,6 +324,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		log:                 option.Log,
 		dnsForwarderIdleTTL: dnsForwarderIdleTTL, // Use package-level default
 	}
+	controller.dnsControllerStore.fakeIPStore = option.FakeIPStore
 	if err := controller.TryUpdateRuntime(option, routing); err != nil {
 		return nil, err
 	}
@@ -355,6 +369,14 @@ func (c *DnsController) Close() error {
 		}
 		if c.janitorDone != nil {
 			janitorDone = c.janitorDone
+		}
+		// Close the persistent FakeIP store (if any) on final shutdown.
+		// closeOnce guarantees this runs exactly once even when multiple
+		// facades share the same dnsControllerStore.
+		if c.fakeIPStore != nil {
+			if err := c.fakeIPStore.Close(); err != nil && c.log != nil {
+				c.log.WithError(err).Warn("failed to close FakeIP store during final shutdown")
+			}
 		}
 	})
 	c.bpfUpdateStopMu.Unlock()

@@ -324,6 +324,10 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 			return herr
 		}
 
+		if handled, herr := c.serveFakeIPWithWriter_(dnsMessage, req, responseWriter, responseCacheKey, upstreamIndex); handled {
+			return herr
+		}
+
 		// Check cache after routing (non-reject case). Cache hits return
 		// immediately without singleflight; stale entries background-refresh.
 		if handled, herr := c.serveFromRespCacheWithRefresh_(dnsMessage, req, responseWriter,
@@ -546,6 +550,10 @@ func (c *DnsController) handleWithResponseWriter_(
 	}
 
 	if handled, herr := c.serveRejectWithWriter_(dnsMessage, req, responseWriter, baseCacheKey, upstreamIndex); handled {
+		return herr
+	}
+
+	if handled, herr := c.serveFakeIPWithWriter_(dnsMessage, req, responseWriter, responseCacheKey, upstreamIndex); handled {
 		return herr
 	}
 

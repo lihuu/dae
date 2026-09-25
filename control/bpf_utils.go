@@ -315,6 +315,16 @@ type loadBpfOptions struct {
 	ConnStateMapMaxEntries     uint32
 	RedirectTrackMapMaxEntries uint32
 	DatapathGeneration         uint16
+	FakeIPEnabled              bool
+	FakeIPV4Network            uint32
+	FakeIPV4Mask               uint32
+}
+
+func boolToUint8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 const (
@@ -666,6 +676,10 @@ retryLoadBpf:
 			hasBpfGetCurrentTask uint8
 			datapathGeneration   uint16
 			daeSocketMark        uint32
+			fakeipV4Network      uint32
+			fakeipV4Mask         uint32
+			fakeipEnabled        uint8
+			fakeipPadding        [3]uint8
 		}{
 			tproxyPort:           opts.BigEndianTproxyPort,
 			controlPlanePid:      uint32(os.Getpid()),
@@ -677,6 +691,10 @@ retryLoadBpf:
 			hasBpfGetCurrentTask: hasBpfGetCurrentTask,
 			datapathGeneration:   opts.DatapathGeneration,
 			daeSocketMark:        soMarkFromDae,
+			fakeipV4Network:      opts.FakeIPV4Network,
+			fakeipV4Mask:         opts.FakeIPV4Mask,
+			fakeipEnabled:        boolToUint8(opts.FakeIPEnabled),
+			fakeipPadding:        [3]uint8{0, 0, 0},
 		},
 		"EVENT_RATE": eventRateValue(),
 	}

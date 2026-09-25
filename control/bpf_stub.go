@@ -39,6 +39,10 @@ type bpfDaeParam struct {
 	HasBpfGetCurrentTask uint8
 	DatapathGeneration   uint16
 	DaeSocketMark        uint32 // mark set on dae's own sockets to identify them in eBPF
+	FakeipV4Network      uint32 // FakeIP IPv4 network address in network byte order
+	FakeipV4Mask         uint32 // FakeIP IPv4 prefix mask in network byte order
+	FakeipEnabled        uint8  // 0=disabled, 1=enabled
+	FakeipPadding        [3]uint8
 }
 
 type bpfDomainRouting struct {
@@ -237,6 +241,7 @@ type bpfMapSpecs struct {
 	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.MapSpec `ebpf:"wan_egress_route_scratch_map"`
 	PktScratchMap            *ebpf.MapSpec `ebpf:"pkt_scratch_map"`
+	FakeipTestOverrideMap    *ebpf.MapSpec `ebpf:"fakeip_test_override_map"`
 }
 
 type bpfVariableSpecs struct {
@@ -281,6 +286,7 @@ type bpfMaps struct {
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`
 	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
+	FakeipTestOverrideMap    *ebpf.Map `ebpf:"fakeip_test_override_map"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -309,6 +315,7 @@ func (m *bpfMaps) Close() error {
 		m.UnusedLpmType,
 		m.WanEgressRouteScratchMap,
 		m.PktScratchMap,
+		m.FakeipTestOverrideMap,
 	)
 }
 
@@ -404,6 +411,9 @@ type loadBpfOptions struct {
 	ConnStateMapMaxEntries     uint32
 	RedirectTrackMapMaxEntries uint32
 	DatapathGeneration         uint16
+	FakeIPEnabled              bool
+	FakeIPV4Network            uint32
+	FakeIPV4Mask               uint32
 }
 
 const (

@@ -206,10 +206,64 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		lConn = &bufioConn{Conn: lConn, reader: bufReader}
 	}
 
+	// FakeIP destination handling: reverse the synthetic address to the
+	// authoritative domain before sniffing. The eBPF program has already
+	// performed business routing and preserved the outbound; we must not
+	// reroute. For unknown FakeIP addresses (inside prefix but no mapping),
+	// reject the connection to prevent leakage.
 	var (
-		domain     string
-		lRelayConn netproxy.Conn = lConn
+		domain              string
+		lRelayConn          netproxy.Conn = lConn
+		authoritativeDomain bool
+		fakeIPAddr          netip.Addr
 	)
+	fakeIPDomain, isFakeIP, fakeIPErr := c.lookupFakeIPDestination(dst.Addr())
+	if isFakeIP {
+		fakeIPAddr = dst.Addr()
+		if fakeIPErr != nil {
+			// Unknown FakeIP: the address is in the configured prefix but has
+			// no persistent mapping. Reject to prevent synthetic-address leakage.
+			// Rate-limit both the structured event and the human log on the same
+			// token so a leaking client cannot flood the log stream.
+			if c.allowUnknownFakeIPLog(time.Now()) {
+				c.logFakeIPUnknown(dst.Addr(), src, "tcp", dst.Port())
+				if c.log.IsLevelEnabled(logrus.WarnLevel) {
+					c.log.WithFields(logrus.Fields{
+						"src": src.String(),
+						"dst": dst.String(),
+					}).Warn("Unknown FakeIP destination; rejecting connection")
+				}
+			}
+			return fmt.Errorf("unknown fakeip destination %v", dst)
+		}
+		domain = fakeIPDomain
+		authoritativeDomain = true
+		// FakeIP + DIRECT: resolve the domain via direct_upstream to get the
+		// real IP. Without this, the direct dialer would try to resolve the
+		// domain via the system resolver, which loops back through the FakeIP
+		// DNS controller (returning the synthetic IP again).
+		// Spec: resolution failure rejects the connection; no fallback.
+		if realAddr, err := c.resolveFakeIPDirect(ctx, domain, true, consts.OutboundIndex(routingResult.Outbound), src, routingResult); err != nil {
+			c.logFakeIPDirectResolveFailed(domain, dst.Addr(), c.directUpstreamName, "tcp", dst.Port(), err)
+			if c.log.IsLevelEnabled(logrus.WarnLevel) {
+				c.log.WithFields(logrus.Fields{
+					"src":      src.String(),
+					"dst":      dst.String(),
+					"domain":   domain,
+					"outbound": "direct",
+					"err":      err.Error(),
+				}).Warn("FakeIP direct resolution failed; rejecting connection")
+			}
+			return fmt.Errorf("fakeip direct resolution failed for %q: %w", domain, err)
+		} else if realAddr.IsValid() {
+			c.logFakeIPDirectResolveOK(domain, dst.Addr(), c.directUpstreamName, "tcp", dst.Port(), realAddr)
+			dst = netip.AddrPortFrom(realAddr, dst.Port())
+			authoritativeDomain = false // dialParam now dials the resolved IP directly
+		}
+		// Skip TCP sniffing: we already know the authoritative domain.
+		goto buildDialParam
+	}
+
 	if c.shouldTryTcpSniff(dst, routingResult) {
 		cacheKey := newTcpSniffNegKey(dst, routingResult)
 		now := time.Now()
@@ -270,10 +324,24 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		}
 	}
 
+buildDialParam:
 	dialParam := tcpProxyDialParamFromRoutingResult(routingResult, domain, src, dst)
+	dialParam.AuthoritativeDomain = authoritativeDomain
 	// Dial and relay.
 	rConn, res, err := c.routeDial(ctx, dialParam)
 	if err != nil {
+		if isFakeIP {
+			errorClass := "proxy_dial_failed"
+			outboundName := ""
+			dialTarget := ""
+			if res != nil && res.Outbound != nil {
+				outboundName = res.Outbound.Name
+			}
+			if res != nil {
+				dialTarget = res.DialTarget
+			}
+			c.logFakeIPDialError(domain, fakeIPAddr, src, "tcp", dst.Port(), outboundName, dialTarget, errorClass, err)
+		}
 		if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 			res.Outbound.HandleNoAliveDialer(
 				res.OrigNetworkType,
@@ -289,6 +357,9 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 			return nil
 		}
 		return fmt.Errorf("failed to dial %v: %w", dst, err)
+	}
+	if isFakeIP && res != nil {
+		c.logFakeIPFlow(domain, fakeIPAddr, src, "tcp", dst.Port(), res.Outbound.Name, string(res.Outbound.GetSelectionPolicy()), res.DialTarget)
 	}
 	if ownership != nil {
 		ownership.storePendingEgress(rConn)
@@ -363,15 +434,16 @@ func relayEstablishedTCPFlow(
 }
 
 type RouteDialParam struct {
-	Outbound    consts.OutboundIndex
-	Must        bool
-	Domain      string
-	Mac         [6]uint8
-	Dscp        uint8
-	ProcessName [16]uint8
-	Src         netip.AddrPort
-	Dest        netip.AddrPort
-	Mark        uint32
+	Outbound            consts.OutboundIndex
+	Must                bool
+	Domain              string
+	Mac                 [6]uint8
+	Dscp                uint8
+	ProcessName         [16]uint8
+	Src                 netip.AddrPort
+	Dest                netip.AddrPort
+	Mark                uint32
+	AuthoritativeDomain bool
 }
 
 func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err error) {
@@ -400,16 +472,17 @@ func tcpProxyDialParamFromRoutingResult(routingResult *bpfRoutingResult, domain 
 
 func (p *RouteDialParam) toProxyDialParam() *proxyDialParam {
 	return &proxyDialParam{
-		Outbound:    p.Outbound,
-		Must:        p.Must,
-		Domain:      p.Domain,
-		Mac:         p.Mac,
-		Dscp:        p.Dscp,
-		ProcessName: p.ProcessName,
-		Src:         p.Src,
-		Dest:        p.Dest,
-		Mark:        p.Mark,
-		Network:     "tcp",
+		Outbound:            p.Outbound,
+		Must:                p.Must,
+		Domain:              p.Domain,
+		Mac:                 p.Mac,
+		Dscp:                p.Dscp,
+		ProcessName:         p.ProcessName,
+		Src:                 p.Src,
+		Dest:                p.Dest,
+		Mark:                p.Mark,
+		Network:             "tcp",
+		AuthoritativeDomain: p.AuthoritativeDomain,
 	}
 }
 

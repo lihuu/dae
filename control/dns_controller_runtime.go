@@ -8,6 +8,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/daeuniverse/dae/component/dns"
@@ -31,6 +32,10 @@ type dnsControllerRuntimeState struct {
 	optimisticCacheTtl      int
 	optimisticStaleReplyTtl int
 	maxCacheSize            int
+	fakeIPEnabled           bool
+	fakeIPTTL               int
+	fakeIPStore             *FakeIPStore
+	fakeIPBitmapPublisher   func(domain string, addr netip.Addr) error
 }
 
 func normalizeDnsRuntimeBehavior(option *DnsControllerOption) (qtypePrefer uint16, optimisticCacheEnabled bool, optimisticCacheTtl int, optimisticStaleReplyTtl int, maxCacheSize int, err error) {
@@ -76,7 +81,10 @@ func (c *DnsController) ReuseForReload(option *DnsControllerOption, routing *dns
 	if c == nil {
 		return nil, nil
 	}
-	c.ensureStoreForReload()
+	store := c.ensureStoreForReload()
+	if option != nil && option.FakeIPStore == nil && store != nil && store.fakeIPStore != nil {
+		option.FakeIPStore = store.fakeIPStore
+	}
 	previousRuntime := c.runtime()
 	projectionUnchanged := previousRuntime != nil && option != nil &&
 		option.RouteProjectionHash != ([32]byte{}) &&
@@ -153,6 +161,10 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		optimisticCacheTtl:      optimisticCacheTtl,
 		optimisticStaleReplyTtl: optimisticStaleReplyTtl,
 		maxCacheSize:            maxCacheSize,
+		fakeIPEnabled:           option.FakeIPEnabled,
+		fakeIPTTL:               option.FakeIPTTL,
+		fakeIPStore:             option.FakeIPStore,
+		fakeIPBitmapPublisher:   option.FakeIPBitmapPublisher,
 	}
 	c.runtimeMu.Lock()
 	c.runtimeState.Store(runtimeState)

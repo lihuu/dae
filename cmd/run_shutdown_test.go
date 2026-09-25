@@ -845,6 +845,7 @@ func TestDNSConfigFingerprintCoversAllDnsFields(t *testing.T) {
 		"Upstream":        {},
 		"Routing":         {},
 		"Bind":            {},
+		"FakeIP":          {},
 	}
 
 	// Fields that are intentionally EXCLUDED from dnsConfigFingerprint

@@ -615,6 +615,37 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 		forceSymmetricKey = udpRouteScopeNeedsDestinationAffinity(routingResult)
 	}
 
+	// FakeIP destination handling for UDP: reverse the synthetic address to
+	// the authoritative domain, skip QUIC sniffing, and force destination-affine
+	// endpoint keys so different domains using the same FakeIP prefix don't
+	// share endpoints.
+	var authoritativeDomain bool
+	var fakeIPAddr netip.Addr
+	var isFakeIP bool
+	fakeIPDomain, isFake, fakeIPErr := c.lookupFakeIPDestination(realDst.Addr())
+	if isFake {
+		isFakeIP = true
+		fakeIPAddr = realDst.Addr()
+		if fakeIPErr != nil {
+			// Unknown FakeIP: reject to prevent synthetic-address leakage.
+			// Rate-limit the structured event together with the human warn on
+			// the same token to bound log volume during synthetic-address leaks.
+			if c.allowUnknownFakeIPLog(time.Now()) {
+				c.logFakeIPUnknown(realDst.Addr(), realSrc, "udp", realDst.Port())
+				if c.log.IsLevelEnabled(logrus.WarnLevel) {
+					c.log.WithFields(logrus.Fields{
+						"src": src.String(),
+						"dst": realDst.String(),
+					}).Warn("Unknown FakeIP UDP destination; dropping packet")
+				}
+			}
+			return nil
+		}
+		domain = fakeIPDomain
+		authoritativeDomain = true
+		forceSymmetricKey = true // destination-affine endpoint key
+	}
+
 	// DNS to port 53 never reaches this point in production: the ingress
 	// task intercepts valid DNS messages and answers them before calling
 	// into the handlePkt chain (see udp_ingress_task.go). Port-53 packets
@@ -633,7 +664,7 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 	// This avoids double sync.Map lookups by pre-selecting the appropriate key:
 	// - Symmetric NAT (Src+Dst) for confirmed QUIC/sniffing sessions on sniff-eligible UDP
 	// - Full-Cone NAT (Src-only) for other UDP traffic
-	isQuicInitial := flowDecision.IsQuicInitial
+	isQuicInitial := flowDecision.IsQuicInitial && !isFakeIP
 	var quicSnifferKey PacketSnifferKey
 	failedQuicDcidKnown := false
 	if isQuicInitial {
@@ -1062,22 +1093,65 @@ getNew:
 				}
 			},
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
+				outboundIdx := consts.OutboundIndex(routingResult.Outbound)
+				dest := realDst
+				authDomain := authoritativeDomain
+
+				// FakeIP + DIRECT: resolve the domain via direct_upstream to
+				// get the real IP. Without this, the direct dialer would
+				// resolve the domain via the FakeIP DNS controller (looping
+				// back to the synthetic IP). We keep realDst unchanged so the
+				// endpoint key (based on the FakeIP) still matches subsequent
+				// packets in the same flow.
+				// Spec: resolution failure rejects the connection; no fallback.
+				if authDomain {
+					if resolvedAddr, resolveErr := c.resolveFakeIPDirect(ctx, domain, authDomain, outboundIdx, realSrc, routingResult); resolveErr != nil {
+						c.logFakeIPDirectResolveFailed(domain, realDst.Addr(), c.directUpstreamName, "udp", realDst.Port(), resolveErr)
+						if c.log.IsLevelEnabled(logrus.WarnLevel) {
+							c.log.WithFields(logrus.Fields{
+								"src":      realSrc.String(),
+								"dst":      realDst.String(),
+								"domain":   domain,
+								"outbound": "direct",
+								"err":      resolveErr.Error(),
+							}).Warn("FakeIP direct resolution failed; rejecting flow")
+						}
+						return nil, fmt.Errorf("fakeip direct resolution failed for %q: %w", domain, resolveErr)
+					} else if resolvedAddr.IsValid() {
+						c.logFakeIPDirectResolveOK(domain, realDst.Addr(), c.directUpstreamName, "udp", realDst.Port(), resolvedAddr)
+						dest = netip.AddrPortFrom(resolvedAddr, realDst.Port())
+						authDomain = false
+					}
+				}
+
 				dialParam := &proxyDialParam{
-					Outbound:    consts.OutboundIndex(routingResult.Outbound),
-					Must:        routingResult.Must != 0,
-					Domain:      domain,
-					Mac:         routingResult.Mac,
-					Dscp:        routingResult.Dscp,
-					ProcessName: routingResult.Pname,
-					Src:         realSrc,
-					Dest:        realDst,
-					Mark:        routingResult.Mark,
-					Network:     "udp",
-					Excluded:    excludedDialer,
+					Outbound:            outboundIdx,
+					Must:                routingResult.Must != 0,
+					Domain:              domain,
+					Mac:                 routingResult.Mac,
+					Dscp:                routingResult.Dscp,
+					ProcessName:         routingResult.Pname,
+					Src:                 realSrc,
+					Dest:                dest,
+					Mark:                routingResult.Mark,
+					Network:             "udp",
+					Excluded:            excludedDialer,
+					AuthoritativeDomain: authDomain,
 				}
 
 				res, err := c.chooseProxyDialer(dialParam)
 				if err != nil {
+					if isFakeIP {
+						outboundName := ""
+						dialTarget := ""
+						if res != nil && res.Outbound != nil {
+							outboundName = res.Outbound.Name
+						}
+						if res != nil {
+							dialTarget = res.DialTarget
+						}
+						c.logFakeIPDialError(domain, fakeIPAddr, realSrc, "udp", realDst.Port(), outboundName, dialTarget, "proxy_dial_failed", err)
+					}
 					if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 						res.Outbound.HandleNoAliveDialer(
 							res.OrigNetworkType,
@@ -1092,6 +1166,9 @@ getNew:
 					return nil, err
 				}
 				if shouldRejectNewUdpDialSelection(res) {
+					if isFakeIP {
+						c.logFakeIPDialError(domain, fakeIPAddr, realSrc, "udp", realDst.Port(), res.Outbound.Name, res.DialTarget, "proxy_dial_failed", ob.ErrNoAliveDialer)
+					}
 					if res.Outbound != nil {
 						res.Outbound.HandleNoAliveDialer(
 							res.OrigNetworkType,
@@ -1105,9 +1182,16 @@ getNew:
 					return nil, ob.ErrNoAliveDialer
 				}
 
+				target := dialTarget
+				if res.DialTarget != "" {
+					target = res.DialTarget
+				}
+				if isFakeIP {
+					c.logFakeIPFlow(domain, fakeIPAddr, realSrc, "udp", realDst.Port(), res.Outbound.Name, string(res.Outbound.GetSelectionPolicy()), target)
+				}
+
 				option = &DialOption{
-					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
-					Target:        dialTarget,
+					Target:        target,
 					Dialer:        res.Dialer,
 					Outbound:      res.Outbound,
 					Network:       res.Network,
@@ -1131,6 +1215,9 @@ getNew:
 				return fmt.Errorf("failed to GetOrCreate: %w", err)
 			}
 			return nil
+		}
+		if ue != nil && ue.DialTarget != "" {
+			dialTarget = ue.DialTarget
 		}
 	}
 

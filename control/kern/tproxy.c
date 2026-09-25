@@ -225,12 +225,73 @@ struct dae_param {
 	// When bpf_sk_lookup_* finds a socket, we check this mark to skip dae's own sockets.
 	// This prevents false positives in NAT loopback detection for transparent proxying.
 	__u32 dae_socket_mark;
+	// FakeIP interception: when enabled, destinations within the configured
+	// IPv4 prefix are redirected to userspace even if routing result is DIRECT.
+	__u32 fakeip_v4_network; // network address in network byte order
+	__u32 fakeip_v4_mask;    // prefix mask in network byte order
+	__u8 fakeip_enabled;     // 0=disabled, 1=enabled
+	__u8 fakeip_padding[3];
 };
 
 /* Use const volatile for cilium/ebpf v0.20.0 compatibility.
  * This ensures the variable is placed in .rodata section and
  * can be rewritten from userspace via RewriteConstants. */
 const volatile struct dae_param PARAM = {};
+
+/* Test-only override for FakeIP parameters. When this map exists and entry 0
+ * is populated, it takes precedence over PARAM for FakeIP checks. This allows
+ * BPF tests to enable FakeIP without rewriting .rodata constants.
+ * Always compiled in (the map is zero-cost when not populated). */
+struct fakeip_test_override {
+	__u32 network;
+	__u32 mask;
+	__u8 enabled;
+	__u8 padding[3];
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct fakeip_test_override);
+	__uint(max_entries, 1);
+} fakeip_test_override_map SEC(".maps");
+
+/* is_fakeip_v4_destination checks whether the destination IPv4 address falls
+ * within the configured FakeIP prefix. Works on IPv4-mapped IPv6 addresses
+ * where the IPv4 portion is in u6_addr32[3]. */
+static __always_inline bool is_fakeip_v4_addr(const __be32 dip[4])
+{
+	if (dip[0] != 0 || dip[1] != 0 ||
+	    dip[2] != bpf_htonl(0x0000ffff)) {
+		return false;
+	}
+
+	__u32 network, mask;
+	__u8 enabled;
+
+	__u32 zero = 0;
+	struct fakeip_test_override *ov =
+		bpf_map_lookup_elem(&fakeip_test_override_map, &zero);
+	if (ov) {
+		enabled = ov->enabled;
+		network = ov->network;
+		mask = ov->mask;
+	} else {
+		enabled = PARAM.fakeip_enabled;
+		network = PARAM.fakeip_v4_network;
+		mask = PARAM.fakeip_v4_mask;
+	}
+
+	if (!enabled)
+		return false;
+	__be32 dst = dip[3];
+	return (dst & mask) == network;
+}
+
+static __always_inline bool
+is_fakeip_v4_destination(const struct tuples_key *five)
+{
+	return is_fakeip_v4_addr(five->dip.u6_addr32);
+}
 
 /* dae_ifindex_map holds the runtime-updatable ifindex of the dae0 device.
  * Unlike PARAM.dae0_ifindex (frozen in .rodata at load time), this ARRAY map
@@ -1523,6 +1584,7 @@ parse_packet(struct __sk_buff *skb, __u32 link_h_len,
 struct route_ctx {
 	__u32 flag[8];
 	__u8 is_wan;
+	bool fakeip_v4_destination;
 	__be32 mac[4];
 	__u16 h_dport;
 	__u16 h_sport;
@@ -1719,6 +1781,12 @@ route_eval_match(struct route_ctx *ctx, const struct match_set *match_set,
 	case MatchType_IpSet:
 	case MatchType_SourceIpSet:
 	{
+		/* FakeIP addresses are synthetic domain handles. Matching them
+		 * against destination IP sets (for example geoip:private) would
+		 * classify the placeholder instead of the authoritative domain. */
+		if (match_type == MatchType_IpSet && ctx->fakeip_v4_destination)
+			break;
+
 		struct lpm_key *lpm_key = route_select_lpm_key(ctx, match_type);
 
 #ifdef __DEBUG_ROUTING
@@ -1963,6 +2031,7 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 	__builtin_memset(ctx, 0, sizeof(*ctx));
 	__builtin_memcpy(ctx->flag, flag, sizeof(ctx->flag));
 	ctx->is_wan = _is_wan;
+	ctx->fakeip_v4_destination = is_fakeip_v4_addr(daddr);
 	__builtin_memcpy(ctx->mac, mac, sizeof(ctx->mac));
 	ctx->result = -ENOEXEC;
 
@@ -3083,6 +3152,8 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		 * (reportDatapathPassthroughSummary in control/control_plane.go).
 		 */
 		if (!tcp_state) {
+			if (is_fakeip_v4_destination(&pkt->tuples.five))
+				return TC_ACT_SHOT;
 			bump_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
 			return TC_ACT_OK;
 		}
@@ -3093,8 +3164,11 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		 */
 		if (!tcp_state->meta.data.has_routing) {
 			/* No cache: keep historical direct-pass semantics (e.g.
-			 * single-arm / reply-path traffic).
+			 * single-arm / reply-path traffic), except for FakeIP
+			 * destinations which must never escape to WAN.
 			 */
+			if (is_fakeip_v4_destination(&pkt->tuples.five))
+				return TC_ACT_SHOT;
 			return TC_ACT_OK;
 		}
 
@@ -3102,7 +3176,8 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		outbound = tcp_state->meta.data.outbound;
 		mark = tcp_state->meta.data.mark;
 
-		if (outbound == OUTBOUND_DIRECT) {
+		if (outbound == OUTBOUND_DIRECT &&
+		    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 			skb->mark = mark;
 			return TC_ACT_OK;
 		}
@@ -3154,7 +3229,8 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 				__u8 outbound = udp_state->meta.data.outbound;
 				__u32 mark = udp_state->meta.data.mark;
 
-				if (outbound == OUTBOUND_DIRECT) {
+				if (outbound == OUTBOUND_DIRECT &&
+				    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 					skb->mark = mark;
 					goto direct;
 				} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
@@ -3278,7 +3354,8 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 
 	// Fail-closed: TCP without conn state must drop to prevent traffic leakage.
 	if (pkt->l4proto == IPPROTO_TCP && !tcp_state) {
-		if (outbound == OUTBOUND_DIRECT && mark == 0) {
+		if (outbound == OUTBOUND_DIRECT && mark == 0 &&
+		    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 			skb->mark = mark;
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			bpf_printk("tcp(lan): GO OUTBOUND_DIRECT (MAP FULL)");
@@ -3313,7 +3390,8 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 	}
 #endif
 
-	if (outbound == OUTBOUND_DIRECT) {
+	if (outbound == OUTBOUND_DIRECT &&
+	    !is_fakeip_v4_destination(&pkt->tuples.five)) {
 		skb->mark = mark;
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("GO OUTBOUND DIRECT");

@@ -6,21 +6,13 @@
 package dns
 
 import (
-	"io"
 	"path/filepath"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/pkg/config_parser"
-	"github.com/sirupsen/logrus"
 )
-
-func discardLogger() *logrus.Logger {
-	l := logrus.New()
-	l.SetOutput(io.Discard)
-	return l
-}
 
 func TestRequestMatcherCacheKeyChangesWhenQNameRulesChange(t *testing.T) {
 	log := discardLogger()
