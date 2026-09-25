@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
@@ -24,6 +25,7 @@ import (
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/dnstransport"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -91,8 +93,48 @@ type lookupCall struct {
 }
 
 type NewOption struct {
-	LocationFinder *assets.LocationFinder
-	DirectDialer   netproxy.Dialer
+	LocationFinder     *assets.LocationFinder
+	DirectDialer       netproxy.Dialer
+	DatReaderOptimizer *routing.DatReaderOptimizer
+	// Stats, when non-nil, receives per-substage construction durations from
+	// NewWithOption. The four fields decompose daedns_router_build into the
+	// substages observed at cmd/run.go so an operator can attribute startup
+	// time inside the otherwise-opaque daedns_router_build stage.
+	Stats *BuildStats
+	// TrieCache, when non-nil, enables persistent caching of compiled trie
+	// structures. SourceHash is the external geosite.dat hash; the request
+	// matcher combines it with lowered qname domain sets before cache lookup.
+	TrieCache  *domain_matcher.TrieCache
+	SourceHash []byte
+}
+
+// BuildStats captures per-substage durations from NewWithOption. The sum of
+// the four fields is expected to be ≈ the parent daedns_router_build_ms; any
+// gap surfaces as daedns_router_unattributed_ms in the rules_load summary.
+type BuildStats struct {
+	// RequestProgramNormalize covers
+	// componentdns.NewNormalizedRequestRoutingProgram and the DatReaderOptimizer
+	// geosite/geoip expansion for daedns request rules.
+	RequestProgramNormalize time.Duration
+	// UpstreamInit covers initUpstreams and BootstrapResolvers.
+	UpstreamInit time.Duration
+	// RequestMatcherLower covers NewRequestMatcherBuilderFromProgram (program
+	// → simulatedDomainSet + rule list; cheap glue).
+	RequestMatcherLower time.Duration
+	// RequestMatcherCompile covers RequestMatcherBuilder.Build (the heavy AC
+	// slimtrie compile).
+	RequestMatcherCompile time.Duration
+	// RequestMatcherBuild is the outer builder wall-clock =
+	// RequestMatcherLower + RequestMatcherCompile. Retained for backwards
+	// compatibility with any collector expecting the combined figure.
+	RequestMatcherBuild time.Duration
+	// MatchersCompile covers the subscription/node/subnode rule compilers.
+	MatchersCompile time.Duration
+	// RequestMatcherDistribution, when non-nil, is populated by the internal
+	// RequestMatcherBuilder with per-slot counts and durations. Callers inspect
+	// this to decide whether the parent daedns_request_matcher_compile_ms cost
+	// is dominated by AC automata, suffix tries, or one giant slot.
+	RequestMatcherDistribution *domain_matcher.BuildStats
 }
 
 type compiledMatcher[T any] struct {
@@ -128,6 +170,17 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		return nil, nil
 	}
 
+	var stats *BuildStats
+	if opt != nil {
+		stats = opt.Stats
+	}
+	stamp := func(field func(*BuildStats) *time.Duration, start time.Time) {
+		if stats == nil {
+			return
+		}
+		*field(stats) = time.Since(start)
+	}
+
 	locationFinder := assets.NewLocationFinder(nil)
 	directDialer := direct.SymmetricDirect
 	if opt != nil {
@@ -138,14 +191,17 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 			directDialer = opt.DirectDialer
 		}
 	}
+	datReaderOptimizer := datReaderOptimizerForRouter(log, locationFinder, opt)
+	progStart := time.Now()
 	requestProgram, err := componentdns.NewNormalizedRequestRoutingProgram(dnsCfg.Routing.Request.Rules, dnsCfg.Routing.Request.Fallback,
-		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestProgramNormalize }, progStart)
 	if len(requestProgram.Rules) == 0 &&
 		len(requestProgram.SubscriptionRules) == 0 &&
 		len(requestProgram.NodeRules) == 0 &&
@@ -163,6 +219,7 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		httpClients:           make(map[string]*dnstransport.HTTPClientGeneration),
 		httpClientGenerations: make(map[*dnstransport.HTTPClientGeneration]struct{}),
 	}
+	upstreamStart := time.Now()
 	router.bootstrapDns, err = config.BootstrapResolvers(global)
 	if err != nil {
 		return nil, err
@@ -170,6 +227,7 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if err = router.initUpstreams(dnsCfg.Upstream); err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.UpstreamInit }, upstreamStart)
 	upstreamName2Id := make(map[string]uint8, len(router.upstreamByIndex))
 	for i, upstreamRaw := range dnsCfg.Upstream {
 		tag, _ := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
@@ -178,15 +236,29 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		}
 		upstreamName2Id[tag] = uint8(i)
 	}
+	requestMatcherStart := time.Now()
 	requestMatcherBuilder, err := componentdns.NewRequestMatcherBuilderFromProgram(log, requestProgram, upstreamName2Id)
 	if err != nil {
 		return nil, err
 	}
+	if stats != nil {
+		stats.RequestMatcherDistribution = &domain_matcher.BuildStats{}
+		requestMatcherBuilder = requestMatcherBuilder.WithStats(stats.RequestMatcherDistribution)
+	}
+	// Pass cache if available
+	if opt != nil && opt.TrieCache != nil {
+		requestMatcherBuilder = requestMatcherBuilder.WithCache(opt.TrieCache, opt.SourceHash)
+	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, requestMatcherStart)
+	requestCompileStart := time.Now()
 	router.requestMatcher, err = requestMatcherBuilder.Build()
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherCompile }, requestCompileStart)
+	stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherBuild }, requestMatcherStart)
 
+	matchersStart := time.Now()
 	router.subMatcher, err = router.compileSubscriptionMatcher(requestProgram.SubscriptionRules)
 	if err != nil {
 		return nil, err
@@ -199,7 +271,29 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if err != nil {
 		return nil, err
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.MatchersCompile }, matchersStart)
 	return router, nil
+}
+
+// RequestMatcher returns the prebuilt DNS request matcher associated with this
+// router, or nil if the router has no DNS routing program (in which case there
+// is nothing to reuse downstream). The returned matcher's outbound-index
+// encoding follows dnsCfg.Upstream order, which is identical to the encoding
+// component/dns.New derives from the same dnsCfg.Upstream slice — so a control
+// plane that supplies this matcher via dns.NewOption.PrebuiltRequestMatcher
+// will get the same Match results as if dns.New built its own matcher.
+func (r *Router) RequestMatcher() *componentdns.RequestMatcher {
+	if r == nil {
+		return nil
+	}
+	return r.requestMatcher
+}
+
+func datReaderOptimizerForRouter(log *logrus.Logger, locationFinder *assets.LocationFinder, opt *NewOption) *routing.DatReaderOptimizer {
+	if opt != nil && opt.DatReaderOptimizer != nil {
+		return opt.DatReaderOptimizer
+	}
+	return &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
 }
 
 func (r *Router) Close() error {

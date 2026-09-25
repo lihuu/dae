@@ -6,6 +6,8 @@
 package dns
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"strconv"
 
@@ -22,6 +24,40 @@ type RequestMatcherBuilder struct {
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
 	rules              []requestMatchSet
+	matcherStats       *domain_matcher.BuildStats
+	trieCache          *domain_matcher.TrieCache
+	sourceHash         []byte
+}
+
+// WithStats attaches a domain_matcher.BuildStats sink. When set, the
+// internal AhocorasickSlimtrie populates the struct with per-slot counts and
+// durations during Build, exposing where wall-clock inside the parent
+// daedns_request_matcher_compile / dns_request_matcher_compile stage went.
+func (b *RequestMatcherBuilder) WithStats(stats *domain_matcher.BuildStats) *RequestMatcherBuilder {
+	b.matcherStats = stats
+	return b
+}
+
+// WithCache attaches a trie cache and source hash. When set, the internal
+// AhocorasickSlimtrie attempts to load from cache first, and saves to cache
+// on cache miss. The sourceHash is typically the hash of geosite.dat; Build
+// combines it with the lowered qname domain sets so config-only DNS routing
+// changes also invalidate the compiled trie cache.
+func (b *RequestMatcherBuilder) WithCache(cache *domain_matcher.TrieCache, sourceHash []byte) *RequestMatcherBuilder {
+	b.trieCache = cache
+	b.sourceHash = sourceHash
+	return b
+}
+
+func NewRequestMatcherBuilder(log *logrus.Logger, rules []*config_parser.RoutingRule, upstreamName2Id map[string]uint8, fallback config.FunctionOrString) (b *RequestMatcherBuilder, err error) {
+	program, err := NewNormalizedRequestRoutingProgram(rules, fallback)
+	if err != nil {
+		return nil, err
+	}
+	if len(program.SubscriptionRules) > 0 || len(program.NodeRules) > 0 || len(program.SubNodeRules) > 0 {
+		return nil, fmt.Errorf("internal dae DNS selectors require explicit request-rule splitting before request matcher construction")
+	}
+	return NewRequestMatcherBuilderFromProgram(log, program, upstreamName2Id)
 }
 
 func NewRequestMatcherBuilderFromProgram(log *logrus.Logger, program *NormalizedRequestRoutingProgram, upstreamName2Id map[string]uint8) (b *RequestMatcherBuilder, err error) {
@@ -42,6 +78,8 @@ func (b *RequestMatcherBuilder) registerProgramParsers(rulesBuilder *routing.Rul
 
 func (b *RequestMatcherBuilder) upstreamToId(upstream string) (upstreamId consts.DnsRequestOutboundIndex, err error) {
 	switch upstream {
+	case consts.DnsRequestOutboundIndex_FakeIP.String():
+		upstreamId = consts.DnsRequestOutboundIndex_FakeIP
 	case consts.DnsRequestOutboundIndex_Reject.String():
 		upstreamId = consts.DnsRequestOutboundIndex_Reject
 	case consts.DnsRequestOutboundIndex_AsIs.String():
@@ -135,12 +173,27 @@ func (b *RequestMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	var m RequestMatcher
 	// Build domainMatcher
-	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen).WithStats(b.matcherStats)
 	for _, domains := range b.simulatedDomainSet {
 		m.domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
-	if err = m.domainMatcher.Build(); err != nil {
-		return nil, err
+	// Use cache if available, otherwise build from scratch
+	if b.trieCache != nil {
+		// Type assert to access BuildWithCache
+		if slimtrie, ok := m.domainMatcher.(*domain_matcher.AhocorasickSlimtrie); ok {
+			if err = slimtrie.BuildWithCache(b.trieCache, b.trieCacheKey()); err != nil {
+				return nil, err
+			}
+		} else {
+			// Fallback to regular build if type assertion fails
+			if err = m.domainMatcher.Build(); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		if err = m.domainMatcher.Build(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Write routings.
@@ -151,6 +204,31 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	m.matches = b.rules
 
 	return &m, nil
+}
+
+func (b *RequestMatcherBuilder) trieCacheKey() []byte {
+	if len(b.sourceHash) != sha256.Size {
+		return b.sourceHash
+	}
+
+	h := sha256.New()
+	h.Write([]byte("dae:dns-request-matcher-trie-cache:v2\x00"))
+	h.Write(b.sourceHash)
+
+	var buf [4]byte
+	for _, set := range b.simulatedDomainSet {
+		binary.LittleEndian.PutUint32(buf[:], uint32(set.RuleIndex))
+		h.Write(buf[:])
+		h.Write([]byte{0})
+		h.Write([]byte(set.Key))
+		h.Write([]byte{0})
+		for _, domain := range set.Domains {
+			h.Write([]byte(domain))
+			h.Write([]byte{0})
+		}
+		h.Write([]byte{0xff})
+	}
+	return h.Sum(nil)
 }
 
 type RequestMatcher struct {

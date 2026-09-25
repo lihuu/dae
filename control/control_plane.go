@@ -35,8 +35,10 @@ import (
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
+	"github.com/daeuniverse/dae/pkg/rulesload"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
@@ -172,6 +174,11 @@ type ControlPlaneBuildOptions struct {
 	DirectDialer          netproxy.Dialer
 	FullconeDirectDialer  netproxy.Dialer
 	SystemDNSResolver     *netutils.SystemDNSResolver
+	PrebuiltDaeDNS        *daedns.Router
+	DatReaderOptimizer    *routing.DatReaderOptimizer
+	TrieCache             *domain_matcher.TrieCache
+	SourceHash            []byte
+	RulesLoadObserver     rulesload.Observer
 }
 
 var (
@@ -607,12 +614,26 @@ func NewControlPlaneWithContextOptions(
 		return netip.Addr{}, fmt.Errorf("no address for %q", host)
 	})
 
-	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
-		LocationFinder: locationFinder,
-		DirectDialer:   directDialer,
-	})
-	if err != nil {
-		return nil, err
+	var datReaderOptimizer *routing.DatReaderOptimizer
+	if buildOpts.DatReaderOptimizer != nil {
+		datReaderOptimizer = buildOpts.DatReaderOptimizer
+	} else {
+		datReaderOptimizer = &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
+	}
+
+	if buildOpts.PrebuiltDaeDNS != nil {
+		option.DaeDNS = buildOpts.PrebuiltDaeDNS
+	} else {
+		option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
+			LocationFinder:     locationFinder,
+			DirectDialer:       directDialer,
+			DatReaderOptimizer: datReaderOptimizer,
+			TrieCache:          buildOpts.TrieCache,
+			SourceHash:         buildOpts.SourceHash,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if option.DaeDNS != nil {
 		deferFuncs = append(deferFuncs, option.DaeDNS.Close)
@@ -763,7 +784,7 @@ func NewControlPlaneWithContextOptions(
 	}
 	routingProgram, err := routing.NewNormalizedProgram(routingA.Rules, routingA.Fallback,
 		&routing.AliasOptimizer{},
-		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
@@ -932,12 +953,20 @@ func NewControlPlaneWithContextOptions(
 	}
 
 	/// DNS upstream.
+	var prebuiltRequestMatcher *dns.RequestMatcher
+	if option.DaeDNS != nil {
+		prebuiltRequestMatcher = option.DaeDNS.RequestMatcher()
+	}
 	dnsUpstream, err := dns.New(dnsConfig, &dns.NewOption{
 		Logger:                  log,
 		LocationFinder:          locationFinder,
+		DatReaderOptimizer:      datReaderOptimizer,
 		UpstreamReadyCallback:   plane.dnsUpstreamReadyCallback,
 		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp),
 		UpstreamHostResolver:    upstreamHostResolver,
+		PrebuiltRequestMatcher:  prebuiltRequestMatcher,
+		TrieCache:               buildOpts.TrieCache,
+		SourceHash:              buildOpts.SourceHash,
 	})
 	if err != nil {
 		return nil, err

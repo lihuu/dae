@@ -28,6 +28,8 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/common/subscription"
 	"github.com/daeuniverse/dae/component/daedns"
+	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/sirupsen/logrus"
@@ -84,6 +86,10 @@ func buildControlPlaneRuntime(
 	prepareOnly bool,
 	dnsRoutingUnchanged bool,
 	isReloadBuild bool,
+	daeDNSRouter *daedns.Router,
+	datReaderOptimizer *routing.DatReaderOptimizer,
+	trieCache *domain_matcher.TrieCache,
+	geositeHash []byte,
 ) (*control.ControlPlane, error) {
 	return control.NewControlPlaneWithContextOptions(
 		ctx,
@@ -104,6 +110,10 @@ func buildControlPlaneRuntime(
 			DirectDialer:          directDialer,
 			FullconeDirectDialer:  fullconeDirectDialer,
 			SystemDNSResolver:     systemDNSResolver,
+			PrebuiltDaeDNS:        daeDNSRouter,
+			DatReaderOptimizer:    datReaderOptimizer,
+			TrieCache:             trieCache,
+			SourceHash:            geositeHash,
 		},
 	)
 }
@@ -195,15 +205,39 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	directDialers := direct.NewDirectDialers(conf.Global.FallbackResolver)
 	systemDNSResolver := netutils.NewSystemDNSResolver(netip.MustParseAddrPort(conf.Global.FallbackResolver))
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
+	datReaderOptimizer := &routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder}
+
+	// Create trie cache if enabled
+	var trieCache *domain_matcher.TrieCache
+	var geositeHash []byte
+	if conf.Global.TrieCacheEnabled {
+		trieCache = domain_matcher.NewTrieCache(log, conf.Global.TrieCachePath, true)
+		// Compute geosite.dat hash for cache key
+		geositePath, err := locationFinder.GetLocationAsset(log, "geosite.dat")
+		if err == nil {
+			if data, err := os.ReadFile(geositePath); err == nil {
+				geositeHash = domain_matcher.ComputeHash(data)
+			}
+		}
+	}
+
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
-		LocationFinder: locationFinder,
-		DirectDialer:   directDialers.Symmetric,
+		LocationFinder:     locationFinder,
+		DirectDialer:       directDialers.Symmetric,
+		DatReaderOptimizer: datReaderOptimizer,
+		TrieCache:          trieCache,
+		SourceHash:         geositeHash,
 	})
 	if err != nil {
 		return nil, err
 	}
+	var daeDNSRouterOwned bool
 	if daeDNSRouter != nil {
-		defer func() { _ = daeDNSRouter.Close() }()
+		defer func() {
+			if !daeDNSRouterOwned {
+				_ = daeDNSRouter.Close()
+			}
+		}()
 	}
 
 	// Start timing the startup process
@@ -395,10 +429,15 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		prepareOnly,
 		dnsRoutingUnchanged,
 		isReloadBuild,
+		daeDNSRouter,
+		datReaderOptimizer,
+		trieCache,
+		geositeHash,
 	)
 	if err != nil {
 		return nil, err
 	}
+	daeDNSRouterOwned = true
 	log.Infof("Control plane built in %v", time.Since(stageStart))
 	log.Infof("Total startup time: %v", time.Since(startTime))
 

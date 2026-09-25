@@ -11,12 +11,14 @@ import (
 	"net/netip"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/component/routing/domain_matcher"
 	"github.com/daeuniverse/dae/config"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
@@ -30,25 +32,93 @@ type Dns struct {
 	upstream2Index sync.Map
 	reqMatcher     *RequestMatcher
 	respMatcher    *ResponseMatcher
+	// nameToIndex maps upstream tag names to their indices for named lookup.
+	nameToIndex map[string]uint8
 }
 
 type NewOption struct {
 	Logger                  *logrus.Logger
 	LocationFinder          *assets.LocationFinder
+	DatReaderOptimizer      *routing.DatReaderOptimizer
 	UpstreamReadyCallback   func(dnsUpstream *Upstream) (err error)
 	UpstreamResolverNetwork string
 	UpstreamHostResolver    func(ctx context.Context, host string, network string) (*netutils.Ip46, error, error)
+	// Stats, when non-nil, receives per-substage construction durations from
+	// New. The seven fields decompose dns_controller_build into the substages
+	// observed inside dns.New so an operator can attribute startup time inside
+	// the otherwise-opaque dns_controller_build stage.
+	Stats *BuildStats
+	// PrebuiltRequestMatcher, when non-nil, skips the entire request-side
+	// build inside New: program normalize, builder construction, and
+	// AhocorasickSlimtrie compile. The caller is responsible for ensuring the
+	// supplied matcher was built from the same dnsCfg.Routing.Request.Rules
+	// and the same dnsCfg.Upstream slice (in the same order) so the matcher's
+	// outbound-index encoding aligns with Dns.upstream populated here.
+	//
+	// When the caller already built a daedns.Router for dialer-side DNS
+	// resolution, daedns.Router.RequestMatcher() returns exactly this matcher.
+	// Reusing it eliminates the second AhocorasickSlimtrie.Build pass that
+	// otherwise dominates dns_controller_build_ms.
+	PrebuiltRequestMatcher *RequestMatcher
+	// TrieCache, when non-nil, enables persistent caching of compiled trie
+	// structures. SourceHash is the external geosite.dat hash; the request
+	// matcher combines it with lowered qname domain sets before cache lookup.
+	TrieCache  *domain_matcher.TrieCache
+	SourceHash []byte
+}
+
+// BuildStats captures per-substage durations from New. The sum of the seven
+// fields is expected to be ≈ the parent dns_controller_build_ms; any gap
+// surfaces as dns_controller_unattributed_ms in the rules_load summary.
+type BuildStats struct {
+	// UpstreamInit covers the upstream URL-parse loop at the top of New.
+	UpstreamInit time.Duration
+	// RequestProgramNormalize covers NewNormalizedRequestRoutingProgram (the
+	// DatReaderOptimizer geosite/geoip expansion for DNS request rules).
+	RequestProgramNormalize time.Duration
+	// RequestMatcherLower covers NewRequestMatcherBuilderFromProgram (program
+	// → simulatedDomainSet + rule list; cheap glue).
+	RequestMatcherLower time.Duration
+	// RequestMatcherCompile covers RequestMatcherBuilder.Build (the heavy AC
+	// slimtrie compile over DNS request rules).
+	RequestMatcherCompile time.Duration
+	// ResponseProgramNormalize covers routing.NewNormalizedProgram for the
+	// DNS response rules.
+	ResponseProgramNormalize time.Duration
+	// ResponseMatcherLower covers NewResponseMatcherBuilderFromProgram.
+	ResponseMatcherLower time.Duration
+	// ResponseMatcherCompile covers ResponseMatcherBuilder.Build.
+	ResponseMatcherCompile time.Duration
+	// RequestMatcherDistribution, when non-nil, is populated by the internal
+	// RequestMatcherBuilder with per-slot counts and durations. Callers inspect
+	// this to decide whether the parent daedns_request_matcher_compile_ms cost
+	// is dominated by AC automata, suffix tries, or one giant slot.
+	RequestMatcherDistribution *domain_matcher.BuildStats
+	// ResponseMatcherDistribution, when non-nil, is populated by the internal
+	// response-matcher Build with the same shape as
+	// RequestMatcherDistribution.
+	ResponseMatcherDistribution *domain_matcher.BuildStats
 }
 
 func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	s = &Dns{
 		log: opt.Logger,
 	}
+
+	var stats *BuildStats
+	if opt != nil {
+		stats = opt.Stats
+	}
+	stamp := func(field func(*BuildStats) *time.Duration, start time.Time) {
+		if stats == nil {
+			return
+		}
+		*field(stats) = time.Since(start)
+	}
+
+	upstreamStart := time.Now()
 	s.upstream2Index.Store((*Upstream)(nil), int(consts.DnsRequestOutboundIndex_AsIs))
-	// Parse upstream. upstreamName2Id is the shared namespace builder so the
-	// validate path resolves upstream names against the same mapping (see
-	// ValidateRouting); the per-upstream format checks stay here, on the path
-	// that actually dials.
+	// Parse upstream.
 	upstreamName2Id := upstreamName2Id(dns)
 	for i, upstreamRaw := range dns.Upstream {
 		if i >= int(consts.DnsRequestOutboundIndex_UserDefinedMax) ||
@@ -63,7 +133,7 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		var u *url.URL
 		u, err = url.Parse(link)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrBadUpstreamFormat, err)
+			return nil, fmt.Errorf("%w: %v", ErrBadUpstreamFormat, err)
 		}
 		r := &UpstreamResolver{
 			Raw:         u,
@@ -85,46 +155,91 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		upstreamName2Id[tag] = uint8(len(s.upstream))
 		s.upstream = append(s.upstream, r)
 	}
-	requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
-		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
-		&routing.MergeAndSortRulesOptimizer{},
-		&routing.DeduplicateParamsOptimizer{},
-	)
-	if err != nil {
-		return nil, err
+	s.nameToIndex = upstreamName2Id
+	stamp(func(s *BuildStats) *time.Duration { return &s.UpstreamInit }, upstreamStart)
+
+	datReaderOptimizer := datReaderOptimizerForDNS(opt)
+	if opt != nil && opt.PrebuiltRequestMatcher != nil {
+		// Reuse path: caller already built the request matcher (e.g. the
+		// daedns.Router built upstream of the control plane). Skip request
+		// program normalize + builder construction + AC slimtrie compile.
+		s.reqMatcher = opt.PrebuiltRequestMatcher
+	} else {
+		reqProgStart := time.Now()
+		requestProgram, err := NewNormalizedRequestRoutingProgram(dns.Routing.Request.Rules, dns.Routing.Request.Fallback,
+			datReaderOptimizer,
+			&routing.MergeAndSortRulesOptimizer{},
+			&routing.DeduplicateParamsOptimizer{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		stamp(func(s *BuildStats) *time.Duration { return &s.RequestProgramNormalize }, reqProgStart)
+
+		// Parse request routing.
+		reqLowerStart := time.Now()
+		reqMatcherBuilder, err := NewRequestMatcherBuilderFromProgram(opt.Logger, requestProgram, upstreamName2Id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
+		}
+		if stats != nil {
+			stats.RequestMatcherDistribution = &domain_matcher.BuildStats{}
+			reqMatcherBuilder = reqMatcherBuilder.WithStats(stats.RequestMatcherDistribution)
+		}
+		// Pass cache if available
+		if opt != nil && opt.TrieCache != nil {
+			reqMatcherBuilder = reqMatcherBuilder.WithCache(opt.TrieCache, opt.SourceHash)
+		}
+		stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherLower }, reqLowerStart)
+		reqCompileStart := time.Now()
+		s.reqMatcher, err = reqMatcherBuilder.Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
+		}
+		stamp(func(s *BuildStats) *time.Duration { return &s.RequestMatcherCompile }, reqCompileStart)
 	}
 
+	respProgStart := time.Now()
 	responseProgram, err := routing.NewNormalizedProgram(dns.Routing.Response.Rules, dns.Routing.Response.Fallback,
-		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
+		datReaderOptimizer,
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)
 	if err != nil {
 		return nil, err
 	}
-	// Parse request routing.
-	reqMatcherBuilder, err := NewRequestMatcherBuilderFromProgram(opt.Logger, requestProgram, upstreamName2Id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
-	}
-	s.reqMatcher, err = reqMatcherBuilder.Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
-	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseProgramNormalize }, respProgStart)
+
 	// Parse response routing.
+	respLowerStart := time.Now()
 	respMatcherBuilder, err := NewResponseMatcherBuilderFromProgram(opt.Logger, responseProgram, upstreamName2Id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
+	if stats != nil {
+		stats.ResponseMatcherDistribution = &domain_matcher.BuildStats{}
+		respMatcherBuilder = respMatcherBuilder.WithStats(stats.ResponseMatcherDistribution)
+	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseMatcherLower }, respLowerStart)
+	respCompileStart := time.Now()
 	s.respMatcher, err = respMatcherBuilder.Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
+	stamp(func(s *BuildStats) *time.Duration { return &s.ResponseMatcherCompile }, respCompileStart)
+
 	if len(dns.Upstream) == 0 {
 		// Immediately ready.
 		go func() { _ = opt.UpstreamReadyCallback(nil) }()
 	}
 	return s, nil
+}
+
+func datReaderOptimizerForDNS(opt *NewOption) *routing.DatReaderOptimizer {
+	if opt != nil && opt.DatReaderOptimizer != nil {
+		return opt.DatReaderOptimizer
+	}
+	return &routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder}
 }
 
 func (s *Dns) CheckUpstreamsFormat() error {
@@ -161,9 +276,10 @@ func (s *Dns) RequestSelect(ctx context.Context, qname string, qtype uint16) (up
 	if err != nil {
 		return 0, nil, err
 	}
-	// nil indicates AsIs.
+	// nil indicates AsIs, Reject, or FakeIP.
 	if upstreamIndex == consts.DnsRequestOutboundIndex_AsIs ||
-		upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
+		upstreamIndex == consts.DnsRequestOutboundIndex_Reject ||
+		upstreamIndex == consts.DnsRequestOutboundIndex_FakeIP {
 		return upstreamIndex, nil, nil
 	}
 	if int(upstreamIndex) >= len(s.upstream) {
@@ -235,4 +351,17 @@ func (s *Dns) ResponseSelect(ctx context.Context, msg *dnsmessage.Msg, fromUpstr
 		upstream = nil
 	}
 	return upstreamIndex, upstream, nil
+}
+
+// GetUpstreamByName returns the upstream resolver identified by its tag name.
+// Returns an error if the name is unknown.
+func (s *Dns) GetUpstreamByName(ctx context.Context, name string) (*Upstream, error) {
+	idx, ok := s.nameToIndex[name]
+	if !ok {
+		return nil, fmt.Errorf("upstream %q not found", name)
+	}
+	if int(idx) >= len(s.upstream) {
+		return nil, fmt.Errorf("bad upstream index: %v not in [0, %v]", idx, len(s.upstream)-1)
+	}
+	return s.upstream[idx].GetUpstream(ctx)
 }

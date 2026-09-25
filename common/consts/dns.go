@@ -13,17 +13,20 @@ import (
 type DnsRequestOutboundIndex int16
 
 const (
+	DnsRequestOutboundIndex_FakeIP      DnsRequestOutboundIndex = 0xFB
 	DnsRequestOutboundIndex_Reject      DnsRequestOutboundIndex = 0xFC
 	DnsRequestOutboundIndex_AsIs        DnsRequestOutboundIndex = 0xFD
 	DnsRequestOutboundIndex_LogicalOr   DnsRequestOutboundIndex = 0xFE
 	DnsRequestOutboundIndex_LogicalAnd  DnsRequestOutboundIndex = 0xFF
 	DnsRequestOutboundIndex_LogicalMask DnsRequestOutboundIndex = 0xFE
 
-	DnsRequestOutboundIndex_UserDefinedMax = DnsRequestOutboundIndex_Reject - 1
+	DnsRequestOutboundIndex_UserDefinedMax = DnsRequestOutboundIndex_FakeIP - 1
 )
 
 func (i DnsRequestOutboundIndex) String() string {
 	switch i {
+	case DnsRequestOutboundIndex_FakeIP:
+		return "fakeip"
 	case DnsRequestOutboundIndex_Reject:
 		return "reject"
 	case DnsRequestOutboundIndex_AsIs:

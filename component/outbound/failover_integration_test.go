@@ -299,15 +299,25 @@ func TestIntegration_Failover_Failback_CompleteCycle(t *testing.T) {
 	// - First probe at ~50ms → success → enter recovering
 	// - Confirmation probe at 50ms → success (2 total)
 	// - Wait for StableTime (100ms) → failback
-	time.Sleep(300 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d, err = ig.dialTCP(t, false)
+		if err == nil && d == ig.primary {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// Phase 4: Selection should return primary again.
-	d, err = ig.dialTCP(t, false)
 	if err != nil {
 		t.Fatalf("phase 4 select error: %v", err)
 	}
 	if d != ig.primary {
-		t.Fatalf("phase 4: expected primary after failback, got %s", d.Property().Name)
+		name := "<nil>"
+		if d != nil {
+			name = d.Property().Name
+		}
+		t.Fatalf("phase 4: expected primary after failback, got %s", name)
 	}
 }
 
@@ -466,14 +476,24 @@ func TestIntegration_Failover_FailureDuringRecovery_ResetsProgress(t *testing.T)
 
 	// Now complete recovery cleanly.
 	ig.simulatePrimaryUp(t)
-	time.Sleep(300 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d, err = ig.dialTCP(t, false)
+		if err == nil && d == ig.primary {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
-	d, err = ig.dialTCP(t, false)
 	if err != nil {
 		t.Fatalf("select error after clean recovery: %v", err)
 	}
 	if d != ig.primary {
-		t.Fatalf("expected primary after clean recovery, got %s", d.Property().Name)
+		name := "<nil>"
+		if d != nil {
+			name = d.Property().Name
+		}
+		t.Fatalf("expected primary after clean recovery, got %s", name)
 	}
 }
 

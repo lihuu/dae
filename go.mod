@@ -116,7 +116,7 @@ require (
 replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
 
 //replace github.com/cilium/ebpf v0.20.0
-//replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
+replace github.com/daeuniverse/dae-config-dist/go/dae_config => ./third_party/dae_config
 
 // Custom outbound fork: protocol lifecycle and framing hardening, cancellable
 // dial queues, UDP write-path cmsg preservation, and congestion-control fixes.
