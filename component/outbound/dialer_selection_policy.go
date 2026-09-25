@@ -27,11 +27,22 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 		return nil, fmt.Errorf("policy should be exact 1 function: got %v", len(fs))
 	}
 	f := fs[0]
+	// primary_rotation_attempts is an opt-in failover-only setting. Reject
+	// negative values and any nonzero value on a non-failover policy at
+	// policy construction time, so startup/reload fails the same way
+	// `dae validate` does even if the operator skipped the validate step.
+	if param.PrimaryRotationAttempts < 0 {
+		return nil, fmt.Errorf("primary_rotation_attempts must not be negative: got %d", param.PrimaryRotationAttempts)
+	}
+	if param.PrimaryRotationAttempts != 0 && f.Name != string(consts.DialerSelectionPolicy_Failover) {
+		return nil, fmt.Errorf("primary_rotation_attempts requires policy: failover, got %q", f.Name)
+	}
 	switch fName := consts.DialerSelectionPolicy(f.Name); fName {
 	case consts.DialerSelectionPolicy_Random,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinLastLatency,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_Failover:
 		return &DialerSelectionPolicy{
 			Policy: fName,
 		}, nil

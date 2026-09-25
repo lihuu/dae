@@ -240,6 +240,9 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 			}
 		}
 	}
+	if handoff.reloadInheritance != nil {
+		handoff.reloadInheritance.Rollback()
+	}
 	if len(rollbackCleanupErrs) > 0 {
 		return nil, errors.Join(rollbackCleanupErrs...)
 	}
@@ -441,6 +444,14 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 				}
 			}
 		}
+	}
+	// After the new plane is closed, roll back the failover reload transfer so
+	// the old plane's failover controllers resume exactly one probe each with
+	// the captured state. Rollback must run AFTER newCancel/newControlPlane.Close
+	// so the new generation's probe/timer cannot race the old generation's
+	// resumed probe. Idempotent (sync.Once inside each transfer).
+	if handoff.reloadInheritance != nil {
+		handoff.reloadInheritance.Rollback()
 	}
 	return errors.Join(errs...)
 }

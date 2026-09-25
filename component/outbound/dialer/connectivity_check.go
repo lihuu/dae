@@ -584,6 +584,14 @@ func (d *Dialer) ActivateCheck() {
 	go d.aliveBackground()
 }
 
+// ConnectivityCheckActive reports whether the periodic connectivity-check
+// goroutine is running.
+func (d *Dialer) ConnectivityCheckActive() bool {
+	d.tickerMu.Lock()
+	defer d.tickerMu.Unlock()
+	return d.checkActivated
+}
+
 // Global connectivity check worker pool
 var (
 	connectivityCheckPool *ants.Pool
@@ -773,15 +781,23 @@ func (d *Dialer) aliveBackground() {
 	}
 	var CheckOpts = []*CheckOption{tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt}
 
-	var unusedOnce bool
-	checkUnused := func() bool {
-		var unused int
+	hasRegisteredChecks := func() bool {
 		for _, opt := range CheckOpts {
-			if !d.hasAliveDialerSets(opt.networkType) {
-				unused++
+			if d.hasAliveDialerSets(opt.networkType) {
+				return true
 			}
 		}
-		if unused == len(CheckOpts) {
+		return false
+	}
+
+	var unusedOnce bool
+	checkUnused := func() bool {
+		// Failover dialers have no AliveDialerSet but need the background loop
+		// to observe TCP health transitions from real traffic failures.
+		if d.keepConnectivityCheck.Load() {
+			return false
+		}
+		if !hasRegisteredChecks() {
 			if !unusedOnce {
 				d.Log.WithField("dialer", d.Property().Name).
 					WithField("p", unsafe.Pointer(d)).
@@ -865,6 +881,13 @@ func (d *Dialer) aliveBackground() {
 			checkFamily = consts.L4ProtoStr_TCP
 		}
 
+		// A failover-only dialer has no periodic selection checks. Its timer is
+		// allowed to expire once, then the goroutine waits for targeted traffic
+		// failure notifications without generating background probe traffic.
+		if checkFamily == "" && d.keepConnectivityCheck.Load() && !hasRegisteredChecks() {
+			continue
+		}
+
 		d.TcpCheckOptionRaw.Reset()
 		d.CheckDnsOptionRaw.Reset()
 
@@ -903,6 +926,13 @@ func (d *Dialer) aliveBackground() {
 
 		// Targeted checks don't disturb the periodic timer — only full checks do.
 		if checkFamily != "" {
+			continue
+		}
+
+		// A dialer used only by failover has no periodic schedule to reset.
+		// Shared dialers still retain the ordinary checks required by their
+		// non-failover groups.
+		if d.keepConnectivityCheck.Load() && !hasRegisteredChecks() {
 			continue
 		}
 
@@ -945,8 +975,13 @@ func filterCheckOptsByFamily(opts []*CheckOption, family consts.L4ProtoStr) []*C
 // submitCheckTasks submits check tasks to worker pool.
 func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opts []*CheckOption, isResuscitation bool, cycle *cycleResult) {
 	for _, opt := range opts {
-		// No need to test if there is no dialer selection policy using its latency.
-		if !d.hasAliveDialerSets(opt.networkType) {
+		hasAliveDialerSet := d.hasAliveDialerSets(opt.networkType)
+		// Targeted TCP checks also feed the failover controller, which observes
+		// dialer health transitions without owning an AliveDialerSet.
+		isFailoverTargetedCheck := d.keepConnectivityCheck.Load() &&
+			isResuscitation &&
+			opt.networkType.L4Proto == consts.L4ProtoStr_TCP
+		if !hasAliveDialerSet && !isFailoverTargetedCheck {
 			continue
 		}
 
@@ -1344,6 +1379,12 @@ func (d *Dialer) ReportAvailableTraffic(typ *NetworkType) {
 	if typ.L4Proto == consts.L4ProtoStr_UDP && typ.EffectiveUdpHealthDomain() == UdpHealthDomainData && !d.MustGetAlive(typ) {
 		d.informDialerGroupUpdate(d.markAvailableTraffic(typ))
 	}
+}
+
+// Check performs a basic connectivity check.
+// Backward compatibility wrapper for check(opts, false, nil).
+func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
+	return d.check(opts, false, nil)
 }
 
 // check performs a basic connectivity check for one dialer.

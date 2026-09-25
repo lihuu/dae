@@ -205,6 +205,9 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int, anno
 			return fmt.Errorf("unknown leaf array type: %v", from.Type())
 		}
 	default:
+		if from.Interface() == nil {
+			return nil
+		}
 		switch val := from.Interface().(type) {
 		case fmt.Stringer, string,
 			uint,

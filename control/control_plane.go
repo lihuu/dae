@@ -31,6 +31,7 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/daedns"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/notifier"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
@@ -639,19 +640,19 @@ func NewControlPlaneWithContextOptions(
 			outbound.DialerSelectionPolicy{
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
-			}, core.outboundAliveChangeCallback(0, disableKernelAliveCallback)),
+			}, core.outboundAliveChangeCallback(0, disableKernelAliveCallback), nil),
 		outbound.NewDialerGroup(option, consts.OutboundBlock.String(),
 			[]*dialer.Dialer{block}, []*dialer.Annotation{{}},
 			outbound.DialerSelectionPolicy{
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
-			}, core.outboundAliveChangeCallback(1, disableKernelAliveCallback)),
+			}, core.outboundAliveChangeCallback(1, disableKernelAliveCallback), nil),
 		outbound.NewDialerGroup(option, consts.OutboundReject.String(),
 			[]*dialer.Dialer{reject}, []*dialer.Annotation{{}},
 			outbound.DialerSelectionPolicy{
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
-			}, core.outboundAliveChangeCallback(uint8(consts.OutboundReject), disableKernelAliveCallback)),
+			}, core.outboundAliveChangeCallback(uint8(consts.OutboundReject), disableKernelAliveCallback), nil),
 	}
 
 	// Filter out groups.
@@ -670,10 +671,10 @@ func NewControlPlaneWithContextOptions(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create group %v: %w", group.Name, err)
 		}
-		// Filter nodes with user given filters.
-		dialers, annos, err := dialerSet.FilterAndAnnotate(group.Filter, group.FilterAnnotation)
+		// Resolve dialers and failover config if applicable.
+		dialers, annos, failoverCfg, err := resolveConfiguredGroupDialers(dialerSet, group, *policy)
 		if err != nil {
-			return nil, fmt.Errorf(`failed to create group "%v": %w`, group.Name, err)
+			return nil, err
 		}
 		// Convert node links to dialers.
 		if log.IsLevelEnabled(logrus.DebugLevel) {
@@ -688,6 +689,7 @@ func NewControlPlaneWithContextOptions(
 		groupOption, err := parseGroupOverrideOptionWithRuntime(group, *global, log, option)
 		finalOption := option
 		if err == nil && groupOption != nil {
+			groupOption.TransportCacheNamespace = option.TransportCacheNamespace
 			newDialers := make([]*dialer.Dialer, 0)
 			for _, d := range dialers {
 				newDialer := d.CloneWithGlobalOptionContext(context.Background(), groupOption)
@@ -699,8 +701,34 @@ func NewControlPlaneWithContextOptions(
 			finalOption = groupOption
 		}
 		// Create dialer group and append it to outbounds.
+		var eventCb outbound.FailoverEventCallback
+		var eventCbClose func()
+		if policy.Policy == consts.DialerSelectionPolicy_Failover {
+			eventCb, eventCbClose = buildFailoverEventCallback(
+				log,
+				group.FailoverNotify,
+				group.FailoverNotifyBarkURL,
+				group.FailoverNotifyBarkURLEnv,
+				group.FailoverNotifySwitchTitle,
+				group.FailoverNotifySwitchBody,
+				group.FailoverNotifyFailbackTitle,
+				group.FailoverNotifyFailbackBody,
+				group.FailoverNotifyBarkProxy,
+			)
+			if eventCbClose != nil {
+				deferFuncs = append(deferFuncs, func() error {
+					eventCbClose()
+					return nil
+				})
+			}
+		}
 		dialerGroup := outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy,
-			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback))
+			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback),
+			failoverCfg)
+		if eventCb != nil {
+			dialerGroup.SetFailoverEventCallback(eventCb)
+		}
+		deferFuncs = append(deferFuncs, dialerGroup.Close)
 		outbounds = append(outbounds, dialerGroup)
 	}
 
@@ -1101,13 +1129,83 @@ func (c *ControlPlane) acquireDrainTicket() func() {
 	return c.drainTracker.Acquire()
 }
 
-// InheritDialerHealthFrom copies health snapshots from a previous control plane
-// generation into the current one, so a reload does not reset health for
-// dialers that both generations share.
-func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) {
-	if c == nil || previous == nil {
+// failoverNotifyDispatcherCapacity bounds the per-group failover event queue.
+const failoverNotifyDispatcherCapacity = 16
+
+func buildFailoverEventCallback(
+	log *logrus.Logger,
+	notify, directURL, envVarName,
+	switchTitle, switchBody, failbackTitle, failbackBody, proxyURL string,
+) (outbound.FailoverEventCallback, func()) {
+	if notify != "bark" {
+		return nil, nil
+	}
+	// Resolve the env var NAME to its VALUE. Direct URL has priority over env.
+	envURL := ""
+	if envVarName != "" {
+		envURL = os.Getenv(envVarName)
+	}
+	bark := notifier.NewBarkNotifier(
+		log, directURL, envURL,
+		switchTitle, switchBody, failbackTitle, failbackBody,
+		proxyURL,
+	)
+	if !bark.Enabled() {
+		// bark configured but no URL resolved: disable silently.
+		return nil, nil
+	}
+	dispatcher := outbound.NewFailoverEventDispatcher(log, "failover", failoverNotifyDispatcherCapacity, func(ev outbound.FailoverEvent) {
+		bark.Send(context.Background(), ev)
+	})
+	return dispatcher, dispatcher.Close
+}
+
+type ReloadInheritance struct {
+	hasOverlap bool
+	transfers  []*outbound.FailoverReloadTransfer
+}
+
+// HasOverlap returns true when at least one dialer matched by group+name
+// between the old and new generation. Safe on a nil receiver.
+func (r *ReloadInheritance) HasOverlap() bool { return r != nil && r.hasOverlap }
+
+// Commit finalizes every aggregated failover reload transfer (keeps the new
+// generation; the old generation stays paused until it is closed). Safe on a
+// nil receiver.
+func (r *ReloadInheritance) Commit() {
+	if r == nil {
 		return
 	}
+	for _, t := range r.transfers {
+		t.Commit()
+	}
+}
+
+// Rollback discards every aggregated failover reload transfer's new-generation
+// restore and resumes exactly one old-generation probe per transfer. Safe on
+// a nil receiver.
+func (r *ReloadInheritance) Rollback() {
+	if r == nil {
+		return
+	}
+	for i := len(r.transfers) - 1; i >= 0; i-- {
+		r.transfers[i].Rollback()
+	}
+}
+
+// InheritDialerHealthFrom copies health snapshots from a previous control plane
+// generation into the current one and returns a transactional ReloadInheritance
+// handle whose HasOverlap reports whether at least one dialer matched by
+// group+name between the old and new generation.
+func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) *ReloadInheritance {
+	if c == nil || previous == nil {
+		return nil
+	}
+
+	var (
+		hasOverlap bool
+		transfers  []*outbound.FailoverReloadTransfer
+	)
 
 	previousGroups := make(map[string]*outbound.DialerGroup, len(previous.outbounds))
 	for _, group := range previous.outbounds {
@@ -1140,11 +1238,19 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) {
 			if oldDialer := oldDialers[d.Property().Name]; oldDialer != nil {
 				if dialerHealthCheckConfigEqual(d, oldDialer) {
 					d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
+					hasOverlap = true
 				}
 			}
 		}
 		group.EnsureReloadSelectionFloor(fallback)
+
+		if group.HasFailoverController() && oldGroup.HasFailoverController() {
+			if transfer, _ := group.PrepareFailoverReloadFrom(oldGroup); transfer != nil {
+				transfers = append(transfers, transfer)
+			}
+		}
 	}
+	return &ReloadInheritance{hasOverlap: hasOverlap, transfers: transfers}
 }
 
 func dialerHealthCheckConfigEqual(current, previous *dialer.Dialer) bool {

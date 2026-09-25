@@ -14,6 +14,7 @@ import (
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
@@ -49,6 +50,14 @@ var (
 			// `dae run` refused to start. Same chain, no second copy of the
 			// checks - see dns.ValidateRouting.
 			if err := dns.ValidateRouting(log, &conf.Dns, []string{filepath.Dir(cfgFile)}); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+			if err := validateFailoverNotify(conf); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+			if err := validateFailoverSettings(conf); err != nil {
 				fmt.Println(err)
 				os.Exit(1)
 			}
@@ -127,6 +136,47 @@ func validateRoutingRules(log *logrus.Logger, conf *config.Config, externGeoData
 	})
 	if err != nil {
 		return fmt.Errorf("invalid routing rules: %w", err)
+	}
+	return nil
+}
+
+// validateFailoverNotify checks that failover groups with failover_notify use
+// supported notification schemes (currently only "bark"). Non-failover groups
+// ignore failover_notify, matching the runtime dispatch policy.
+func validateFailoverNotify(conf *config.Config) error {
+	for i := range conf.Group {
+		g := &conf.Group[i]
+		if g.FailoverNotify == "" || g.FailoverNotify == "bark" {
+			continue
+		}
+		policy, err := outbound.NewDialerSelectionPolicyFromGroupParam(g)
+		if err != nil {
+			// A malformed policy is reported by other validation; skip here.
+			continue
+		}
+		if policy.Policy == consts.DialerSelectionPolicy_Failover {
+			return fmt.Errorf("group %q: unknown failover_notify %q (only \"bark\" is supported)",
+				g.Name, g.FailoverNotify)
+		}
+	}
+	return nil
+}
+
+// validateFailoverSettings checks that primary_rotation_attempts is either
+// disabled (zero) or used with policy: failover and a non-negative value.
+// The runtime policy parser (outbound.NewDialerSelectionPolicyFromGroupParam)
+// performs the same checks at startup/reload, so an operator who skips
+// `dae validate` still gets a deterministic failure. This function mirrors
+// that guard at validate time and reports the offending group by name.
+func validateFailoverSettings(conf *config.Config) error {
+	for i := range conf.Group {
+		g := &conf.Group[i]
+		if g.PrimaryRotationAttempts == 0 {
+			continue
+		}
+		if _, err := outbound.NewDialerSelectionPolicyFromGroupParam(g); err != nil {
+			return fmt.Errorf("group %q: %w", g.Name, err)
+		}
 	}
 	return nil
 }

@@ -29,7 +29,7 @@ func newConnectivitySnapshotTestPlane(t *testing.T, mode consts.DialMode, policy
 		dialers[i] = d
 		t.Cleanup(func() { _ = d.Close() })
 	}
-	group := outbound.NewDialerGroup(option, "snapshot", dialers, []*dialer.Annotation{{}, {}}, outbound.DialerSelectionPolicy{Policy: policy}, func(bool, *dialer.NetworkType, bool) {})
+	group := outbound.NewDialerGroup(option, "snapshot", dialers, []*dialer.Annotation{{}, {}}, outbound.DialerSelectionPolicy{Policy: policy}, func(bool, *dialer.NetworkType, bool) {}, nil)
 	t.Cleanup(func() { _ = group.Close() })
 	plane := &ControlPlane{
 		core: &controlPlaneCore{},

@@ -138,6 +138,10 @@ type Dialer struct {
 	// errCheckOptionUnavailable failures (see check()).
 	lastCheckOptionWarn atomic.Int64
 
+	// keepConnectivityCheck is set for failover dialers to ensure
+	// their connectivity check goroutine runs even without AliveDialerSet.
+	keepConnectivityCheck atomic.Bool
+
 	// proxyFailurePromotions counts how many times the persistent-proxy-IP
 	// failure path promoted this dialer to unavailable. The promotion is only
 	// announced when it actually changes a collection's alive state, so this
@@ -285,6 +289,12 @@ func (o *GlobalOption) SetRuntimeDependencies(directDialer, fullconeDirectDialer
 	o.TcpCheckOptionRaw.SystemDNSResolver = systemDNSResolver
 	o.CheckDnsOptionRaw.DirectDialer = directDialer
 	o.CheckDnsOptionRaw.SystemDNSResolver = systemDNSResolver
+}
+
+// NewDialer creates a new Dialer with context.Background().
+// Backward compatibility wrapper for NewDialerContext.
+func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOption, property *Property) *Dialer {
+	return NewDialerContext(context.Background(), dialer, option, iOption, property)
 }
 
 // NewDialerContext is for internal use with lifecycle management.
@@ -453,6 +463,14 @@ func (d *Dialer) RegisterAliveTransitionCallback(callback func(networkType *Netw
 	d.aliveTransitionMu.Lock()
 	d.aliveTransitionCallbacks = append(d.aliveTransitionCallbacks, callback)
 	d.aliveTransitionMu.Unlock()
+}
+
+// MarkKeepConnectivityCheck signals that this dialer requires the
+// aliveBackground goroutine to remain active, even without AliveDialerSet
+// registrations. Used by the failover controller to observe TCP health
+// transitions from real traffic failures.
+func (d *Dialer) MarkKeepConnectivityCheck() {
+	d.keepConnectivityCheck.Store(true)
 }
 
 func (d *Dialer) notifyAliveTransition(networkType *NetworkType, alive bool) {

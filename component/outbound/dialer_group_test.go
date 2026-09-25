@@ -108,8 +108,55 @@ func newTestGroupForSelection(policy DialerSelectionPolicy) (*DialerGroup, []*di
 		newDirectDialer(option),
 		newDirectDialer(option),
 	}
-	group := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)), policy, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+	group := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)), policy, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 	return group, dialers
+}
+
+func TestFailoverGroupInitializesAllBPFConnectivitySlots(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	dialers := []*dialer.Dialer{
+		newNoopDialer(option),
+		newNoopDialer(option),
+	}
+	annotations := []*dialer.Annotation{{}, {}}
+	failoverCfg := &FailoverConfig{
+		PrimaryCandidateIdxs: []int{0},
+		FallbackIdx:          1,
+		Recovery: FailoverRecoveryConfig{
+			ProbeInitial: time.Second,
+			ProbeMax:     time.Minute,
+			Successes:    3,
+			StableTime:   time.Second,
+		},
+	}
+
+	var initialized [8]bool
+	group := NewDialerGroup(
+		option,
+		"failover-connectivity-init",
+		dialers,
+		annotations,
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Failover},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+			if !alive || !isInit {
+				t.Fatalf("connectivity callback = alive:%v isInit:%v, want true/true", alive, isInit)
+			}
+			initialized[networkType.Index()] = true
+		},
+		failoverCfg,
+	)
+	defer group.Close()
+
+	for _, networkType := range standardSelectionNetworkTypes() {
+		if !initialized[networkType.Index()] {
+			t.Errorf("connectivity slot %q was not initialized", networkType.String())
+		}
+	}
 }
 
 // markDialersDead kills dialers through the real collection-state API:
@@ -140,7 +187,7 @@ func TestDialerGroup_Select_Fixed(t *testing.T) {
 		DialerSelectionPolicy{
 			Policy:     consts.DialerSelectionPolicy_Fixed,
 			FixedIndex: fixedIndex,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 	for range 10 {
 		d, _, err := g.Select(TestNetworkType, false)
 		if err != nil {
@@ -190,7 +237,7 @@ func TestDialerGroup_Select_MinLastLatency(t *testing.T) {
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
 			Policy: consts.DialerSelectionPolicy_MinLastLatency,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 
 	// Test 1000 times.
 	for range 1000 {
@@ -269,7 +316,7 @@ func TestDialerGroup_Select_Random(t *testing.T) {
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
 			Policy: consts.DialerSelectionPolicy_Random,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 	count := make([]int, len(dialers))
 	for range 100 {
 		d, _, err := g.Select(TestNetworkType, false)
@@ -353,7 +400,7 @@ func TestDialerGroup_SetAlive(t *testing.T) {
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
 			Policy: consts.DialerSelectionPolicy_Random,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 	zeroTarget := 3
 	// Kill through the dialer state API: NotifyLatencyChange is now an
 	// out-of-order-tolerant informer that revalidates membership against the
@@ -399,7 +446,7 @@ func TestDialerGroup_SetSelectionPolicy_FixedToRandomCreatesAliveState(t *testin
 		DialerSelectionPolicy{
 			Policy:     consts.DialerSelectionPolicy_Fixed,
 			FixedIndex: 0,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 
 	if got := g.MustGetAliveDialerSet(TestNetworkType); got != nil {
 		t.Fatal("fixed policy should not eagerly allocate alive-state sets")
@@ -434,7 +481,7 @@ func TestDialerGroup_SetSelectionPolicy_FixedToRandomPreservesAliveState(t *test
 		DialerSelectionPolicy{
 			Policy:     consts.DialerSelectionPolicy_Fixed,
 			FixedIndex: 0,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 
 	dialers[1].ReportUnavailableForced(TestNetworkType, errors.New("forced dead for policy switch"))
 
@@ -474,7 +521,7 @@ func TestDialerGroup_SetSelectionPolicy_RecomputesMinLatencyOrdering(t *testing.
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
 			Policy: consts.DialerSelectionPolicy_Random,
-		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 
 	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(90 * time.Millisecond)
 	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(80 * time.Millisecond)
@@ -605,7 +652,7 @@ func newDataUdpGroup(t *testing.T, callback func(bool, *dialer.NetworkType, bool
 	}
 	g := NewDialerGroup(option, "callback-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
-		callback)
+		callback, nil)
 	return g, dialers
 }
 
@@ -827,7 +874,7 @@ func TestDialerGroup_Select_SingleDialerLenientFallsBackToFixed(t *testing.T) {
 	dialers := []*dialer.Dialer{newDirectDialer(option)}
 	g := NewDialerGroup(option, "single-node", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
-		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {}, nil)
 
 	// Kill the only dialer in both address families through the real
 	// collection-state API.
@@ -923,6 +970,7 @@ func TestGroupPublishesOptimisticAlive(t *testing.T) {
 	}{
 		{consts.DialerSelectionPolicy_Fixed, true},
 		{consts.DialerSelectionPolicy_Random, true},
+		{consts.DialerSelectionPolicy_Failover, true},
 		{consts.DialerSelectionPolicy_MinLastLatency, false},
 		{consts.DialerSelectionPolicy_MinAverage10Latencies, false},
 		{consts.DialerSelectionPolicy_MinMovingAverageLatencies, false},

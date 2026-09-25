@@ -20,6 +20,19 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// FailoverConfig holds the configuration needed to create a failover controller
+// for a DialerGroup. Only used when the policy is DialerSelectionPolicy_Failover.
+//
+// PrimaryCandidateIdxs is the ordered list of primary candidate dialer indices.
+// Index 0 is the initial current primary; the remaining indices are standby
+// candidates in the order they should be probed during rotation. FallbackIdx is
+// the index of the fixed fallback dialer and never participates in rotation.
+type FailoverConfig struct {
+	PrimaryCandidateIdxs []int
+	FallbackIdx          int
+	Recovery             FailoverRecoveryConfig
+}
+
 var ErrNoAliveDialer = fmt.Errorf("no alive dialer")
 
 type DialerGroup struct {
@@ -48,6 +61,12 @@ type DialerGroup struct {
 	alivePublishMissingSetCount atomic.Uint64
 
 	cachedMinCheckInterval time.Duration
+
+	// failoverController is non-nil only for failover policy groups.
+	failoverController *FailoverController
+	// failoverCfg maps the ordered Primary candidates and fixed Fallback role to
+	// actual dialer indices. Non-nil only for failover policy groups.
+	failoverCfg *FailoverConfig
 }
 
 type dialerGroupSelectionState struct {
@@ -66,6 +85,7 @@ func NewDialerGroup(
 	dialersAnnotations []*dialer.Annotation,
 	p DialerSelectionPolicy,
 	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool),
+	failoverCfg *FailoverConfig,
 ) *DialerGroup {
 	log := option.Log
 
@@ -77,6 +97,31 @@ func NewDialerGroup(
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
 	}
+
+	if p.Policy == consts.DialerSelectionPolicy_Failover && failoverCfg != nil {
+		// Failover policy: use the failover controller instead of AliveDialerSet.
+		group.failoverCfg = failoverCfg
+		primaryCandidates := make([]*dialer.Dialer, 0, len(failoverCfg.PrimaryCandidateIdxs))
+		for _, idx := range failoverCfg.PrimaryCandidateIdxs {
+			primaryCandidates = append(primaryCandidates, dialers[idx])
+		}
+		group.failoverController = NewFailoverControllerWithCandidates(
+			log, name,
+			primaryCandidates,
+			dialers[failoverCfg.FallbackIdx],
+			failoverCfg.Recovery,
+		)
+		// Failover doesn't use AliveDialerSet, so we store a minimal state.
+		group.selectionState.Store(&dialerGroupSelectionState{policy: p})
+		for _, idx := range failoverCfg.PrimaryCandidateIdxs {
+			dialers[idx].ActivateCheck()
+		}
+		for _, nt := range standardSelectionNetworkTypes() {
+			group.publishAliveChange(true, nt, true)
+		}
+		return group
+	}
+
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
 	group.selectionState.Store(state)
@@ -90,8 +135,64 @@ func NewDialerGroup(
 }
 
 func (g *DialerGroup) Close() error {
+	if g.failoverController != nil {
+		g.failoverController.Close()
+	}
 	g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
 	return nil
+}
+
+// HasFailoverController returns true if this group uses a failover policy.
+func (g *DialerGroup) HasFailoverController() bool {
+	return g.failoverController != nil
+}
+
+// SetFailoverEventCallback installs a failover event callback on the
+// controller. It is a no-op if this group does not use a failover policy.
+func (g *DialerGroup) SetFailoverEventCallback(cb FailoverEventCallback) {
+	if g.failoverController != nil {
+		g.failoverController.SetEventCallback(cb)
+	}
+}
+
+// FailoverIdentity returns the names of the primary and fallback dialers
+// configured for this group. Returns ("", "") if this is not a failover group.
+func (g *DialerGroup) FailoverIdentity() (primaryName, fallbackName string) {
+	if g.failoverController == nil {
+		return "", ""
+	}
+	return dialerName(g.failoverController.primaryDialer()), dialerName(g.failoverController.fallback)
+}
+
+// CaptureFailoverSnapshot captures the failover controller state for reload.
+// Returns nil if this is not a failover group.
+func (g *DialerGroup) CaptureFailoverSnapshot() *FailoverControllerSnapshot {
+	if g.failoverController == nil {
+		return nil
+	}
+	snap := g.failoverController.CaptureSnapshot()
+	return &snap
+}
+
+// RestoreFailoverSnapshot restores the failover controller state from a reload.
+// No-op if this is not a failover group or if snap is nil.
+func (g *DialerGroup) RestoreFailoverSnapshot(snap *FailoverControllerSnapshot) {
+	if g.failoverController != nil && snap != nil {
+		g.failoverController.RestoreSnapshot(*snap)
+	}
+}
+
+// PrepareFailoverReloadFrom compares this group's failover identity against the
+// previous generation and, on compatibility, atomically pauses the old
+// generation and restores the new generation.
+func (g *DialerGroup) PrepareFailoverReloadFrom(old *DialerGroup) (*FailoverReloadTransfer, string) {
+	if g == nil || old == nil {
+		return nil, "nil_group"
+	}
+	if !g.HasFailoverController() || !old.HasFailoverController() {
+		return nil, "not_failover"
+	}
+	return g.failoverController.prepareReloadTransfer(old.failoverController)
 }
 
 // SnapshotForEstablishedFlow returns a compact immutable view of the group
@@ -379,6 +480,33 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 		}
 		return nil, time.Hour, nil, ErrNoAliveDialer
 
+	case consts.DialerSelectionPolicy_Failover:
+		// Failover policy: select from the controller's atomic snapshot.
+		// The hot path performs one atomic load and never traverses candidates
+		// or acquires the controller mutex. Rotation/recovery is off the hot path.
+		if g.failoverController == nil || g.failoverCfg == nil {
+			return nil, 0, nil, fmt.Errorf("failover controller not initialized")
+		}
+		d, usingFallback := g.failoverController.ActiveDialer()
+		if d == nil {
+			return nil, 0, nil, fmt.Errorf("failover active dialer is nil")
+		}
+		if excluded != nil && d == excluded {
+			if !usingFallback {
+				// Active primary is excluded — fall through to the fixed
+				// fallback. Rotation to another Primary is a recovery concern
+				// and must not happen on the hot path.
+				fallback := g.Dialers[g.failoverCfg.FallbackIdx]
+				if fallback != nil && fallback != excluded {
+					return fallback, 0, preferAlternateSelectionNetworkType(fallback, networkType), nil
+				}
+			}
+			// Fallback is excluded (or fallback is the active role and excluded)
+			// — return an error rather than an unconfirmed primary.
+			return nil, 0, nil, ErrNoAliveDialer
+		}
+		return d, 0, preferAlternateSelectionNetworkType(d, networkType), nil
+
 	case consts.DialerSelectionPolicy_Fixed:
 		// Fixed policy represents explicit user intent to use a specific dialer.
 		// It ignores the 'excluded' parameter because user configuration takes
@@ -550,7 +678,9 @@ func (g *DialerGroup) publishAliveChange(alive bool, networkType *dialer.Network
 // flows for the group (mirrors resumeOutboundConnectivityUpdates).
 func groupPublishesOptimisticAlive(policy consts.DialerSelectionPolicy) bool {
 	switch policy {
-	case consts.DialerSelectionPolicy_Fixed, consts.DialerSelectionPolicy_Random:
+	case consts.DialerSelectionPolicy_Fixed,
+		consts.DialerSelectionPolicy_Random,
+		consts.DialerSelectionPolicy_Failover:
 		return true
 	default:
 		return false
@@ -596,7 +726,8 @@ func policyNeedsAliveState(policy consts.DialerSelectionPolicy) bool {
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 		return true
-	case consts.DialerSelectionPolicy_Fixed:
+	case consts.DialerSelectionPolicy_Fixed,
+		consts.DialerSelectionPolicy_Failover:
 		return false
 	default:
 		panic(fmt.Sprintf("unexpected dialer selection policy: %v", policy))

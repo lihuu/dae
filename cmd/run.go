@@ -162,6 +162,7 @@ type stagedReloadHandoff struct {
 	newCancel             context.CancelFunc
 	newListener           *control.Listener
 	abortConnections      bool
+	hasOverlap            bool
 	freshDatapath         bool
 	preparedDNSHandoff    bool
 	bpfTransferred        bool
@@ -177,6 +178,18 @@ type stagedReloadHandoff struct {
 	tcHookSetAdopted      bool
 	hookFlipCommitted     bool
 	provisionalOwner      bool
+	reloadInheritance     reloadInheritanceTxn
+}
+
+// reloadInheritanceTxn is the narrow transaction interface the staged reload
+// handoff uses to drive failover rotation transfers. *control.ReloadInheritance
+// satisfies it; tests supply a recording implementation to assert Commit is
+// called on a successful cutover and Rollback after the new plane closes on a
+// failed staged cutover.
+type reloadInheritanceTxn interface {
+	HasOverlap() bool
+	Commit()
+	Rollback()
 }
 
 // newStagedReloadHandoff builds the base handoff from the two supervisor
@@ -817,6 +830,9 @@ loop:
 								break loop
 							}
 						}
+					}
+					if handoff.reloadInheritance != nil {
+						handoff.reloadInheritance.Commit()
 					}
 					w.c = handoff.preparedGeneration.controlPlane
 					w.currCancel = handoff.preparedGeneration.cancel

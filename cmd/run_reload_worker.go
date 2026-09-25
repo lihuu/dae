@@ -257,7 +257,7 @@ func (w *reloadWorker) run() {
 					newC.SetReloadDnsCacheSource(oldC.CloneDnsCache)
 				}
 			}
-			newC.InheritDialerHealthFrom(oldC)
+			inheritance := newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
 				controlPlane: oldC,
@@ -272,14 +272,24 @@ func (w *reloadWorker) run() {
 				conf:         newConf,
 			}
 			if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
-				failSupervisorStep(err, "record active generation for staged reload", candidateGeneration, nil, nil)
+				failSupervisorStep(err, "record active generation for staged reload", candidateGeneration, func() {
+					if inheritance != nil {
+						inheritance.Rollback()
+					}
+				}, nil)
 				continue
 			}
 			if err := w.runtimeSupervisor.installPrepared(candidateGeneration); err != nil {
-				failSupervisorStep(err, "install staged reload candidate", candidateGeneration, nil, nil)
+				failSupervisorStep(err, "install staged reload candidate", candidateGeneration, func() {
+					if inheritance != nil {
+						inheritance.Rollback()
+					}
+				}, nil)
 				continue
 			}
 			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
+			handoff.hasOverlap = inheritance != nil && inheritance.HasOverlap()
+			handoff.reloadInheritance = inheritance
 			handoff.preparedDNSHandoff = true
 			handoff.sharedBpfHandoff = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
@@ -326,7 +336,7 @@ func (w *reloadWorker) run() {
 			oldConf := w.conf
 			oldListener := w.listener
 
-			newC.InheritDialerHealthFrom(oldC)
+			inheritance := newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
 				controlPlane: oldC,
@@ -341,15 +351,25 @@ func (w *reloadWorker) run() {
 				conf:         newConf,
 			}
 			if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
-				failSupervisorStep(err, "record active generation for fresh datapath reload", candidateGeneration, nil, nil)
+				failSupervisorStep(err, "record active generation for fresh datapath reload", candidateGeneration, func() {
+					if inheritance != nil {
+						inheritance.Rollback()
+					}
+				}, nil)
 				continue
 			}
 			if err := w.runtimeSupervisor.installPrepared(candidateGeneration); err != nil {
-				failSupervisorStep(err, "install fresh datapath reload candidate", candidateGeneration, nil, nil)
+				failSupervisorStep(err, "install fresh datapath reload candidate", candidateGeneration, func() {
+					if inheritance != nil {
+						inheritance.Rollback()
+					}
+				}, nil)
 				continue
 			}
 			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 			handoff.freshDatapath = true
+			handoff.hasOverlap = inheritance != nil && inheritance.HasOverlap()
+			handoff.reloadInheritance = inheritance
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 			w.reloadManager.beginHandoff()
 			releaseReloadTransition()
@@ -444,7 +464,7 @@ func (w *reloadWorker) run() {
 		oldCancel := w.currCancel
 		oldConf := w.conf
 
-		newC.InheritDialerHealthFrom(oldC)
+		inheritance := newC.InheritDialerHealthFrom(oldC)
 		configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 		activeGeneration := &runtimeGeneration{
 			controlPlane: oldC,
@@ -462,6 +482,9 @@ func (w *reloadWorker) run() {
 		// failure the ownership must return before candidate teardown, and the
 		// old DNS listener restarts after it.
 		restoreBpfOwnership := func() {
+			if inheritance != nil {
+				inheritance.Rollback()
+			}
 			if !freshDatapathReload && oldC != nil {
 				oldC.InjectBpf(newC.EjectBpf())
 			}
@@ -483,6 +506,8 @@ func (w *reloadWorker) run() {
 		}
 		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 		handoff.bpfTransferred = !freshDatapathReload
+		handoff.hasOverlap = inheritance != nil && inheritance.HasOverlap()
+		handoff.reloadInheritance = inheritance
 		w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.clearPendingRetirement()
 		w.reloadManager.setPendingReloadMetadata(reloadStartedAt, reloadStartedAtMono)

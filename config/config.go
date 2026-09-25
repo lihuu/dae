@@ -76,7 +76,7 @@ func ParseFunctionOrString(fs FunctionOrString) (*config_parser.Function, error)
 		if len(fs) == 1 {
 			return fs[0], nil
 		}
-		return nil, fmt.Errorf("expected exactly 1 function in fallback, got %d", len(fs))
+		return nil, fmt.Errorf("expected exactly 1 function, got %d", len(fs))
 	default:
 		return nil, fmt.Errorf("unsupported function-or-string value type: %T", fs)
 	}
@@ -104,6 +104,8 @@ type Group struct {
 
 	Filter           [][]*config_parser.Function `mapstructure:"filter" repeatable:""`
 	FilterAnnotation [][]*config_parser.Param    `mapstructure:"_"`
+	Primary          FunctionOrString            `mapstructure:"primary"`
+	Fallback         FunctionOrString            `mapstructure:"fallback"`
 	Policy           FunctionListOrString        `mapstructure:"policy" required:""`
 
 	TcpCheckUrl        []string      `mapstructure:"tcp_check_url"`
@@ -111,6 +113,37 @@ type Group struct {
 	UdpCheckDns        []string      `mapstructure:"udp_check_dns"`
 	CheckInterval      time.Duration `mapstructure:"check_interval"`
 	CheckTolerance     time.Duration `mapstructure:"check_tolerance"`
+
+	// Failover recovery settings (only used when policy: failover).
+	RecoveryProbeBackoff string        `mapstructure:"recovery_probe_backoff" default:"exponential"`
+	RecoveryProbeInitial time.Duration `mapstructure:"recovery_probe_initial" default:"15s"`
+	RecoveryProbeMax     time.Duration `mapstructure:"recovery_probe_max" default:"5m"`
+	RecoverySuccesses    int           `mapstructure:"recovery_successes" default:"3"`
+	RecoveryStableTime   time.Duration `mapstructure:"recovery_stable_time" default:"30s"`
+
+	// PrimaryRotationAttempts advances to the next configured Primary after
+	// this many consecutive failed probes against the current recovery target.
+	// Zero keeps that target pinned while recovery probing continues. A
+	// positive value is only valid with policy: failover.
+	PrimaryRotationAttempts int `mapstructure:"primary_rotation_attempts" default:"0"`
+
+	// Failover notification settings (only used when policy: failover).
+	// failover_notify enables notifications only when set to "bark".
+	// failover_notify_bark_url is the preferred Bark URL source; the _env
+	// variant is consulted only when the direct URL is empty. If neither
+	// resolves, the notifier is disabled for this group.
+	FailoverNotify              string `mapstructure:"failover_notify"`
+	FailoverNotifyBarkURL       string `mapstructure:"failover_notify_bark_url"`
+	FailoverNotifyBarkURLEnv    string `mapstructure:"failover_notify_bark_url_env"`
+	FailoverNotifySwitchTitle   string `mapstructure:"failover_notify_switch_title"`
+	FailoverNotifySwitchBody    string `mapstructure:"failover_notify_switch_body"`
+	FailoverNotifyFailbackTitle string `mapstructure:"failover_notify_failback_title"`
+	FailoverNotifyFailbackBody  string `mapstructure:"failover_notify_failback_body"`
+	// failover_notify_bark_proxy routes Bark notification HTTP requests through
+	// the specified SOCKS5 proxy (e.g. local Xray) instead of letting them be
+	// captured by DAE's own transparent proxy. This avoids delivery failures
+	// during failover/failback transitions when the transparent path is unstable.
+	FailoverNotifyBarkProxy string `mapstructure:"failover_notify_bark_proxy"`
 }
 
 type DnsRequestRouting struct {
