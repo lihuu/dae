@@ -49,6 +49,16 @@ var (
 			// chain (component/dns), and a typo there used to exit 0 here while
 			// `dae run` refused to start. Same chain, no second copy of the
 			// checks - see dns.ValidateRouting.
+			//
+			// Expand routing_outbound(...) -> fakeip selectors before DNS
+			// validation: the DNS parser has no handler for routing_outbound,
+			// so it must be rewritten into qname(...) rules first.
+			if expanded, expandErr := control.ExpandFakeIPRoutingOutbound(log, conf.Dns.Routing.Request.Rules, conf.Routing.Rules, staticOutboundExists(conf)); expandErr != nil {
+				fmt.Println(expandErr)
+				os.Exit(1)
+			} else {
+				conf.Dns.Routing.Request.Rules = expanded
+			}
 			if err := dns.ValidateRouting(log, &conf.Dns, []string{filepath.Dir(cfgFile)}); err != nil {
 				fmt.Println(err)
 				os.Exit(1)
@@ -180,4 +190,23 @@ func validateFailoverSettings(conf *config.Config) error {
 		}
 	}
 	return nil
+}
+
+// staticOutboundExists returns a predicate that reports whether a given name
+// is a known outbound in the config. It includes the implicit direct, block,
+// and reject outbounds plus every user-defined group name. Used by
+// ExpandFakeIPRoutingOutbound to validate routing_outbound(...) targets.
+func staticOutboundExists(conf *config.Config) func(name string) bool {
+	names := map[string]struct{}{
+		consts.OutboundDirect.String(): {},
+		consts.OutboundBlock.String():  {},
+		consts.OutboundReject.String(): {},
+	}
+	for _, g := range conf.Group {
+		names[g.Name] = struct{}{}
+	}
+	return func(name string) bool {
+		_, ok := names[name]
+		return ok
+	}
 }

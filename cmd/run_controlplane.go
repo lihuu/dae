@@ -221,6 +221,15 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		}
 	}
 
+	// Expand routing_outbound(...) -> fakeip selectors before the DNS
+	// router build: the DNS parser has no handler for routing_outbound,
+	// so it must be rewritten into qname(...) rules first.
+	if expanded, expandErr := control.ExpandFakeIPRoutingOutbound(log, conf.Dns.Routing.Request.Rules, conf.Routing.Rules, staticOutboundExists(conf)); expandErr != nil {
+		return nil, fmt.Errorf("expand routing_outbound DNS selector: %w", expandErr)
+	} else {
+		conf.Dns.Routing.Request.Rules = expanded
+	}
+
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
 		LocationFinder:     locationFinder,
 		DirectDialer:       directDialers.Symmetric,
